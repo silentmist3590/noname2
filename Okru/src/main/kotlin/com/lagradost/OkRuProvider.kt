@@ -6,7 +6,7 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
-import org.jsoup.Jsoup
+import java.net.URLEncoder
 
 @CloudstreamPlugin
 class OkRuPlugin : Plugin() {
@@ -24,14 +24,6 @@ class OkRuExtractor : ExtractorApi() {
     override val mainUrl = "https://ok.ru"
     override val requiresReferer = true
 
-    companion object {
-        // User-Agent OkHttp tương thích hoàn toàn với ExoPlayer trên Android, tránh lỗi HTTP 400 của OKCDN
-        val defaultHeaders = mapOf(
-            "User-Agent" to "okhttp/4.12.0",
-            "Referer" to "https://ok.ru/"
-        )
-    }
-
     override suspend fun getUrl(
         url: String,
         referer: String?,
@@ -42,51 +34,61 @@ class OkRuExtractor : ExtractorApi() {
             ?: Regex("""(\d{8,})""").find(url)?.groupValues?.get(1)
             ?: return
 
-        val embedUrl = "https://ok.ru/videoembed/$videoId"
-        val response = app.get(embedUrl, headers = defaultHeaders).text
-        val optionsMatch = Regex("""data-options="([^"]+)"""").find(response)?.groupValues?.get(1) ?: return
+        OkRuHelper.resolveStreams(videoId, name, callback)
+    }
+}
 
-        val decodedJson = optionsMatch
-            .replace("&quot;", "\"")
-            .replace("&amp;", "&")
-            .replace("&#39;", "'")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
+object OkRuHelper {
+    // Nếu bạn có Cookie tài khoản OK.ru, hãy dán vào đây để mở khóa video 18+ và video nhóm kín
+    var USER_COOKIE: String = ""
 
-        val rootJson = try {
-            JSONObject(decodedJson)
+    val headers: Map<String, String>
+        get() {
+            val map = mutableMapOf(
+                "User-Agent" to "okhttp/4.12.0",
+                "Referer" to "https://ok.ru/"
+            )
+            if (USER_COOKIE.isNotBlank()) {
+                map["Cookie"] = USER_COOKIE
+            }
+            return map
+        }
+
+    suspend fun resolveStreams(videoId: String, sourceName: String, callback: (ExtractorLink) -> Unit) {
+        val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
+        val response = try {
+            app.post(apiUrl, headers = headers).text
         } catch (e: Exception) {
             return
         }
 
-        val flashvars = rootJson.optJSONObject("flashvars") ?: return
+        val json = try {
+            JSONObject(response)
+        } catch (e: Exception) {
+            return
+        }
 
-        val metaJson: JSONObject? = if (flashvars.has("metadata")) {
-            val metaRaw = flashvars.optString("metadata")
-            try {
-                JSONObject(metaRaw)
-            } catch (e: Exception) {
-                null
-            }
-        } else if (flashvars.has("metadataUrl")) {
-            val metaUrl = flashvars.optString("metadataUrl")
-            if (metaUrl.isNotBlank()) {
-                val metaText = app.get(metaUrl, headers = defaultHeaders).text
-                try {
-                    JSONObject(metaText)
-                } catch (e: Exception) {
-                    null
+        // 1. Luồng HLS Master tự động thích ứng băng thông
+        val hlsUrl = json.optString("hlsManifestUrl")
+        if (hlsUrl.isNotBlank()) {
+            callback(
+                newExtractorLink(
+                    source = sourceName,
+                    name = "$sourceName Auto (HLS)",
+                    url = hlsUrl,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "https://ok.ru/"
+                    this.quality = Qualities.Unknown.value
+                    this.headers = headers
                 }
-            } else null
-        } else null
+            )
+        }
 
-        if (metaJson == null) return
-
-        val qualityOrder = listOf("ultra", "quad", "full", "hd", "sd", "low", "lowest", "mobile")
-
-        // Ưu tiên phát các luồng MP4 trực tiếp chất lượng cao (1080p, 720p, 480p)
-        val videos = metaJson.optJSONArray("videos")
+        // 2. Các luồng MP4 trực tiếp chất lượng cao
+        val videos = json.optJSONArray("videos")
         if (videos != null) {
+            val qualityOrder = listOf("ultra", "quad", "full", "hd", "sd", "low", "lowest", "mobile")
             val videoList = mutableListOf<JSONObject>()
             for (i in 0 until videos.length()) {
                 videos.optJSONObject(i)?.let { videoList.add(it) }
@@ -127,43 +129,25 @@ class OkRuExtractor : ExtractorApi() {
                     else -> qualityName.uppercase()
                 }
 
-                val isM3u8 = vidUrl.contains(".m3u8", ignoreCase = true)
                 callback(
                     newExtractorLink(
-                        source = name,
-                        name = "$name $label",
+                        source = sourceName,
+                        name = "$sourceName $label",
                         url = vidUrl,
-                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                        type = ExtractorLinkType.VIDEO
                     ) {
                         this.referer = "https://ok.ru/"
                         this.quality = quality
-                        this.headers = defaultHeaders
+                        this.headers = headers
                     }
                 )
             }
-        }
-
-        // Link HLS Master Playlist làm dự phòng
-        val hlsUrl = metaJson.optString("hlsManifestUrl")
-        if (hlsUrl.isNotBlank()) {
-            callback(
-                newExtractorLink(
-                    source = name,
-                    name = "$name (Auto HLS)",
-                    url = hlsUrl,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = "https://ok.ru/"
-                    this.quality = Qualities.Unknown.value
-                    this.headers = defaultHeaders
-                }
-            )
         }
     }
 }
 
 /**
- * MainAPI cho OK.ru: Giao diện mượt mà, tìm kiếm chính xác và xem video không lỗi
+ * MainAPI cho OK.ru: Giao diện mượt mà, tải nhanh tức thì và không bị treo
  */
 class OkRuProvider : MainAPI() {
     override var mainUrl = "https://ok.ru"
@@ -173,13 +157,6 @@ class OkRuProvider : MainAPI() {
     override val hasQuickSearch = false
     override val supportedTypes = setOf(TvType.Others, TvType.Movie)
 
-    private val extractor = OkRuExtractor()
-
-    private val appHeaders = mapOf(
-        "User-Agent" to "okhttp/4.12.0",
-        "Referer" to "https://ok.ru/video"
-    )
-
     private val mobileHeaders = mapOf(
         "User-Agent" to "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
         "Accept-Language" to "vi,en-US;q=0.9,en;q=0.8"
@@ -188,14 +165,12 @@ class OkRuProvider : MainAPI() {
     override val mainPage = mainPageOf(
         "1" to "🔥 Thịnh hành hôm nay",
         "2" to "⚡ Video nổi bật",
-        "3" to "🌟 Xem nhiều nhất",
-        "4" to "🎬 Khám phá video mới",
-        "5" to "📺 Kênh phổ biến"
+        "3" to "🌟 Xem nhiều nhất"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val basePageOffset = request.data.toIntOrNull() ?: 1
-        val actualPage = (basePageOffset - 1) + page
+        val actualPage = (basePageOffset - 1) * 2 + page
         val targetUrl = "https://m.ok.ru/video?st.page=$actualPage"
 
         val homeItems = mutableListOf<SearchResponse>()
@@ -246,7 +221,7 @@ class OkRuProvider : MainAPI() {
         val cleanQuery = query.trim()
         val searchResults = mutableListOf<SearchResponse>()
 
-        // 1. Hỗ trợ người dùng dán trực tiếp link hoặc ID video
+        // 1. Dán trực tiếp link hoặc ID video: Tìm kiếm và hiển thị ngay
         val directMatch = Regex("""(?:video|videoembed)/(\d+)""").find(cleanQuery)
             ?: Regex("""^(\d{8,})$""").find(cleanQuery)
 
@@ -257,21 +232,12 @@ class OkRuProvider : MainAPI() {
             var title = "OK.ru Video #$id"
             var poster: String? = null
             try {
-                val embedUrl = "https://ok.ru/videoembed/$id"
-                val embedRes = app.get(embedUrl, headers = appHeaders).text
-                val optMatch = Regex("""data-options="([^"]+)"""").find(embedRes)?.groupValues?.get(1)
-                if (optMatch != null) {
-                    val dec = optMatch.replace("&quot;", "\"").replace("&amp;", "&").replace("&#39;", "'")
-                    val root = JSONObject(dec)
-                    val flashvars = root.optJSONObject("flashvars")
-                    if (flashvars?.has("metadata") == true) {
-                        val meta = JSONObject(flashvars.optString("metadata"))
-                        meta.optJSONObject("movie")?.let { m ->
-                            m.optString("title").takeIf { it.isNotBlank() }?.let { title = it }
-                            m.optString("poster").takeIf { it.isNotBlank() }?.let { poster = it }
-                        }
-                    }
-                }
+                val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$id"
+                val res = app.post(apiUrl, headers = OkRuHelper.headers).text
+                val json = JSONObject(res)
+                val movie = json.optJSONObject("movie")
+                movie?.optString("title")?.takeIf { it.isNotBlank() }?.let { title = it }
+                movie?.optString("poster")?.takeIf { it.isNotBlank() }?.let { poster = it }
             } catch (ignored: Exception) {}
 
             return listOf(
@@ -281,12 +247,11 @@ class OkRuProvider : MainAPI() {
             )
         }
 
-        // 2. Tìm kiếm chính xác qua API web của OK.ru
+        // 2. Tìm kiếm qua API chính thức của OK.ru
         val searchUrl = "https://ok.ru/video/search/${cleanQuery.encodeUrl()}"
         try {
-            val response = app.get(searchUrl, headers = appHeaders).text
+            val response = app.get(searchUrl, headers = OkRuHelper.headers).text
 
-            // Tìm chính xác khối data-props chứa videos mà không dùng regex quét chuỗi dài
             val match = Regex("""data-props="([^"]*&quot;videos&quot;[^"]*)"""").find(response)?.groupValues?.get(1)
             if (match != null) {
                 val decoded = match
@@ -330,61 +295,19 @@ class OkRuProvider : MainAPI() {
             ?: Regex("""(\d{8,})""").find(url)?.groupValues?.get(1)
             ?: throw ErrorLoadingException("Link video OK.ru không hợp lệ!")
 
-        val embedUrl = "https://ok.ru/videoembed/$videoId"
-        val response = app.get(embedUrl, headers = appHeaders).text
+        val apiUrl = "https://ok.ru/dk?cmd=videoPlayerMetadata&mid=$videoId"
+        val response = app.post(apiUrl, headers = OkRuHelper.headers).text
+        val json = JSONObject(response)
 
-        var title = "OK.ru Video #$videoId"
-        var poster: String? = null
-        var plot: String? = null
-        var duration: Int? = null
+        val movie = json.optJSONObject("movie")
+        val title = movie?.optString("title")?.takeIf { it.isNotBlank() } ?: "OK.ru Video #$videoId"
+        val poster = movie?.optString("poster")?.takeIf { it.isNotBlank() }
+        val plot = movie?.optString("description")?.takeIf { it.isNotBlank() }
+        val dur = movie?.optInt("duration", 0) ?: 0
+        val duration = if (dur > 0) dur / 60 else null
 
-        val optionsMatch = Regex("""data-options="([^"]+)"""").find(response)?.groupValues?.get(1)
-        if (optionsMatch != null) {
-            val decoded = optionsMatch
-                .replace("&quot;", "\"")
-                .replace("&amp;", "&")
-                .replace("&#39;", "'")
-
-            try {
-                val root = JSONObject(decoded)
-                val flashvars = root.optJSONObject("flashvars")
-                if (flashvars != null) {
-                    val metaJson = if (flashvars.has("metadata")) {
-                        JSONObject(flashvars.optString("metadata"))
-                    } else if (flashvars.has("metadataUrl")) {
-                        val metaUrl = flashvars.optString("metadataUrl")
-                        if (metaUrl.isNotBlank()) {
-                            JSONObject(app.get(metaUrl, headers = appHeaders).text)
-                        } else null
-                    } else null
-
-                    if (metaJson != null) {
-                        val movie = metaJson.optJSONObject("movie")
-                        if (movie != null) {
-                            movie.optString("title").takeIf { it.isNotBlank() }?.let { title = it }
-                            movie.optString("poster").takeIf { it.isNotBlank() }?.let { poster = it }
-                            movie.optString("description").takeIf { it.isNotBlank() }?.let { plot = it }
-                            val dur = movie.optInt("duration", 0)
-                            if (dur > 0) duration = dur / 60
-                        }
-                    }
-                }
-            } catch (ignored: Exception) {}
-        }
-
-        if (title == "OK.ru Video #$videoId") {
-            val doc = Jsoup.parse(response)
-            val docTitle = doc.select("meta[property=og:title], meta[name=title]").attr("content")
-            if (docTitle.isNotBlank()) title = docTitle
-            if (poster == null) {
-                val docPoster = doc.select("meta[property=og:image], link[rel=image_src]").attr("content").ifBlank {
-                    doc.select("link[rel=image_src]").attr("href")
-                }
-                if (docPoster.isNotBlank()) poster = docPoster
-            }
-        }
-
-        return newMovieLoadResponse(title, url, TvType.Movie, url) {
+        // Truyền videoId vào data của response để loadLinks sử dụng trực tiếp
+        return newMovieLoadResponse(title, url, TvType.Movie, videoId) {
             this.posterUrl = poster
             this.plot = plot
             this.duration = duration
@@ -397,9 +320,13 @@ class OkRuProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        extractor.getUrl(data, mainUrl, subtitleCallback, callback)
+        val videoId = Regex("""(?:video|videoembed)/(\d+)""").find(data)?.groupValues?.get(1)
+            ?: Regex("""(\d{8,})""").find(data)?.groupValues?.get(1)
+            ?: data
+
+        OkRuHelper.resolveStreams(videoId, name, callback)
         return true
     }
 
-    private fun String.encodeUrl(): String = java.net.URLEncoder.encode(this, "UTF-8")
+    private fun String.encodeUrl(): String = URLEncoder.encode(this, "UTF-8")
 }
