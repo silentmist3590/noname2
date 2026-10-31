@@ -31,9 +31,11 @@ class OkRuExtractor : ExtractorApi() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ) {
-        val videoId = Regex("""(?:video|videoembed)/(\d+)""").find(url)?.groupValues?.get(1) ?: return
-        val embedUrl = "https://ok.ru/videoembed/$videoId"
+        val videoId = Regex("""(?:video|videoembed)/(\d+)""").find(url)?.groupValues?.get(1)
+            ?: Regex("""(\d{8,})""").find(url)?.groupValues?.get(1)
+            ?: return
 
+        val embedUrl = "https://ok.ru/videoembed/$videoId"
         val headers = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Referer" to "https://ok.ru/"
@@ -145,7 +147,7 @@ class OkRuExtractor : ExtractorApi() {
 }
 
 /**
- * MainAPI cho OK.ru: Hỗ trợ tìm kiếm, duyệt video và dán link trực tiếp
+ * MainAPI cho OK.ru: Duyệt danh mục, tìm kiếm và dán link trực tiếp
  */
 class OkRuProvider : MainAPI() {
     override var mainUrl = "https://ok.ru"
@@ -172,73 +174,151 @@ class OkRuProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val document = app.get(request.data, headers = mobileHeaders).document
+        val targetUrl = if (page <= 1) "https://m.ok.ru/video" else "https://m.ok.ru/video?st.page=$page"
+        val response = app.get(targetUrl, headers = mobileHeaders).text
         val homeItems = mutableListOf<SearchResponse>()
+        var hasNextPage = false
 
-        document.select("a[href*=/video/]").forEach { element ->
-            val href = element.attr("href")
-            val idMatch = Regex("""/video/(\d+)""").find(href)?.groupValues?.get(1) ?: return@forEach
-            val videoUrl = "https://ok.ru/video/$idMatch"
+        // 1. Phân tích trực tiếp từ thuộc tính JSON `videos="..."` trên m.ok.ru
+        val videosAttrMatch = Regex("""videos="([^"]+)"""").find(response)?.groupValues?.get(1)
+        if (videosAttrMatch != null) {
+            try {
+                val decoded = videosAttrMatch
+                    .replace("&quot;", "\"")
+                    .replace("&amp;", "&")
+                    .replace("&#39;", "'")
+                val rootJson = JSONObject(decoded)
+                val table = rootJson.optJSONObject("table")
+                val data = table?.optJSONArray("data")
+                if (data != null) {
+                    for (i in 0 until data.length()) {
+                        val item = data.optJSONObject(i) ?: continue
+                        val id = item.optString("id")
+                        if (id.isBlank()) continue
+                        val videoUrl = "https://ok.ru/video/$id"
+                        val title = item.optString("name").ifBlank { "OK.ru Video #$id" }
 
-            val title = element.select("div.va-title, div.ellip, span.video-card_n, img[alt]").text().ifBlank {
-                element.attr("title").ifBlank { "OK.ru Video #$idMatch" }
-            }
-            val poster = element.select("img").attr("src").ifBlank {
-                element.select("img").attr("data-src")
-            }
+                        // Lấy ảnh bìa chất lượng cao
+                        val thumbs = item.optJSONObject("thumbnails")
+                        val poster = thumbs?.optString("STANDARD")?.takeIf { it.isNotBlank() }
+                            ?: thumbs?.optString("HIGH")?.takeIf { it.isNotBlank() }
+                            ?: thumbs?.optString("MEDIUM")?.takeIf { it.isNotBlank() }
+                            ?: thumbs?.optString("UPLOADED_IMAGE")?.takeIf { it.isNotBlank() }
+                            ?: thumbs?.optString("SMALL")
 
-            if (homeItems.none { it.url == videoUrl }) {
-                homeItems.add(
-                    newMovieSearchResponse(title, videoUrl, TvType.Movie) {
-                        this.posterUrl = poster.ifBlank { null }
+                        if (homeItems.none { it.url == videoUrl }) {
+                            homeItems.add(
+                                newMovieSearchResponse(title, videoUrl, TvType.Movie) {
+                                    this.posterUrl = poster
+                                }
+                            )
+                        }
                     }
-                )
+                }
+                val pager = rootJson.optJSONObject("pager")
+                hasNextPage = pager?.optBoolean("hasNext", false) ?: false
+            } catch (ignored: Exception) {}
+        }
+
+        // 2. Dự phòng: quét các liên kết sao chép `data-copy="http://ok.ru/video/..."`
+        if (homeItems.isEmpty()) {
+            val idMatches = Regex("""data-copy="https?://(?:www\.|m\.)?ok\.ru/video/(\d+)"""").findAll(response)
+            for (match in idMatches) {
+                val id = match.groupValues[1]
+                val videoUrl = "https://ok.ru/video/$id"
+                if (homeItems.none { it.url == videoUrl }) {
+                    homeItems.add(
+                        newMovieSearchResponse("OK.ru Video #$id", videoUrl, TvType.Movie)
+                    )
+                }
             }
         }
 
         return newHomePageResponse(
             listOf(HomePageList(request.name, homeItems)),
-            hasNext = false
+            hasNext = hasNextPage || (homeItems.size >= 10 && page < 20)
         )
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
 
-        // Hỗ trợ dán trực tiếp link ok.ru vào ô tìm kiếm: ok.ru/video/123456...
+        // Hỗ trợ người dùng dán trực tiếp link ok.ru hoặc ID số vào ô tìm kiếm:
         val directMatch = Regex("""(?:video|videoembed)/(\d+)""").find(cleanQuery)
+            ?: Regex("""^(\d{8,})$""").find(cleanQuery)
+
         if (directMatch != null) {
             val id = directMatch.groupValues[1]
-            val url = "https://ok.ru/video/$id"
+            val videoUrl = "https://ok.ru/video/$id"
+
+            // Tải trước embed để lấy tiêu đề và poster thật của video
+            var title = "OK.ru Video #$id"
+            var poster: String? = null
+            try {
+                val embedUrl = "https://ok.ru/videoembed/$id"
+                val embedRes = app.get(embedUrl, headers = defaultHeaders).text
+                val optMatch = Regex("""data-options="([^"]+)"""").find(embedRes)?.groupValues?.get(1)
+                if (optMatch != null) {
+                    val dec = optMatch.replace("&quot;", "\"").replace("&amp;", "&").replace("&#39;", "'")
+                    val root = JSONObject(dec)
+                    val flashvars = root.optJSONObject("flashvars")
+                    if (flashvars?.has("metadata") == true) {
+                        val meta = JSONObject(flashvars.optString("metadata"))
+                        meta.optJSONObject("movie")?.let { m ->
+                            m.optString("title").takeIf { it.isNotBlank() }?.let { title = it }
+                            m.optString("poster").takeIf { it.isNotBlank() }?.let { poster = it }
+                        }
+                    }
+                }
+            } catch (ignored: Exception) {}
+
             return listOf(
-                newMovieSearchResponse("OK.ru Video: $id", url, TvType.Movie)
+                newMovieSearchResponse(title, videoUrl, TvType.Movie) {
+                    this.posterUrl = poster
+                }
             )
         }
 
-        val searchUrl = "https://m.ok.ru/video/search?query=${cleanQuery.encodeUrl()}"
+        // Tìm kiếm trên OK.ru
+        val searchUrl = "https://m.ok.ru/video/search?st.query=${cleanQuery.encodeUrl()}"
         val response = app.get(searchUrl, headers = mobileHeaders).text
-        val document = Jsoup.parse(response)
         val searchResults = mutableListOf<SearchResponse>()
 
-        document.select("a[href*=/video/]").forEach { element ->
-            val href = element.attr("href")
-            val id = Regex("""/video/(\d+)""").find(href)?.groupValues?.get(1) ?: return@forEach
-            val videoUrl = "https://ok.ru/video/$id"
+        val videosAttrMatch = Regex("""videos="([^"]+)"""").find(response)?.groupValues?.get(1)
+        if (videosAttrMatch != null) {
+            try {
+                val decoded = videosAttrMatch
+                    .replace("&quot;", "\"")
+                    .replace("&amp;", "&")
+                    .replace("&#39;", "'")
+                val rootJson = JSONObject(decoded)
+                val table = rootJson.optJSONObject("table")
+                val data = table?.optJSONArray("data")
+                if (data != null) {
+                    for (i in 0 until data.length()) {
+                        val item = data.optJSONObject(i) ?: continue
+                        val id = item.optString("id")
+                        if (id.isBlank()) continue
+                        val videoUrl = "https://ok.ru/video/$id"
+                        val title = item.optString("name").ifBlank { "OK.ru Video #$id" }
 
-            val title = element.select(".va-title, .ellip, .video-card_n, img[alt]").firstOrNull()?.text()
-                ?: element.attr("title").ifBlank { "Video $id" }
+                        val thumbs = item.optJSONObject("thumbnails")
+                        val poster = thumbs?.optString("STANDARD")?.takeIf { it.isNotBlank() }
+                            ?: thumbs?.optString("HIGH")?.takeIf { it.isNotBlank() }
+                            ?: thumbs?.optString("MEDIUM")?.takeIf { it.isNotBlank() }
+                            ?: thumbs?.optString("UPLOADED_IMAGE")?.takeIf { it.isNotBlank() }
+                            ?: thumbs?.optString("SMALL")
 
-            val poster = element.select("img").firstOrNull()?.let {
-                it.attr("src").ifBlank { it.attr("data-src") }
-            }
-
-            if (searchResults.none { it.url == videoUrl }) {
-                searchResults.add(
-                    newMovieSearchResponse(title.trim(), videoUrl, TvType.Movie) {
-                        this.posterUrl = poster?.takeIf { it.isNotBlank() }
+                        if (searchResults.none { it.url == videoUrl }) {
+                            searchResults.add(
+                                newMovieSearchResponse(title, videoUrl, TvType.Movie) {
+                                    this.posterUrl = poster
+                                }
+                            )
+                        }
                     }
-                )
-            }
+                }
+            } catch (ignored: Exception) {}
         }
 
         return searchResults
@@ -246,6 +326,7 @@ class OkRuProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse {
         val videoId = Regex("""(?:video|videoembed)/(\d+)""").find(url)?.groupValues?.get(1)
+            ?: Regex("""(\d{8,})""").find(url)?.groupValues?.get(1)
             ?: throw ErrorLoadingException("Link video OK.ru không hợp lệ!")
 
         val embedUrl = "https://ok.ru/videoembed/$videoId"
@@ -290,7 +371,7 @@ class OkRuProvider : MainAPI() {
             } catch (ignored: Exception) {}
         }
 
-        // Fallback lấy tiêu đề và ảnh bìa từ HTML nếu không có trong metadata
+        // Fallback lấy tiêu đề và poster từ thẻ meta HTML
         if (title == "OK.ru Video #$videoId") {
             val doc = Jsoup.parse(response)
             val docTitle = doc.select("meta[property=og:title], meta[name=title]").attr("content")
