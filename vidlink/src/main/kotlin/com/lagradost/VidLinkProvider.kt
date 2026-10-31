@@ -4,13 +4,12 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.cloudflareBypass // THÊM IMPORT NÀY ĐỂ VƯỢT CLOUDFLARE
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 import org.json.JSONObject
 
 // =====================================================================================
-// 1. CẤU HÌNH API KEY (Giữ nguyên theo yêu cầu của bạn)
+// 1. CẤU HÌNH API KEY
 // =====================================================================================
 private const val TMDB_API_KEY = "b9e1ff7ff423790bf7df202e661377ca"
 private const val OMDB_API_KEY = "a116862a"
@@ -117,7 +116,6 @@ object ApiServices {
 // 4. LỚP PROVIDER CHÍNH
 // =====================================================================================
 class VidLinkProvider : MainAPI() {
-    // Giữ nguyên Proxy Worker của bạn
     override var mainUrl = "https://tmdb-proxy.silentmist3590.workers.dev/3"
     override var name = "VidLink (All-in-One)"
     override var lang = "en"
@@ -264,22 +262,18 @@ class VidLinkProvider : MainAPI() {
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
             "Origin" to "https://vidlink.pro",
             "Referer" to "https://vidlink.pro/",
-            "Accept" to "application/json, text/plain, */*" // Thêm Accept header
+            "Accept" to "application/json, text/plain, */*"
         )
 
         try {
             ClipboardLogger.logAndCopy("API Request", "URL: $apiUrl")
             
-            // SỬA LỖI 1: Thêm cloudflareBypass() để vượt qua rào cản
-            val response = app.get(
-                apiUrl, 
-                headers = headers,
-                interceptor = cloudflareBypass()
-            ).text
+            // Đã xóa cloudflareBypass, quay lại gọi HTTP cơ bản
+            val response = app.get(apiUrl, headers = headers).text
             
             ClipboardLogger.logAndCopy("API Response", response)
 
-            // SỬA LỖI 2: Kiểm tra nếu bị Cloudflare chặn trả về HTML
+            // Kiểm tra nếu bị Cloudflare chặn trả về HTML
             if (response.trim().startsWith("<!DOCTYPE") || response.trim().startsWith("<html")) {
                 ClipboardLogger.logAndCopy("Error", "Bị Cloudflare chặn (Trả về HTML).")
                 return false
@@ -294,7 +288,7 @@ class VidLinkProvider : MainAPI() {
                 return false
             }
 
-            // SỬA LỖI 3: Quét linh hoạt các key có thể chứa link video
+            // Quét linh hoạt các key có thể chứa link video
             var playlistUrl = streamObject.optString("playlist")
             if (playlistUrl.isEmpty()) playlistUrl = streamObject.optString("url")
             if (playlistUrl.isEmpty()) playlistUrl = streamObject.optString("file")
@@ -311,19 +305,30 @@ class VidLinkProvider : MainAPI() {
                 if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
             )
 
-            streamObject.optJSONArray("captions")?.let { captions ->
-                for (i in 0 until captions.length()) {
-                    val cap = captions.getJSONObject(i)
-                    val capUrl = cap.optString("url")
-                    if (capUrl.isNotEmpty()) subtitleCallback.invoke(SubtitleFile(cap.optString("language"), capUrl))
+            val captionsArray = streamObject.optJSONArray("captions")
+            if (captionsArray != null) {
+                for (i in 0 until captionsArray.length()) {
+                    val caption = captionsArray.getJSONObject(i)
+                    val captionUrl = caption.optString("url")
+                    val captionLang = caption.optString("language")
+                    if (captionUrl.isNotEmpty()) {
+                        subtitleCallback.invoke(SubtitleFile(captionLang, captionUrl))
+                    }
                 }
             }
 
-            callback.invoke(ExtractorLink(
-                source = this.name, name = "VidLink", url = playlistUrl, referer = "https://vidlink.pro/",
-                quality = Qualities.P1080.value, type = if (playlistUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-            ))
+            callback.invoke(
+                ExtractorLink(
+                    source = this.name,
+                    name = "VidLink",
+                    url = playlistUrl,
+                    referer = "https://vidlink.pro/",
+                    quality = Qualities.P1080.value,
+                    type = if (playlistUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO 
+                )
+            )
             return true
+
         } catch (e: Exception) {
             ClipboardLogger.logAndCopy("Exception", "Error: ${e.message}\nStackTrace: ${e.stackTraceToString()}")
             return false
