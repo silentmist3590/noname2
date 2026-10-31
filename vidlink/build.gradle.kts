@@ -1,18 +1,20 @@
 // vidlink/build.gradle.kts
 cloudstream {
-    description = "VidLink API provider with TMDB metadata and auto-copy debug logs"
+    description = "VidLink API provider with TMDB, OMDb, TVMaze and Trakt integration"
     authors = listOf("silentmist3590")
-    version = 3
     status = 1
+    version = 4
     tvTypes = listOf("Movie", "TvSeries")
     requiresResources = false
 }
 
 android {
-    namespace = "com.lagradost" // Đã sửa lại cho khớp với package
+    namespace = "com.lagradost"
 }
 
 dependencies {
-    // BẮT BUỘC phải có dòng này để mã hóa token hoạt động
+    // Thư viện mã hóa
     implementation("org.bouncycastle:bcprov-jdk15on:1.70")
+    // Thư viện JSON (nếu chưa có)
+    implementation("com.google.code.gson:gson:2.10.1")
 }
