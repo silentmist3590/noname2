@@ -6,7 +6,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import com.lagradost.cloudstream3.appContext
+import com.lagradost.cloudstream3.APIHolder // Thay thế appContext
 
 object ClipboardLogger {
     private const val TAG = "VidLinkPlugin"
@@ -16,10 +16,10 @@ object ClipboardLogger {
         Log.d(TAG, logMessage)
 
         try {
-            // Sử dụng appContext thay vì app (app là HTTP Client)
-            val clipboard = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            // Lấy context thông qua APIHolder
+            val context = APIHolder.context ?: return
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             
-            // Chạy trên Main Thread để đảm bảo an toàn
             Handler(Looper.getMainLooper()).post {
                 val clip = ClipData.newPlainText("VidLink Log", logMessage)
                 clipboard.setPrimaryClip(clip)
