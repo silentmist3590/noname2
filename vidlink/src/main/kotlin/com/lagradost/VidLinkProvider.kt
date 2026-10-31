@@ -235,7 +235,7 @@ class VidLinkProvider : MainAPI() {
         }
     }
 
-    // Hàm đệ quy để tìm link stream trong bất kỳ cấu trúc JSON nào
+    // Hàm đệ quy tìm link stream trong bất kỳ cấu trúc JSON nào
     private fun findStreamUrl(json: Any?): String? {
         when (json) {
             is JSONObject -> {
@@ -286,7 +286,6 @@ class VidLinkProvider : MainAPI() {
             "https://vidlink.pro/api/b/tv/$token/${parts[3]}/${parts[4]}?multiLang=1"
         }
 
-        // Cập nhật Headers giả lập trình duyệt Chrome cực mạnh
         val headers = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
             "Origin" to "https://vidlink.pro",
@@ -303,7 +302,6 @@ class VidLinkProvider : MainAPI() {
             val response = app.get(apiUrl, headers = headers).text
             ClipboardLogger.logAndCopy("API Response", response)
 
-            // Kiểm tra nếu bị Cloudflare chặn trả về HTML
             if (response.trim().startsWith("<!DOCTYPE") || response.trim().startsWith("<html")) {
                 ClipboardLogger.logAndCopy("Error", "Bị Cloudflare chặn (Trả về HTML).")
                 return false
@@ -312,18 +310,18 @@ class VidLinkProvider : MainAPI() {
             val jsonObject = JSONObject(response)
             
             var playlistUrl: String? = null
+            var captionsArray: JSONArray? = null
 
-            // Cách 1: Thử lấy theo cấu trúc chuẩn
             val streamObject = jsonObject.optJSONObject("stream")
             if (streamObject != null) {
                 playlistUrl = streamObject.optString("playlist")
                 if (playlistUrl.isEmpty()) playlistUrl = streamObject.optString("url")
                 if (playlistUrl.isEmpty()) playlistUrl = streamObject.optString("file")
+                captionsArray = streamObject.optJSONArray("captions")
             }
 
-            // Cách 2: Nếu cách 1 thất bại, quét toàn bộ JSON để tìm link .m3u8 hoặc .mp4
             if (playlistUrl.isNullOrEmpty()) {
-                ClipboardLogger.logAndCopy("JSON Scan", "Không tìm thấy ở cấu trúc chuẩn, đang quét toàn bộ JSON...")
+                ClipboardLogger.logAndCopy("JSON Scan", "Đang quét toàn bộ JSON...")
                 playlistUrl = findStreamUrl(jsonObject)
             }
 
@@ -339,7 +337,6 @@ class VidLinkProvider : MainAPI() {
                 if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
             )
 
-            val captionsArray = streamObject?.optJSONArray("captions")
             if (captionsArray != null) {
                 for (i in 0 until captionsArray.length()) {
                     val caption = captionsArray.getJSONObject(i)
@@ -351,15 +348,16 @@ class VidLinkProvider : MainAPI() {
                 }
             }
 
+            // SỬA LỖI QUAN TRỌNG: Máy chủ video yêu cầu Referer là filmboom.top
             callback.invoke(
                 ExtractorLink(
                     source = this.name,
                     name = "VidLink",
                     url = playlistUrl,
-                    referer = "https://vidlink.pro/", // Rất quan trọng để player không bị chặn
+                    referer = "https://filmboom.top/",
                     quality = Qualities.P1080.value,
                     type = if (playlistUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                    headers = headers // Truyền headers vào trình phát video
+                    headers = mapOf("Origin" to "https://filmboom.top")
                 )
             )
             return true
