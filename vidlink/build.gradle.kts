@@ -3,7 +3,7 @@ cloudstream {
     description = "VidLink API provider with TMDB, OMDb, TVMaze and Trakt integration"
     authors = listOf("silentmist3590")
     status = 1
-    version = 4
+    version = 5
     tvTypes = listOf("Movie", "TvSeries")
     requiresResources = false
 }
