@@ -1,13 +1,13 @@
 package com.lagradost
 
 import android.content.Context
-import androidx.appcompat.app.AppCompatActivity
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
-import com.lagradost.cloudstream3.utils.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
 import org.jsoup.Jsoup
 
@@ -81,18 +81,19 @@ class OkRuExtractor : ExtractorApi() {
 
         if (metaJson == null) return
 
-        // 1. Lấy link HLS Adaptive Playlist (m3u8) nếu có
+        // 1. Lấy link HLS Master Playlist (m3u8) nếu có
         val hlsUrl = metaJson.optString("hlsManifestUrl")
         if (hlsUrl.isNotBlank()) {
             callback(
-                ExtractorLink(
+                newExtractorLink(
                     source = name,
                     name = "$name (Auto HLS)",
                     url = hlsUrl,
-                    referer = "https://ok.ru/",
-                    quality = Qualities.Unknown.value,
-                    isM3u8 = true
-                )
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "https://ok.ru/"
+                    this.quality = Qualities.Unknown.value
+                }
             )
         }
 
@@ -129,15 +130,17 @@ class OkRuExtractor : ExtractorApi() {
                     else -> qualityName.uppercase()
                 }
 
+                val isM3u8 = vidUrl.contains(".m3u8", ignoreCase = true)
                 callback(
-                    ExtractorLink(
+                    newExtractorLink(
                         source = name,
                         name = "$name $label",
                         url = vidUrl,
-                        referer = "https://ok.ru/",
-                        quality = quality,
-                        isM3u8 = vidUrl.contains(".m3u8", ignoreCase = true)
-                    )
+                        type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "https://ok.ru/"
+                        this.quality = quality
+                    }
                 )
             }
         }
@@ -290,7 +293,7 @@ class OkRuProvider : MainAPI() {
             } catch (ignored: Exception) {}
         }
 
-        // Fallback lấy title từ thẻ meta html nếu JSON không có
+        // Fallback lấy title từ thẻ meta HTML nếu JSON không có
         if (title == "OK.ru Video #$videoId") {
             val doc = Jsoup.parse(response)
             val docTitle = doc.select("meta[property=og:title], meta[name=title]").attr("content")
