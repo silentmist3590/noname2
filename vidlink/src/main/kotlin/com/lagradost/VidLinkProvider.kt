@@ -6,11 +6,13 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
+import org.json.JSONArray
 import org.json.JSONObject
 
 // =====================================================================================
-// 1. CẤU HÌNH API KEY
+// 1. CẤU HÌNH API KEY VÀ PROXY
 // =====================================================================================
+private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
 private const val TMDB_API_KEY = "b9e1ff7ff423790bf7df202e661377ca"
 private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
@@ -116,7 +118,7 @@ object ApiServices {
 // 4. LỚP PROVIDER CHÍNH
 // =====================================================================================
 class VidLinkProvider : MainAPI() {
-    override var mainUrl = "https://tmdb-proxy.silentmist3590.workers.dev/3"
+    override var mainUrl = TMDB_BASE_URL
     override var name = "VidLink (All-in-One)"
     override var lang = "en"
     override val hasMainPage = true
@@ -233,6 +235,32 @@ class VidLinkProvider : MainAPI() {
         }
     }
 
+    // Hàm đệ quy để tìm link stream trong bất kỳ cấu trúc JSON nào
+    private fun findStreamUrl(json: Any?): String? {
+        when (json) {
+            is JSONObject -> {
+                val keys = json.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    val value = json.get(key)
+                    if (value is String && (value.contains(".m3u8") || value.contains(".mp4"))) {
+                        return value
+                    } else {
+                        val nested = findStreamUrl(value)
+                        if (nested != null) return nested
+                    }
+                }
+            }
+            is JSONArray -> {
+                for (i in 0 until json.length()) {
+                    val nested = findStreamUrl(json.get(i))
+                    if (nested != null) return nested
+                }
+            }
+        }
+        return null
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -258,19 +286,21 @@ class VidLinkProvider : MainAPI() {
             "https://vidlink.pro/api/b/tv/$token/${parts[3]}/${parts[4]}?multiLang=1"
         }
 
+        // Cập nhật Headers giả lập trình duyệt Chrome cực mạnh
         val headers = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
             "Origin" to "https://vidlink.pro",
             "Referer" to "https://vidlink.pro/",
-            "Accept" to "application/json, text/plain, */*"
+            "Accept" to "application/json, text/plain, */*",
+            "Accept-Language" to "en-US,en;q=0.9,vi;q=0.8",
+            "Sec-Fetch-Dest" to "empty",
+            "Sec-Fetch-Mode" to "cors",
+            "Sec-Fetch-Site" to "same-site"
         )
 
         try {
             ClipboardLogger.logAndCopy("API Request", "URL: $apiUrl")
-            
-            // Đã xóa cloudflareBypass, quay lại gọi HTTP cơ bản
             val response = app.get(apiUrl, headers = headers).text
-            
             ClipboardLogger.logAndCopy("API Response", response)
 
             // Kiểm tra nếu bị Cloudflare chặn trả về HTML
@@ -280,21 +310,25 @@ class VidLinkProvider : MainAPI() {
             }
 
             val jsonObject = JSONObject(response)
-            ClipboardLogger.logAndCopy("JSON Parsed", jsonObject.toString(2))
+            
+            var playlistUrl: String? = null
 
+            // Cách 1: Thử lấy theo cấu trúc chuẩn
             val streamObject = jsonObject.optJSONObject("stream")
-            if (streamObject == null) {
-                ClipboardLogger.logAndCopy("Error", "Không tìm thấy object 'stream' trong JSON.")
-                return false
+            if (streamObject != null) {
+                playlistUrl = streamObject.optString("playlist")
+                if (playlistUrl.isEmpty()) playlistUrl = streamObject.optString("url")
+                if (playlistUrl.isEmpty()) playlistUrl = streamObject.optString("file")
             }
 
-            // Quét linh hoạt các key có thể chứa link video
-            var playlistUrl = streamObject.optString("playlist")
-            if (playlistUrl.isEmpty()) playlistUrl = streamObject.optString("url")
-            if (playlistUrl.isEmpty()) playlistUrl = streamObject.optString("file")
+            // Cách 2: Nếu cách 1 thất bại, quét toàn bộ JSON để tìm link .m3u8 hoặc .mp4
+            if (playlistUrl.isNullOrEmpty()) {
+                ClipboardLogger.logAndCopy("JSON Scan", "Không tìm thấy ở cấu trúc chuẩn, đang quét toàn bộ JSON...")
+                playlistUrl = findStreamUrl(jsonObject)
+            }
 
-            if (playlistUrl.isEmpty()) {
-                ClipboardLogger.logAndCopy("Error", "Không tìm thấy URL stream trong object 'stream'.")
+            if (playlistUrl.isNullOrEmpty()) {
+                ClipboardLogger.logAndCopy("Error", "Không tìm thấy URL stream trong toàn bộ JSON.")
                 return false
             }
 
@@ -305,7 +339,7 @@ class VidLinkProvider : MainAPI() {
                 if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
             )
 
-            val captionsArray = streamObject.optJSONArray("captions")
+            val captionsArray = streamObject?.optJSONArray("captions")
             if (captionsArray != null) {
                 for (i in 0 until captionsArray.length()) {
                     val caption = captionsArray.getJSONObject(i)
@@ -322,9 +356,10 @@ class VidLinkProvider : MainAPI() {
                     source = this.name,
                     name = "VidLink",
                     url = playlistUrl,
-                    referer = "https://vidlink.pro/",
+                    referer = "https://vidlink.pro/", // Rất quan trọng để player không bị chặn
                     quality = Qualities.P1080.value,
-                    type = if (playlistUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO 
+                    type = if (playlistUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                    headers = headers // Truyền headers vào trình phát video
                 )
             )
             return true
