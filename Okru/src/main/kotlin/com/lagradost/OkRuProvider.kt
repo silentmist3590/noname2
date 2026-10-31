@@ -12,12 +12,15 @@ import org.json.JSONObject
 import java.net.URLEncoder
 
 // =============================================================================
-// CẤU HÌNH TÙY CHỌN (OPTIONAL)
+// CẤU HÌNH COOKIE TÙY CHỌN (OPTIONAL)
 // =============================================================================
-// Nếu bạn có tài khoản OK.ru và muốn xem các video 18+ hoặc video riêng tư,
-// bạn có thể dán Cookie trình duyệt vào đây (ví dụ: "AUTHCODE=...; JSESSIONID=...").
-// Nếu để trống, plugin vẫn phát bình thường tất cả các video công khai.
-private const val USER_COOKIE: String = "_gid=GA1.2.408718373.1793368896; _hd=h; tmr_lvid=5725d3bd97cffc921fbe188528bf5db1; tmr_lvidTS=1793368897153; _ym_uid=1793368898600613063; _ym_d=1793368898; __pwa=0; __dzbd=false; _touch=false; _hover=true; ok_dpi=240; ok_w=1920; ok_h=1080; _breakpoint=XL; cudr=0; klos=0; _gcl_au=1.1.440008412.1793411949; viewport=680; _ga=GA1.1.1067751352.1793368896; _ym_isad=2; mdd=0; LASTSRV=ok.ru; _ga_GEGXS3ELM6=GS2.1.s1793458060$o5$g0$t1793458069$j51$l0$h0; TZ=14; CDN=; domain_sid=TQZ8IR0LUqJvX5x9SBQSm%3A1793458092109; tmr_detect=0%7C1793458094507; TZD=14.643; TD=643; __last_online=1793458456832"
+// CÁCH 1: Dán chuỗi cookie trực tiếp.
+// LƯU Ý QUAN TRỌNG: Nếu trong Cookie có dấu $, bạn hãy thêm dấu \ phía trước (ví dụ: \$o5, \$g0).
+private var USER_COOKIE: String = "_gid=GA1.2.408718373.1793368896; _hd=h; tmr_lvid=5725d3bd97cffc921fbe188528bf5db1; tmr_lvidTS=1793368897153; _ym_uid=1793368898600613063; _ym_d=1793368898; __pwa=0; __dzbd=false; _touch=false; _hover=true; ok_dpi=240; ok_w=1920; ok_h=1080; _breakpoint=XL; cudr=0; klos=0; _gcl_au=1.1.440008412.1793411949; viewport=680; _ga=GA1.1.1067751352.1793368896; _ym_isad=2; mdd=0; LASTSRV=ok.ru; _ga_GEGXS3ELM6=GS2.1.s1793458060\$o5\$g0\$t1793458069\$j51$l0$h0; TZ=14; CDN=; domain_sid=TQZ8IR0LUqJvX5x9SBQSm%3A1793458092109; tmr_detect=0%7C1793458094507; TZD=14.643; TD=643; __last_online=1793458456832"
+
+// CÁCH 2 (KHUYÊN DÙNG NẾU COOKIE CÓ NHIỀU KÝ TỰ LẠ):
+// Bạn mã hóa chuỗi Cookie sang Base64 rồi dán vào đây, đảm bảo 100% không bị lỗi dấu $:
+private var USER_COOKIE_BASE64: String = ""
 
 private const val USER_AGENT: String =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
@@ -38,6 +41,16 @@ class OkRuProvider : MainAPI() {
         "/video/live" to "Trực tiếp (Live)"
     )
 
+    private fun getEffectiveCookie(): String {
+        if (USER_COOKIE.isNotBlank()) return USER_COOKIE
+        if (USER_COOKIE_BASE64.isNotBlank()) {
+            return runCatching {
+                String(android.util.Base64.decode(USER_COOKIE_BASE64, android.util.Base64.DEFAULT), Charsets.UTF_8)
+            }.getOrDefault("")
+        }
+        return ""
+    }
+
     private fun getHeaders(): Map<String, String> {
         val headers = mutableMapOf(
             "User-Agent" to USER_AGENT,
@@ -45,8 +58,9 @@ class OkRuProvider : MainAPI() {
             "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"
         )
-        if (USER_COOKIE.isNotBlank()) {
-            headers["Cookie"] = USER_COOKIE
+        val cookie = getEffectiveCookie()
+        if (cookie.isNotBlank()) {
+            headers["Cookie"] = cookie
         }
         return headers
     }
@@ -162,7 +176,6 @@ class OkRuProvider : MainAPI() {
             url
         }
 
-        // Lấy thông tin metadata trực tiếp từ trang embed (cực nhanh, không bao giờ bị redirect login)
         val embedUrl = "$mainUrl/videoembed/$videoId"
         val res = runCatching {
             app.get(embedUrl, headers = getHeaders(), timeout = 10L).text
@@ -226,7 +239,7 @@ class OkRuProvider : MainAPI() {
             "Referer" to "https://ok.ru/"
         )
 
-        // BƯỚC 1: Lấy link từ videoembed (Có đầy đủ HLS và MP4)
+        // BƯỚC 1: Lấy link từ videoembed
         runCatching {
             val embedUrl = "$mainUrl/videoembed/$videoId"
             val html = app.get(embedUrl, headers = getHeaders(), timeout = 10L).text
@@ -271,7 +284,8 @@ class OkRuProvider : MainAPI() {
         return totalLinks > 0
     }
 
-    private fun emitStreams(
+    // Đã thêm từ khóa `suspend` để có thể gọi `newExtractorLink`
+    private suspend fun emitStreams(
         metadata: JSONObject,
         streamHeaders: Map<String, String>,
         subtitleCallback: (SubtitleFile) -> Unit,
@@ -359,7 +373,6 @@ class OkRuProvider : MainAPI() {
 @CloudstreamPlugin
 class OkRuPlugin : Plugin() {
     override fun load(context: Context) {
-        // Chỉ đăng ký MainAPI duy nhất, tránh chạy xung đột extractor kép
         registerMainAPI(OkRuProvider())
     }
 }
