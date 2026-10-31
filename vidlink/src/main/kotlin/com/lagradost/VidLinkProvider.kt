@@ -2,74 +2,235 @@ package com.lagradost
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.loadExtractor
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.Qualities
+import org.json.JSONObject
 
 class VidLinkProvider : MainAPI() {
-    override var mainUrl = "https://movieshubhd.com" // URL gốc của trang phim
-    override var name = "MoviesHubHD"
+    override var mainUrl = "https://api.themoviedb.org/3"
+    override var name = "VidLink"
     override var lang = "en"
-    override val hasMainPage = false
+    
+    // BẬT giao diện chính
+    override val hasMainPage = true 
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
+    // TODO: Thay thế bằng API Key của bạn
+    private val tmdbApiKey = "YOUR_TMDB_API_KEY"
+    private val omdbApiKey = "YOUR_OMDB_API_KEY"
+
+    // Định nghĩa các mục trên giao diện chính
+    override val mainPage = mainPageOf(
+        "$mainUrl/trending/all/day?api_key=$tmdbApiKey" to "Trending Today",
+        "$mainUrl/movie/popular?api_key=$tmdbApiKey" to "Popular Movies",
+        "$mainUrl/tv/popular?api_key=$tmdbApiKey" to "Popular TV Shows"
+    )
+
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        return newHomePageResponse(emptyList())
+        val url = "${request.data}&page=$page"
+        val response = app.get(url).text
+        val json = JSONObject(response)
+        val results = json.getJSONArray("results")
+        val home = mutableListOf<SearchResponse>()
+
+        for (i in 0 until results.length()) {
+            val item = results.getJSONObject(i)
+            val mediaType = item.optString("media_type", if (request.name.contains("TV")) "tv" else "movie")
+            val id = item.getInt("id").toString()
+            val title = item.optString("title", item.optString("name"))
+            val poster = item.optString("poster_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w500$it" else null }
+            
+            home.add(
+                newMovieSearchResponse(title, "tmdb:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
+                    this.posterUrl = poster
+                }
+            )
+        }
+        return newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
     }
 
-    // Hàm tìm kiếm (Bạn có thể phát triển thêm sau)
     override suspend fun search(query: String): List<SearchResponse> {
-        return emptyList()
+        val url = "$mainUrl/search/multi?api_key=$tmdbApiKey&query=$query"
+        val response = app.get(url).text
+        val json = JSONObject(response)
+        val results = json.getJSONArray("results")
+        val searchResults = mutableListOf<SearchResponse>()
+
+        for (i in 0 until results.length()) {
+            val item = results.getJSONObject(i)
+            val mediaType = item.optString("media_type")
+            if (mediaType != "movie" && mediaType != "tv") continue
+            
+            val id = item.getInt("id").toString()
+            val title = item.optString("title", item.optString("name"))
+            val poster = item.optString("poster_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w500$it" else null }
+            
+            searchResults.add(
+                newMovieSearchResponse(title, "tmdb:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
+                    this.posterUrl = poster
+                }
+            )
+        }
+        return searchResults
     }
 
-    // Hàm load thông tin phim.
-    // Ở đây ta giả định plugin sẽ nhận TMDB ID hoặc URL của phim.
-    override suspend fun load(url: String): LoadResponse {
-        // Nếu bạn truyền TMDB ID (ví dụ: "20453")
-        val tmdbId = if (url.contains("tmdb/")) url.substringAfter("tmdb/") else url
+    override suspend fun load(url: String): LoadResponse? {
+        val parts = url.split(":")
+        if (parts.size < 3) return null
+        val mediaType = parts[1]
+        val tmdbId = parts[2]
 
-        return newMovieLoadResponse(
-            name = "Movie $tmdbId", // Tên tạm (bạn có thể gọi API TMDB để lấy tên thật)
-            url = tmdbId,           // Lưu TMDB ID vào trường url để truyền sang loadLinks
-            type = TvType.Movie,
-            dataUrl = tmdbId        // Dữ liệu truyền xuống loadLinks
-        )
+        val detailsUrl = "$mainUrl/$mediaType/$tmdbId?api_key=$tmdbApiKey"
+        val response = app.get(detailsUrl).text
+        val json = JSONObject(response)
+
+        val title = json.optString("title", json.optString("name"))
+        val description = json.optString("overview")
+        val poster = json.optString("poster_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w500$it" else null }
+        val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
+        val imdbId = json.optString("imdb_id")
+
+        var imdbScore: Score? = null
+        if (imdbId.isNotEmpty() && omdbApiKey != "YOUR_OMDB_API_KEY") {
+            try {
+                val omdbUrl = "https://www.omdbapi.com/?apikey=$omdbApiKey&i=$imdbId"
+                val omdbRes = JSONObject(app.get(omdbUrl).text)
+                val ratingStr = omdbRes.optString("imdbRating")
+                if (ratingStr.isNotEmpty() && ratingStr != "N/A") {
+                    imdbScore = Score.from10(ratingStr.toDouble())
+                }
+                ClipboardLogger.logAndCopy("OMDb Data", "IMDb Score: $imdbScore")
+            } catch (e: Exception) {
+                ClipboardLogger.logAndCopy("OMDb Error", e.message ?: "Unknown error")
+            }
+        }
+
+        val episodes = mutableListOf<Episode>()
+        if (mediaType == "tv") {
+            val seasonsCount = json.optInt("number_of_seasons", 1)
+            for (s in 1..seasonsCount) {
+                try {
+                    val seasonRes = app.get("$mainUrl/tv/$tmdbId/season/$s?api_key=$tmdbApiKey").text
+                    val seasonJson = JSONObject(seasonRes)
+                    val eps = seasonJson.getJSONArray("episodes")
+                    for (e in 0 until eps.length()) {
+                        val ep = eps.getJSONObject(e)
+                        episodes.add(
+                            newEpisode("vidlink:tv:$tmdbId:${ep.getInt("season_number")}:${ep.getInt("episode_number")}") {
+                                this.name = ep.optString("name")
+                                this.episode = ep.getInt("episode_number")
+                                this.season = ep.getInt("season_number")
+                                this.description = ep.optString("overview")
+                                this.posterUrl = ep.optString("still_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w300$it" else null }
+                            }
+                        )
+                    }
+                } catch (e: Exception) {
+                    ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
+                }
+            }
+            
+            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                this.data = "vidlink:tv:$tmdbId"
+                this.posterUrl = poster
+                this.plot = description
+                this.year = year
+                this.score = imdbScore 
+            }
+        } else {
+            return newMovieLoadResponse(title, url, TvType.Movie, "vidlink:movie:$tmdbId") {
+                this.posterUrl = poster
+                this.plot = description
+                this.year = year
+                this.score = imdbScore 
+            }
+        }
     }
 
-    // HÀM QUAN TRỌNG NHẤT: Khai báo đúng chữ ký để sửa lỗi 'Unresolved reference data'
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // data ở đây chính là tmdbId được truyền từ hàm load() phía trên
-        val tmdbId = data
-
-        // Danh sách các server từ ảnh bạn gửi
-        val embedUrls = listOf(
-            "https://vidlink.pro/movie/$tmdbId",
-            "https://www.vidking.net/embed/movie/$tmdbId",
-            "https://vidsrc-embed.ru/embed/movie/$tmdbId",
-            "https://www.2embed.cc/embed/$tmdbId",
-            "https://vidsrc.cc/v2/embed/movie/$tmdbId",
-            "https://multiembed.mov/?video_id=$tmdbId&tmdb=1",
-            "https://vidsrc.me/embed/movie/$tmdbId",
-            "https://autoembed.co/movie/tmdb/$tmdbId",
-            "https://111movies.com/movie/$tmdbId",
-            "https://player.videasy.net/movie/$tmdbId",
-            "https://vidfast.vc/movie/$tmdbId"
-        )
-
-        // Duyệt qua từng server và nhờ CloudStream tự động bóc tách link
-        for (embedUrl in embedUrls) {
-            try {
-                // Hàm loadExtractor sẽ tự động nhận diện server và lấy link video
-                loadExtractor(embedUrl, subtitleCallback, callback)
-            } catch (e: Exception) {
-                // Bỏ qua nếu server đó lỗi, chuyển sang server tiếp theo
-                e.printStackTrace()
-            }
+        ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
+        
+        val parts = data.split(":")
+        if (parts.size < 3) {
+            ClipboardLogger.logAndCopy("Error", "Invalid data format: $data")
+            return false
         }
 
-        return true
+        val type = parts[1]
+        val tmdbId = parts[2]
+        
+        val token = CryptoUtils.encryptToken(tmdbId)
+        ClipboardLogger.logAndCopy("Token Generated", "TMDB ID: $tmdbId\nToken: $token")
+
+        val apiUrl = if (type == "movie") {
+            "https://vidlink.pro/api/b/movie/$token?multiLang=1"
+        } else {
+            if (parts.size < 5) {
+                ClipboardLogger.logAndCopy("Error", "Missing season/episode: $data")
+                return false
+            }
+            "https://vidlink.pro/api/b/tv/$token/${parts[3]}/${parts[4]}?multiLang=1"
+        }
+
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+            "Origin" to "https://vidlink.pro",
+            "Referer" to "https://vidlink.pro/"
+        )
+
+        try {
+            ClipboardLogger.logAndCopy("API Request", "URL: $apiUrl")
+            val response = app.get(apiUrl, headers = headers).text
+            ClipboardLogger.logAndCopy("API Response", response)
+
+            val jsonObject = JSONObject(response)
+            val streamObject = jsonObject.optJSONObject("stream")
+            
+            if (streamObject == null) {
+                ClipboardLogger.logAndCopy("Error", "No 'stream' object found in response")
+                return false
+            }
+
+            val playlistUrl = streamObject.optString("playlist")
+            if (playlistUrl.isEmpty()) {
+                ClipboardLogger.logAndCopy("Error", "No 'playlist' URL found in stream object")
+                return false
+            }
+
+            ClipboardLogger.logAndCopy("Success", "Stream URL: $playlistUrl")
+
+            val captionsArray = streamObject.optJSONArray("captions")
+            if (captionsArray != null) {
+                for (i in 0 until captionsArray.length()) {
+                    val caption = captionsArray.getJSONObject(i)
+                    val captionUrl = caption.optString("url")
+                    val captionLang = caption.optString("language")
+                    if (captionUrl.isNotEmpty()) {
+                        subtitleCallback.invoke(SubtitleFile(captionLang, captionUrl))
+                    }
+                }
+            }
+
+            callback.invoke(
+                ExtractorLink(
+                    source = this.name,
+                    name = "VidLink",
+                    url = playlistUrl,
+                    referer = "https://vidlink.pro/",
+                    quality = Qualities.P1080.value,
+                    type = if (playlistUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO 
+                )
+            )
+            return true
+
+        } catch (e: Exception) {
+            ClipboardLogger.logAndCopy("Exception", "Error: ${e.message}\nStackTrace: ${e.stackTraceToString()}")
+            return false
+        }
     }
 }
