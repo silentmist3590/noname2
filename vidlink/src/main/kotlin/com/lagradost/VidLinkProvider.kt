@@ -127,7 +127,7 @@ object ApiServices {
 // =====================================================================================
 
 class VidLinkProvider : MainAPI() {
-    override var mainUrl = "https://api.themoviedb.org/3"
+    override var mainUrl = "https://tmdb-proxy.silentmist3590.workers.dev/3"
     override var name = "VidLink (All-in-One)"
     override var lang = "en"
     override val hasMainPage = true
