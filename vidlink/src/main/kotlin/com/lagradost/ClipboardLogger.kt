@@ -6,7 +6,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import com.lagradost.cloudstream3.APIHolder
+import com.lagradost.cloudstream3.CloudStreamApp // Import đúng lớp
 
 object ClipboardLogger {
     private const val TAG = "VidLinkPlugin"
@@ -16,7 +16,8 @@ object ClipboardLogger {
         Log.d(TAG, logMessage)
 
         try {
-            val context = APIHolder.context ?: return
+            // SỬA LỖI: Dùng CloudStreamApp.context
+            val context = CloudStreamApp.context ?: return
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             
             Handler(Looper.getMainLooper()).post {
