@@ -20,12 +20,12 @@ class VidLinkProvider : MainAPI() {
         return emptyList()
     }
 
-    // Hàm load thông tin phim. 
+    // Hàm load thông tin phim.
     // Ở đây ta giả định plugin sẽ nhận TMDB ID hoặc URL của phim.
     override suspend fun load(url: String): LoadResponse {
         // Nếu bạn truyền TMDB ID (ví dụ: "20453")
         val tmdbId = if (url.contains("tmdb/")) url.substringAfter("tmdb/") else url
-        
+
         return newMovieLoadResponse(
             name = "Movie $tmdbId", // Tên tạm (bạn có thể gọi API TMDB để lấy tên thật)
             url = tmdbId,           // Lưu TMDB ID vào trường url để truyền sang loadLinks
@@ -43,7 +43,7 @@ class VidLinkProvider : MainAPI() {
     ): Boolean {
         // data ở đây chính là tmdbId được truyền từ hàm load() phía trên
         val tmdbId = data
-        
+
         // Danh sách các server từ ảnh bạn gửi
         val embedUrls = listOf(
             "https://vidlink.pro/movie/$tmdbId",
