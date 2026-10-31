@@ -1,7 +1,6 @@
-// VidLink/build.gradle.kts
+// vidlink/build.gradle.kts
 cloudstream {
     description = "VidLink API provider with TMDB metadata and auto-copy debug logs"
-    version = 1
     authors = listOf("silentmist3590")
     status = 1
     tvTypes = listOf("Movie", "TvSeries")
@@ -9,10 +8,10 @@ cloudstream {
 }
 
 android {
-    namespace = "com.example.vidlink"
+    namespace = "com.lagradost" // Đã sửa lại cho khớp với package
 }
 
 dependencies {
-    // Thư viện mã hóa để tạo token
+    // BẮT BUỘC phải có dòng này để mã hóa token hoạt động
     implementation("org.bouncycastle:bcprov-jdk15on:1.70")
 }
