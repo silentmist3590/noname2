@@ -4,28 +4,143 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
+import com.google.gson.Gson
+import com.google.gson.annotations.SerializedName
 import org.json.JSONObject
+
+// =====================================================================================
+// 1. CẤU HÌNH API KEY (Thay thế bằng key của bạn)
+// =====================================================================================
+private const val TMDB_API_KEY = "b9e1ff7ff423790bf7df202e661377ca"
+private const val OMDB_API_KEY = "a116862a"
+private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
+// Trakt Access Token: Chỉ cần nếu bạn muốn theo dõi tiến độ xem (scrobble).
+// Để trống nếu không dùng tính năng này.
+private const val TRAKT_ACCESS_TOKEN = ""
+
+
+// =====================================================================================
+// 2. DATA CLASSES CHO CÁC API
+// =====================================================================================
+
+// --- TVMaze ---
+data class TvMazeShow(
+    @SerializedName("id") val id: Int,
+    @SerializedName("name") val name: String?
+)
+
+data class TvMazeEpisode(
+    @SerializedName("id") val id: Int,
+    @SerializedName("name") val name: String?,
+    @SerializedName("season") val season: Int,
+    @SerializedName("number") val number: Int?,
+    @SerializedName("summary") val summary: String?
+)
+
+// --- OMDb ---
+data class OmdbResponse(
+    @SerializedName("imdbRating") val imdbRating: String?,
+    @SerializedName("imdbVotes") val imdbVotes: String?,
+    @SerializedName("Awards") val awards: String?,
+    @SerializedName("Response") val response: String?
+)
+
+// --- Trakt ---
+data class TraktScrobbleRequest(
+    @SerializedName("movie") val movie: TraktMovie? = null,
+    @SerializedName("episode") val episode: TraktEpisode? = null,
+    @SerializedName("progress") val progress: Float
+)
+data class TraktMovie(@SerializedName("ids") val ids: TraktIds)
+data class TraktEpisode(
+    @SerializedName("season") val season: Int,
+    @SerializedName("number") val number: Int
+)
+data class TraktIds(@SerializedName("tmdb") val tmdb: Int?)
+
+
+// =====================================================================================
+// 3. CÁC HÀM GỌI API (Được gộp chung)
+// =====================================================================================
+
+object ApiServices {
+    // --- TVMaze API ---
+    private const val TVMAZE_BASE = "https://api.tvmaze.com"
+
+    suspend fun searchTvMazeShow(showName: String): TvMazeShow? {
+        return try {
+            val res = app.get("$TVMAZE_BASE/search/shows?q=$showName").text
+            Gson().fromJson(res, Array<TvMazeShow>::class.java).firstOrNull()
+        } catch (e: Exception) {
+            ClipboardLogger.logAndCopy("TVMaze Search Error", e.message ?: "Unknown")
+            null
+        }
+    }
+
+    suspend fun getTvMazeEpisodes(showId: Int): List<TvMazeEpisode> {
+        return try {
+            val res = app.get("$TVMAZE_BASE/shows/$showId/episodes").text
+            Gson().fromJson(res, Array<TvMazeEpisode>::class.java).toList()
+        } catch (e: Exception) {
+            ClipboardLogger.logAndCopy("TVMaze Episodes Error", e.message ?: "Unknown")
+            emptyList()
+        }
+    }
+
+    // --- OMDb API ---
+    suspend fun getOmdbData(imdbId: String): OmdbResponse? {
+        return try {
+            val res = app.get("https://www.omdbapi.com/?apikey=$OMDB_API_KEY&i=$imdbId").text
+            Gson().fromJson(res, OmdbResponse::class.java)
+        } catch (e: Exception) {
+            ClipboardLogger.logAndCopy("OMDb Error", e.message ?: "Unknown")
+            null
+        }
+    }
+
+    // --- Trakt API ---
+    suspend fun sendTraktScrobble(action: String, type: String, tmdbId: Int, progress: Float, season: Int? = null, episode: Int? = null) {
+        if (TRAKT_ACCESS_TOKEN.isEmpty()) return
+        val url = "https://api.trakt.tv/scrobble/$action"
+        val headers = mapOf(
+            "Content-Type" to "application/json",
+            "trakt-api-version" to "2",
+            "trakt-api-key" to TRAKT_CLIENT_ID,
+            "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
+        )
+        val body = if (type == "movie") {
+            TraktScrobbleRequest(movie = TraktMovie(TraktIds(tmdbId)), progress = progress)
+        } else {
+            TraktScrobbleRequest(episode = TraktEpisode(season ?: 1, episode ?: 1), progress = progress)
+        }
+        try {
+            app.post(url, headers = headers, json = body).text
+        } catch (e: Exception) {
+            ClipboardLogger.logAndCopy("Trakt Scrobble Error", e.message ?: "Unknown")
+        }
+    }
+}
+
+
+// =====================================================================================
+// 4. LỚP PROVIDER CHÍNH
+// =====================================================================================
 
 class VidLinkProvider : MainAPI() {
     override var mainUrl = "https://api.themoviedb.org/3"
-    override var name = "VidLink"
+    override var name = "VidLink (All-in-One)"
     override var lang = "en"
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    // TODO: Thay thế bằng API Key của bạn
-    private val tmdbApiKey = "b9e1ff7ff423790bf7df202e661377ca"
-    private val omdbApiKey = "a116862a"
-
     override val mainPage = mainPageOf(
-        "$mainUrl/trending/all/day?api_key=$tmdbApiKey" to "Trending Today",
-        "$mainUrl/movie/popular?api_key=$tmdbApiKey" to "Popular Movies",
-        "$mainUrl/tv/popular?api_key=$tmdbApiKey" to "Popular TV Shows"
+        "$mainUrl/trending/all/day?api_key=$TMDB_API_KEY" to "Trending Today",
+        "$mainUrl/movie/popular?api_key=$TMDB_API_KEY" to "Popular Movies",
+        "$mainUrl/tv/popular?api_key=$TMDB_API_KEY" to "Popular TV Shows"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = "${request.data}&page=$page"
-        val response = app.get(url).text
+        val response = app.get("${request.data}&page=$page").text
         val json = JSONObject(response)
         val results = json.getJSONArray("results")
         val home = mutableListOf<SearchResponse>()
@@ -36,19 +151,15 @@ class VidLinkProvider : MainAPI() {
             val id = item.getInt("id").toString()
             val title = item.optString("title", item.optString("name"))
             val poster = item.optString("poster_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w500$it" else null }
-            
-            home.add(
-                newMovieSearchResponse(title, "tmdb:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
-                    this.posterUrl = poster
-                }
-            )
+            home.add(newMovieSearchResponse(title, "tmdb:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
+                this.posterUrl = poster
+            })
         }
         return newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/search/multi?api_key=$tmdbApiKey&query=$query"
-        val response = app.get(url).text
+        val response = app.get("$mainUrl/search/multi?api_key=$TMDB_API_KEY&query=$query").text
         val json = JSONObject(response)
         val results = json.getJSONArray("results")
         val searchResults = mutableListOf<SearchResponse>()
@@ -57,16 +168,12 @@ class VidLinkProvider : MainAPI() {
             val item = results.getJSONObject(i)
             val mediaType = item.optString("media_type")
             if (mediaType != "movie" && mediaType != "tv") continue
-            
             val id = item.getInt("id").toString()
             val title = item.optString("title", item.optString("name"))
             val poster = item.optString("poster_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w500$it" else null }
-            
-            searchResults.add(
-                newMovieSearchResponse(title, "tmdb:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
-                    this.posterUrl = poster
-                }
-            )
+            searchResults.add(newMovieSearchResponse(title, "tmdb:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
+                this.posterUrl = poster
+            })
         }
         return searchResults
     }
@@ -77,69 +184,67 @@ class VidLinkProvider : MainAPI() {
         val mediaType = parts[1]
         val tmdbId = parts[2]
 
-        val detailsUrl = "$mainUrl/$mediaType/$tmdbId?api_key=$tmdbApiKey"
-        val response = app.get(detailsUrl).text
+        // 1. Lấy thông tin cơ bản từ TMDB
+        val response = app.get("$mainUrl/$mediaType/$tmdbId?api_key=$TMDB_API_KEY").text
         val json = JSONObject(response)
-
         val title = json.optString("title", json.optString("name"))
         val description = json.optString("overview")
         val poster = json.optString("poster_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w500$it" else null }
         val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
         val imdbId = json.optString("imdb_id")
 
+        // 2. Lấy điểm IMDb từ OMDb
         var imdbScore: Score? = null
-        if (imdbId.isNotEmpty() && omdbApiKey != "YOUR_OMDB_API_KEY") {
-            try {
-                val omdbUrl = "https://www.omdbapi.com/?apikey=$omdbApiKey&i=$imdbId"
-                val omdbRes = JSONObject(app.get(omdbUrl).text)
-                val ratingStr = omdbRes.optString("imdbRating")
-                if (ratingStr.isNotEmpty() && ratingStr != "N/A") {
+        if (imdbId.isNotEmpty()) {
+            ApiServices.getOmdbData(imdbId)?.let { omdb ->
+                val ratingStr = omdb.imdbRating
+                if (!ratingStr.isNullOrEmpty() && ratingStr != "N/A") {
                     imdbScore = Score.from10(ratingStr.toDouble())
                 }
-                ClipboardLogger.logAndCopy("OMDb Data", "IMDb Score: $imdbScore")
-            } catch (e: Exception) {
-                ClipboardLogger.logAndCopy("OMDb Error", e.message ?: "Unknown error")
             }
         }
 
+        // 3. Xử lý episodes cho TV Series
         val episodes = mutableListOf<Episode>()
         if (mediaType == "tv") {
-            val seasonsCount = json.optInt("number_of_seasons", 1)
-            for (s in 1..seasonsCount) {
-                try {
-                    val seasonRes = app.get("$mainUrl/tv/$tmdbId/season/$s?api_key=$tmdbApiKey").text
-                    val seasonJson = JSONObject(seasonRes)
-                    val eps = seasonJson.getJSONArray("episodes")
-                    for (e in 0 until eps.length()) {
-                        val ep = eps.getJSONObject(e)
-                        episodes.add(
-                            newEpisode("vidlink:tv:$tmdbId:${ep.getInt("season_number")}:${ep.getInt("episode_number")}") {
+            // Ưu tiên TVMaze
+            val tvMazeShow = ApiServices.searchTvMazeShow(title)
+            if (tvMazeShow != null) {
+                val tvMazeEpisodes = ApiServices.getTvMazeEpisodes(tvMazeShow.id)
+                tvMazeEpisodes.forEach { ep ->
+                    episodes.add(newEpisode("vidlink:tv:$tmdbId:${ep.season}:${ep.number}") {
+                        this.name = ep.name
+                        this.season = ep.season
+                        this.episode = ep.number ?: 0
+                        this.description = ep.summary
+                    })
+                }
+            } else {
+                // Fallback về TMDB nếu TVMaze không có
+                val seasonsCount = json.optInt("number_of_seasons", 1)
+                for (s in 1..seasonsCount) {
+                    try {
+                        val seasonRes = app.get("$mainUrl/tv/$tmdbId/season/$s?api_key=$TMDB_API_KEY").text
+                        val seasonJson = JSONObject(seasonRes)
+                        val eps = seasonJson.getJSONArray("episodes")
+                        for (e in 0 until eps.length()) {
+                            val ep = eps.getJSONObject(e)
+                            episodes.add(newEpisode("vidlink:tv:$tmdbId:${ep.getInt("season_number")}:${ep.getInt("episode_number")}") {
                                 this.name = ep.optString("name")
                                 this.episode = ep.getInt("episode_number")
                                 this.season = ep.getInt("season_number")
                                 this.description = ep.optString("overview")
-                                this.posterUrl = ep.optString("still_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w300$it" else null }
-                            }
-                        )
-                    }
-                } catch (e: Exception) {
-                    ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
+                            })
+                        }
+                    } catch (e: Exception) { /* Bỏ qua lỗi mùa */ }
                 }
             }
-            
-            // SỬA LỖI: Truyền "vidlink:tv:$tmdbId" vào tham số thứ 2 (url)
             return newTvSeriesLoadResponse(title, "vidlink:tv:$tmdbId", TvType.TvSeries, episodes) {
-                this.posterUrl = poster
-                this.plot = description
-                this.year = year
-                this.score = imdbScore 
+                this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
             }
         } else {
             return newMovieLoadResponse(title, url, TvType.Movie, "vidlink:movie:$tmdbId") {
-                this.posterUrl = poster
-                this.plot = description
-                this.year = year
-                this.score = imdbScore 
+                this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
             }
         }
     }
@@ -151,26 +256,22 @@ class VidLinkProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
-        
         val parts = data.split(":")
-        if (parts.size < 3) {
-            ClipboardLogger.logAndCopy("Error", "Invalid data format: $data")
-            return false
-        }
-
+        if (parts.size < 3) return false
         val type = parts[1]
         val tmdbId = parts[2]
-        
-        val token = CryptoUtils.encryptToken(tmdbId)
-        ClipboardLogger.logAndCopy("Token Generated", "TMDB ID: $tmdbId\nToken: $token")
 
+        // Gửi scrobble "start" đến Trakt
+        ApiServices.sendTraktScrobble("start", type, tmdbId.toIntOrNull() ?: 0, 0f,
+            if (type == "tv" && parts.size >= 5) parts[3].toIntOrNull() else null,
+            if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
+        )
+
+        val token = CryptoUtils.encryptToken(tmdbId)
         val apiUrl = if (type == "movie") {
             "https://vidlink.pro/api/b/movie/$token?multiLang=1"
         } else {
-            if (parts.size < 5) {
-                ClipboardLogger.logAndCopy("Error", "Missing season/episode: $data")
-                return false
-            }
+            if (parts.size < 5) return false
             "https://vidlink.pro/api/b/tv/$token/${parts[3]}/${parts[4]}?multiLang=1"
         }
 
@@ -186,45 +287,32 @@ class VidLinkProvider : MainAPI() {
             ClipboardLogger.logAndCopy("API Response", response)
 
             val jsonObject = JSONObject(response)
-            val streamObject = jsonObject.optJSONObject("stream")
-            
-            if (streamObject == null) {
-                ClipboardLogger.logAndCopy("Error", "No 'stream' object found in response")
-                return false
-            }
-
+            val streamObject = jsonObject.optJSONObject("stream") ?: return false
             val playlistUrl = streamObject.optString("playlist")
-            if (playlistUrl.isEmpty()) {
-                ClipboardLogger.logAndCopy("Error", "No 'playlist' URL found in stream object")
-                return false
-            }
+            if (playlistUrl.isEmpty()) return false
 
             ClipboardLogger.logAndCopy("Success", "Stream URL: $playlistUrl")
 
-            val captionsArray = streamObject.optJSONArray("captions")
-            if (captionsArray != null) {
-                for (i in 0 until captionsArray.length()) {
-                    val caption = captionsArray.getJSONObject(i)
-                    val captionUrl = caption.optString("url")
-                    val captionLang = caption.optString("language")
-                    if (captionUrl.isNotEmpty()) {
-                        subtitleCallback.invoke(SubtitleFile(captionLang, captionUrl))
-                    }
+            // Gửi scrobble "stop" đến Trakt (vì không có thông tin thời lượng)
+            ApiServices.sendTraktScrobble("stop", type, tmdbId.toIntOrNull() ?: 0, 100f,
+                if (type == "tv" && parts.size >= 5) parts[3].toIntOrNull() else null,
+                if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
+            )
+
+            // Xử lý phụ đề
+            streamObject.optJSONArray("captions")?.let { captions ->
+                for (i in 0 until captions.length()) {
+                    val cap = captions.getJSONObject(i)
+                    val capUrl = cap.optString("url")
+                    if (capUrl.isNotEmpty()) subtitleCallback.invoke(SubtitleFile(cap.optString("language"), capUrl))
                 }
             }
 
-            callback.invoke(
-                ExtractorLink(
-                    source = this.name,
-                    name = "VidLink",
-                    url = playlistUrl,
-                    referer = "https://vidlink.pro/",
-                    quality = Qualities.P1080.value,
-                    type = if (playlistUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO 
-                )
-            )
+            callback.invoke(ExtractorLink(
+                source = this.name, name = "VidLink", url = playlistUrl, referer = "https://vidlink.pro/",
+                quality = Qualities.P1080.value, type = if (playlistUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            ))
             return true
-
         } catch (e: Exception) {
             ClipboardLogger.logAndCopy("Exception", "Error: ${e.message}\nStackTrace: ${e.stackTraceToString()}")
             return false
