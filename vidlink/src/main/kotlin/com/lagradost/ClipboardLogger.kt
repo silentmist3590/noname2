@@ -1,5 +1,4 @@
-// ClipboardLogger.kt
-package com.example.vidlink
+package com.lagradost // Đảm bảo đúng package của bạn
 
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -17,9 +16,10 @@ object ClipboardLogger {
         Log.d(TAG, logMessage)
 
         try {
-            val context = app
-            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            // Sử dụng app context trực tiếp để lấy ClipboardManager
+            val clipboard = app.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             
+            // Chạy trên Main Thread để đảm bảo an toàn
             Handler(Looper.getMainLooper()).post {
                 val clip = ClipData.newPlainText("VidLink Log", logMessage)
                 clipboard.setPrimaryClip(clip)
