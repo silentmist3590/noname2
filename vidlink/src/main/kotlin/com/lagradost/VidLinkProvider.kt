@@ -1,5 +1,4 @@
-// VidLinkProvider.kt
-package com.example.vidlink
+package com.lagradost // Đảm bảo đúng package của bạn
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -88,13 +87,17 @@ class VidLinkProvider : MainAPI() {
         val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
         val imdbId = json.optString("imdb_id")
 
-        var imdbRating: String? = null
+        var imdbScore: Int? = null
         if (imdbId.isNotEmpty() && omdbApiKey != "YOUR_OMDB_API_KEY") {
             try {
                 val omdbUrl = "https://www.omdbapi.com/?apikey=$omdbApiKey&i=$imdbId"
                 val omdbRes = JSONObject(app.get(omdbUrl).text)
-                imdbRating = omdbRes.optString("imdbRating")
-                ClipboardLogger.logAndCopy("OMDb Data", "IMDb Rating: $imdbRating")
+                val ratingStr = omdbRes.optString("imdbRating")
+                if (ratingStr.isNotEmpty() && ratingStr != "N/A") {
+                    // Đổi điểm IMDb (thang 10) sang thang 100 của Cloudstream
+                    imdbScore = (ratingStr.toDouble() * 10).toInt()
+                }
+                ClipboardLogger.logAndCopy("OMDb Data", "IMDb Score: $imdbScore")
             } catch (e: Exception) {
                 ClipboardLogger.logAndCopy("OMDb Error", e.message ?: "Unknown error")
             }
@@ -126,13 +129,22 @@ class VidLinkProvider : MainAPI() {
             }
         }
 
-        val loadData = if (mediaType == "tv") "vidlink:tv:$tmdbId" else "vidlink:movie:$tmdbId"
-        return newMovieLoadResponse(title, url, if (mediaType == "tv") TvType.TvSeries else TvType.Movie, loadData) {
-            this.posterUrl = poster
-            this.plot = description
-            this.year = year
-            this.rating = imdbRating?.toIntOrNull()?.times(10)
-            this.episodes = episodes
+        // Sửa lỗi: Phân tách rõ ràng giữa Movie và TVSeries
+        if (mediaType == "tv") {
+            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, "vidlink:tv:$tmdbId") {
+                this.posterUrl = poster
+                this.plot = description
+                this.year = year
+                this.score = imdbScore // Sử dụng score thay vì rating
+                this.episodes = episodes
+            }
+        } else {
+            return newMovieLoadResponse(title, url, TvType.Movie, "vidlink:movie:$tmdbId") {
+                this.posterUrl = poster
+                this.plot = description
+                this.year = year
+                this.score = imdbScore // Sử dụng score thay vì rating
+            }
         }
     }
 
