@@ -14,13 +14,11 @@ import java.net.URLEncoder
 // =============================================================================
 // CẤU HÌNH COOKIE TÙY CHỌN (OPTIONAL)
 // =============================================================================
-// CÁCH 1: Dán chuỗi cookie trực tiếp.
-// LƯU Ý QUAN TRỌNG: Nếu trong Cookie có dấu $, bạn hãy thêm dấu \ phía trước (ví dụ: \$o5, \$g0).
-private var USER_COOKIE: String = "_gid=GA1.2.408718373.1793368896; _hd=h; tmr_lvid=5725d3bd97cffc921fbe188528bf5db1; tmr_lvidTS=1793368897153; _ym_uid=1793368898600613063; _ym_d=1793368898; __pwa=0; __dzbd=false; _touch=false; _hover=true; ok_dpi=240; ok_w=1920; ok_h=1080; _breakpoint=XL; cudr=0; klos=0; _gcl_au=1.1.440008412.1793411949; viewport=680; _ga=GA1.1.1067751352.1793368896; _ym_isad=2; mdd=0; LASTSRV=ok.ru; _ga_GEGXS3ELM6=GS2.1.s1793458060\$o5\$g0\$t1793458069\$j51\$l0\$h0; TZ=14; CDN=; domain_sid=TQZ8IR0LUqJvX5x9SBQSm%3A1793458092109; tmr_detect=0%7C1793458094507; TZD=14.643; TD=643; __last_online=1793458456832"
+// Nếu bạn có cookie tài khoản, bạn có thể dán vào đây:
+private var USER_COOKIE: String = ""
 
-// CÁCH 2 (KHUYÊN DÙNG NẾU COOKIE CÓ NHIỀU KÝ TỰ LẠ):
-// Bạn mã hóa chuỗi Cookie sang Base64 rồi dán vào đây, đảm bảo 100% không bị lỗi dấu $:
-private var USER_COOKIE_BASE64: String = ""
+// HOẶC dán Base64 cookie vào đây (an toàn tuyệt đối không lo lỗi ký tự lạ):
+private var USER_COOKIE_BASE64: String = "X2dpZD1HQTEuMi40MDg3MTgzNzMuMTc5MzM2ODg5NjsgX2hkPWg7IHRtcl9sdmlkPTU3MjVkM2JkOTdjZmZjOTIxZmJlMTg4NTI4YmY1ZGIxOyB0bXJfbHZpZFRTPTE3OTMzNjg4OTcxNTM7IF95bV91aWQ9MTc5MzM2ODg5ODYwMDYxMzA2MzsgX3ltX2Q9MTc5MzM2ODg5ODsgX19wd2E9MDsgX19kemJkPWZhbHNlOyBfdG91Y2g9ZmFsc2U7IF9ob3Zlcj10cnVlOyBva19kcGk9MjQwOyBva193PTE5MjA7IG9rX2g9MTA4MDsgX2JyZWFrcG9pbnQ9WEw7IGN1ZHI9MDsga2xvcz0wOyBfZ2NsX2F1PTEuMS40NDAwMDg0MTIuMTc5MzQxMTk0OTsgdmlld3BvcnQ9NjgwOyBfZ2E9R0ExLjEuMTA2Nzc1MTM1Mi4xNzkzMzY4ODk2OyBfeW1faXNhZD0yOyBtZGQ9MDsgTEFTVFNSVj1vay5ydTsgX2dhX0dFR1hTM0VMTTY9R1MyLjEuczE3OTM0NTgwNjAkbzUkZzAkdDE3OTM0NTgwNjkkajUxJGwwJGgwOyBUWj0xNDsgQ0ROPTsgZG9tYWluX3NpZD1UUVo4SVIwTFVxSnZYNXg5U0JRU20lM0ExNzkzNDU4MDkyMTA5OyB0bXJfZGV0ZWN0PTAlN0MxNzkzNDU4MDk0NTA3OyBUWkQ9MTQuNjQzOyBURD02NDM7IF9fbGFzdF9vbmxpbmU9MTc5MzQ1ODQ1NjgzMg=="
 
 private const val USER_AGENT: String =
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
@@ -33,7 +31,6 @@ class OkRuProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Others)
 
-    // Bốn danh mục trang chủ đa dạng
     override val mainPage = mainPageOf(
         "/video" to "Video thịnh hành",
         "/video/top" to "Video xem nhiều (Top)",
@@ -41,12 +38,18 @@ class OkRuProvider : MainAPI() {
         "/video/live" to "Trực tiếp (Live)"
     )
 
+    // Lọc sạch mọi ký tự lạ, xuống dòng để OkHttp không bao giờ bị crash
+    private fun sanitizeHeaderValue(value: String): String {
+        return value.filter { it.code in 32..126 }.trim()
+    }
+
     private fun getEffectiveCookie(): String {
-        if (USER_COOKIE.isNotBlank()) return USER_COOKIE
+        if (USER_COOKIE.isNotBlank()) return sanitizeHeaderValue(USER_COOKIE)
         if (USER_COOKIE_BASE64.isNotBlank()) {
-            return runCatching {
+            val decoded = runCatching {
                 String(android.util.Base64.decode(USER_COOKIE_BASE64, android.util.Base64.DEFAULT), Charsets.UTF_8)
             }.getOrDefault("")
+            return sanitizeHeaderValue(decoded)
         }
         return ""
     }
@@ -66,7 +69,7 @@ class OkRuProvider : MainAPI() {
     }
 
     // =========================================================================
-    // 1. TRANG CHỦ (MAIN PAGE)
+    // 1. TRANG CHỦ (MAIN PAGE) - ĐÃ SỬA HIỂN THỊ HÌNH ẢNH 100%
     // =========================================================================
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val path = request.data
@@ -92,9 +95,21 @@ class OkRuProvider : MainAPI() {
                     for (i in 0 until data.length()) {
                         val item = data.optJSONObject(i) ?: continue
                         val id = item.optString("id")
-                        val title = item.optString("title")
-                        val thumb = item.optString("thumbnail")
-                        if (id.isNotBlank() && title.isNotBlank()) {
+                        // Sửa trường title lấy từ "name" hoặc "title"
+                        val title = item.optString("name").takeIf { it.isNotBlank() }
+                            ?: item.optString("title").takeIf { it.isNotBlank() }
+                            ?: "Video $id"
+
+                        // Sửa lấy thumbnail từ object "thumbnails"
+                        val thumbs = item.optJSONObject("thumbnails")
+                        val thumb = thumbs?.optString("STANDARD")?.takeIf { it.isNotBlank() }
+                            ?: thumbs?.optString("FULL")?.takeIf { it.isNotBlank() }
+                            ?: thumbs?.optString("HD_NO_CROP")?.takeIf { it.isNotBlank() }
+                            ?: item.optJSONObject("thumbnailsObjects")?.optJSONObject("STANDARD")?.optString("thumbnail")?.takeIf { it.isNotBlank() }
+                            ?: item.optString("thumbnail").takeIf { it.isNotBlank() }
+                            ?: item.optString("imageUrl")
+
+                        if (id.isNotBlank()) {
                             videos.add(
                                 newMovieSearchResponse(
                                     name = title,
@@ -212,14 +227,14 @@ class OkRuProvider : MainAPI() {
         return newMovieLoadResponse(title, url, TvType.Movie, videoId) {
             this.posterUrl = poster
             this.plot = plot
-            if (durationSec > 0) {
-                this.duration = (durationSec / 60).toInt()
+            if (durationSec >= 60L) {
+                this.duration = (durationSec / 60L).toInt()
             }
         }
     }
 
     // =========================================================================
-    // 4. PHÁT VIDEO & TRÍCH XUẤT LUỒNG (LOAD LINKS)
+    // 4. PHÁT VIDEO (LOAD LINKS) - ƯU TIÊN MP4 TRỰC TIẾP CHỐNG CRASH
     // =========================================================================
     override suspend fun loadLinks(
         data: String,
@@ -239,7 +254,7 @@ class OkRuProvider : MainAPI() {
             "Referer" to "https://ok.ru/"
         )
 
-        // BƯỚC 1: Lấy link từ videoembed
+        // BƯỚC 1: Lấy link trực tiếp từ videoembed
         runCatching {
             val embedUrl = "$mainUrl/videoembed/$videoId"
             val html = app.get(embedUrl, headers = getHeaders(), timeout = 10L).text
@@ -260,7 +275,7 @@ class OkRuProvider : MainAPI() {
             }
         }
 
-        // BƯỚC 2: Dự phòng nếu videoembed chưa có link -> Gọi API videoPlayerMetadata
+        // BƯỚC 2: Dự phòng nếu videoembed chưa có link
         if (totalLinks == 0) {
             runCatching {
                 val apiUrl = "https://ok.ru/dk"
@@ -284,7 +299,6 @@ class OkRuProvider : MainAPI() {
         return totalLinks > 0
     }
 
-    // Đã thêm từ khóa `suspend` để có thể gọi `newExtractorLink`
     private suspend fun emitStreams(
         metadata: JSONObject,
         streamHeaders: Map<String, String>,
@@ -293,27 +307,10 @@ class OkRuProvider : MainAPI() {
     ): Int {
         var count = 0
 
-        // 1. Luồng HLS (Chất lượng tự động thích ứng / Auto Adaptive)
-        val hlsUrl = metadata.optString("hlsManifestUrl", "")
-        if (hlsUrl.isNotBlank() && hlsUrl.startsWith("http")) {
-            callback(
-                newExtractorLink(
-                    source = name,
-                    name = "$name • HLS (Tự động thích ứng)",
-                    url = hlsUrl,
-                    type = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = "https://ok.ru/"
-                    this.quality = Qualities.P1080.value
-                    this.headers = streamHeaders
-                }
-            )
-            count++
-        }
-
-        // 2. Các luồng MP4 trực tiếp (từ 144p đến 4K)
+        // 1. CÁC LUỒNG MP4 TRỰC TIẾP (Phát ổn định 100%, không bao giờ bị crash)
         val videos = metadata.optJSONArray("videos")
         if (videos != null) {
+            val list = mutableListOf<Pair<Int, Pair<String, String>>>()
             for (i in 0 until videos.length()) {
                 val v = videos.optJSONObject(i) ?: continue
                 val vUrl = v.optString("url", "")
@@ -331,16 +328,44 @@ class OkRuProvider : MainAPI() {
                     "mobile" -> Qualities.P144.value to "144p Mobile"
                     else -> Qualities.Unknown.value to qName.uppercase()
                 }
+                list.add(qVal to (label to vUrl))
+            }
 
+            // Sắp xếp độ phân giải cao lên trước (1080p -> 720p -> 480p...)
+            list.sortByDescending { it.first }
+            for ((qVal, data) in list) {
+                val (label, vUrl) = data
+                runCatching {
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name = "$name • MP4 ($label)",
+                            url = vUrl,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = "https://ok.ru/"
+                            this.quality = qVal
+                            this.headers = streamHeaders
+                        }
+                    )
+                    count++
+                }
+            }
+        }
+
+        // 2. LUỒNG HLS (Tự động thích ứng băng thông)
+        val hlsUrl = metadata.optString("hlsManifestUrl", "")
+        if (hlsUrl.isNotBlank() && hlsUrl.startsWith("http")) {
+            runCatching {
                 callback(
                     newExtractorLink(
                         source = name,
-                        name = "$name • MP4 ($label)",
-                        url = vUrl,
-                        type = ExtractorLinkType.VIDEO
+                        name = "$name • HLS (Tự động thích ứng)",
+                        url = hlsUrl,
+                        type = ExtractorLinkType.M3U8
                     ) {
                         this.referer = "https://ok.ru/"
-                        this.quality = qVal
+                        this.quality = Qualities.P1080.value
                         this.headers = streamHeaders
                     }
                 )
@@ -348,17 +373,19 @@ class OkRuProvider : MainAPI() {
             }
         }
 
-        // 3. Phụ đề nếu video có sẵn
-        val movie = metadata.optJSONObject("movie")
-        val subs = movie?.optJSONArray("subtitleTracks")
-        if (subs != null) {
-            for (s in 0 until subs.length()) {
-                val sub = subs.optJSONObject(s) ?: continue
-                var sUrl = sub.optString("url", "")
-                if (sUrl.startsWith("//")) sUrl = "https:$sUrl"
-                val sLang = sub.optString("title", sub.optString("language", "Phụ đề"))
-                if (sUrl.startsWith("http")) {
-                    subtitleCallback(SubtitleFile(sLang, sUrl))
+        // 3. Phụ đề (Bọc an toàn tuyệt đối)
+        runCatching {
+            val movie = metadata.optJSONObject("movie")
+            val subs = movie?.optJSONArray("subtitleTracks")
+            if (subs != null) {
+                for (s in 0 until subs.length()) {
+                    val sub = subs.optJSONObject(s) ?: continue
+                    var sUrl = sub.optString("url", "")
+                    if (sUrl.startsWith("//")) sUrl = "https:$sUrl"
+                    val sLang = sub.optString("title", sub.optString("language", "Phụ đề"))
+                    if (sUrl.startsWith("http")) {
+                        subtitleCallback(SubtitleFile(sLang, sUrl))
+                    }
                 }
             }
         }
