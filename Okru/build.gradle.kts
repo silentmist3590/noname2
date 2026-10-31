@@ -1,28 +1,13 @@
 plugins {
-    id("com.android.library")
-    id("kotlin-android")
+    kotlin("android")
 }
 
-android {
-    namespace = "com.lagradost.okru"
-    compileSdk = 34
-
-    defaultConfig {
-        minSdk = 21
-    }
-
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
-    }
-
-    kotlinOptions {
-        jvmTarget = "1.8"
-        freeCompilerArgs = freeCompilerArgs + "-Xopt-in=kotlin.RequiresOptIn"
-    }
-}
-
-dependencies {
-    val cloudstream by configurations
-    cloudstream("com.lagradost:cloudstream3:pre-release")
+cloudstream {
+    language = "vi"
+    description = "OK.ru - Tìm kiếm, xem video và trích xuất luồng phát Odnoklassniki (144p - 4K, HLS)"
+    authors = listOf("TJ-Plugins")
+    version = 1
+    status = 1
+    tvTypes = listOf("Movie", "Others")
+    iconUrl = "https://ok.ru/favicon.ico"
 }
