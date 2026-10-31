@@ -14,8 +14,8 @@ class VidLinkProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     // TODO: Thay thế bằng API Key của bạn
-    private val tmdbApiKey = "YOUR_TMDB_API_KEY"
-    private val omdbApiKey = "YOUR_OMDB_API_KEY"
+    private val tmdbApiKey = "b9e1ff7ff423790bf7df202e661377ca"
+    private val omdbApiKey = "a116862a"
 
     override val mainPage = mainPageOf(
         "$mainUrl/trending/all/day?api_key=$tmdbApiKey" to "Trending Today",
