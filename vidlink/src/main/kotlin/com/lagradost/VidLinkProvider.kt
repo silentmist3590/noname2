@@ -1,4 +1,4 @@
-package com.lagradost // Đảm bảo đúng package của bạn
+package com.lagradost
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -14,8 +14,8 @@ class VidLinkProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     // TODO: Thay thế bằng API Key của bạn
-    private val tmdbApiKey = "b9e1ff7ff423790bf7df202e661377ca"
-    private val omdbApiKey = "a116862a"
+    private val tmdbApiKey = "YOUR_TMDB_API_KEY"
+    private val omdbApiKey = "YOUR_OMDB_API_KEY"
 
     override val mainPage = mainPageOf(
         "$mainUrl/trending/all/day?api_key=$tmdbApiKey" to "Trending Today",
@@ -87,15 +87,15 @@ class VidLinkProvider : MainAPI() {
         val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
         val imdbId = json.optString("imdb_id")
 
-        var imdbScore: Int? = null
+        var imdbScore: Score? = null
         if (imdbId.isNotEmpty() && omdbApiKey != "YOUR_OMDB_API_KEY") {
             try {
                 val omdbUrl = "https://www.omdbapi.com/?apikey=$omdbApiKey&i=$imdbId"
                 val omdbRes = JSONObject(app.get(omdbUrl).text)
                 val ratingStr = omdbRes.optString("imdbRating")
                 if (ratingStr.isNotEmpty() && ratingStr != "N/A") {
-                    // Đổi điểm IMDb (thang 10) sang thang 100 của Cloudstream
-                    imdbScore = (ratingStr.toDouble() * 10).toInt()
+                    // Chuyển đổi điểm IMDb (thang 10) sang đối tượng Score của Cloudstream
+                    imdbScore = Score.from10(ratingStr.toDouble())
                 }
                 ClipboardLogger.logAndCopy("OMDb Data", "IMDb Score: $imdbScore")
             } catch (e: Exception) {
@@ -127,23 +127,20 @@ class VidLinkProvider : MainAPI() {
                     ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
                 }
             }
-        }
-
-        // Sửa lỗi: Phân tách rõ ràng giữa Movie và TVSeries
-        if (mediaType == "tv") {
-            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, "vidlink:tv:$tmdbId") {
+            
+            // Sửa lỗi: Truyền danh sách `episodes` vào làm đối số thứ 5
+            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, "vidlink:tv:$tmdbId", episodes) {
                 this.posterUrl = poster
                 this.plot = description
                 this.year = year
-                this.score = imdbScore // Sử dụng score thay vì rating
-                this.episodes = episodes
+                this.score = imdbScore 
             }
         } else {
             return newMovieLoadResponse(title, url, TvType.Movie, "vidlink:movie:$tmdbId") {
                 this.posterUrl = poster
                 this.plot = description
                 this.year = year
-                this.score = imdbScore // Sử dụng score thay vì rating
+                this.score = imdbScore 
             }
         }
     }
@@ -224,7 +221,8 @@ class VidLinkProvider : MainAPI() {
                     url = playlistUrl,
                     referer = "https://vidlink.pro/",
                     quality = Qualities.P1080.value,
-                    type = if (playlistUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.MP4
+                    // Sửa lỗi: Đổi MP4 thành M3U8 vì enum MP4 không tồn tại trong bản SDK này
+                    type = if (playlistUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.M3U8 
                 )
             )
             return true
