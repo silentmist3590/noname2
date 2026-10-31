@@ -3,7 +3,7 @@ name: Build
 on:
   push:
     branches:
-      - main # Hoặc master, tùy vào nhánh chính của bạn
+      - main # Hoặc master tùy vào nhánh chính của bạn
     paths-ignore:
       - '*.md'
 
@@ -23,7 +23,7 @@ jobs:
       - name: Checkout builds branch
         uses: actions/checkout@v4
         with:
-          ref: "builds"
+          ref: "builds" # Nhánh chứa file .cs3
           path: "builds"
 
       - name: Clean old builds
@@ -41,7 +41,9 @@ jobs:
           gradle-version: 'current'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
 
       - name: Build Plugins
         run: |
