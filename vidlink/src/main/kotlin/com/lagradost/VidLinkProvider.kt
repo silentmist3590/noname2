@@ -94,7 +94,6 @@ class VidLinkProvider : MainAPI() {
                 val omdbRes = JSONObject(app.get(omdbUrl).text)
                 val ratingStr = omdbRes.optString("imdbRating")
                 if (ratingStr.isNotEmpty() && ratingStr != "N/A") {
-                    // Chuyển đổi điểm IMDb (thang 10) sang đối tượng Score của Cloudstream
                     imdbScore = Score.from10(ratingStr.toDouble())
                 }
                 ClipboardLogger.logAndCopy("OMDb Data", "IMDb Score: $imdbScore")
@@ -128,8 +127,9 @@ class VidLinkProvider : MainAPI() {
                 }
             }
             
-            // Sửa lỗi: Truyền danh sách `episodes` vào làm đối số thứ 5
-            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, "vidlink:tv:$tmdbId", episodes) {
+            // SỬA LỖI: Bỏ chuỗi data ra khỏi đối số, đưa nó vào bên trong block
+            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                this.data = "vidlink:tv:$tmdbId" // Gán data ở đây
                 this.posterUrl = poster
                 this.plot = description
                 this.year = year
@@ -221,8 +221,8 @@ class VidLinkProvider : MainAPI() {
                     url = playlistUrl,
                     referer = "https://vidlink.pro/",
                     quality = Qualities.P1080.value,
-                    // Sửa lỗi: Đổi MP4 thành M3U8 vì enum MP4 không tồn tại trong bản SDK này
-                    type = if (playlistUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.M3U8 
+                    // Sử dụng VIDEO thay vì MP4 để tránh lỗi Unresolved
+                    type = if (playlistUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO 
                 )
             )
             return true
