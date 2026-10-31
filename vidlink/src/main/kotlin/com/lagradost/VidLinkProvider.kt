@@ -10,16 +10,13 @@ class VidLinkProvider : MainAPI() {
     override var mainUrl = "https://api.themoviedb.org/3"
     override var name = "VidLink"
     override var lang = "en"
-    
-    // BẬT giao diện chính
-    override val hasMainPage = true 
+    override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     // TODO: Thay thế bằng API Key của bạn
     private val tmdbApiKey = "YOUR_TMDB_API_KEY"
     private val omdbApiKey = "YOUR_OMDB_API_KEY"
 
-    // Định nghĩa các mục trên giao diện chính
     override val mainPage = mainPageOf(
         "$mainUrl/trending/all/day?api_key=$tmdbApiKey" to "Trending Today",
         "$mainUrl/movie/popular?api_key=$tmdbApiKey" to "Popular Movies",
@@ -130,8 +127,8 @@ class VidLinkProvider : MainAPI() {
                 }
             }
             
-            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                this.data = "vidlink:tv:$tmdbId"
+            // SỬA LỖI: Truyền "vidlink:tv:$tmdbId" vào tham số thứ 2 (url)
+            return newTvSeriesLoadResponse(title, "vidlink:tv:$tmdbId", TvType.TvSeries, episodes) {
                 this.posterUrl = poster
                 this.plot = description
                 this.year = year
