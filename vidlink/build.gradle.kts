@@ -2,6 +2,7 @@
 cloudstream {
     description = "VidLink API provider with TMDB metadata and auto-copy debug logs"
     authors = listOf("silentmist3590")
+    version = 1
     status = 1
     tvTypes = listOf("Movie", "TvSeries")
     requiresResources = false
