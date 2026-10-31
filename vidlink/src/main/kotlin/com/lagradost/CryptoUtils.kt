@@ -1,5 +1,4 @@
-// CryptoUtils.kt
-package com.example.vidlink
+package com.lagradost
 
 import org.bouncycastle.crypto.engines.XSalsa20Engine
 import org.bouncycastle.crypto.macs.Poly1305
