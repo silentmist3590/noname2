@@ -4,10 +4,7 @@ import android.content.Context
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
 import org.jsoup.Jsoup
 
@@ -208,7 +205,7 @@ class OkRuProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val cleanQuery = query.trim()
 
-        // Hỗ trợ người dùng dán trực tiếp link ok.ru vào ô tìm kiếm: ok.ru/video/123456...
+        // Hỗ trợ dán trực tiếp link ok.ru vào ô tìm kiếm: ok.ru/video/123456...
         val directMatch = Regex("""(?:video|videoembed)/(\d+)""").find(cleanQuery)
         if (directMatch != null) {
             val id = directMatch.groupValues[1]
@@ -293,7 +290,7 @@ class OkRuProvider : MainAPI() {
             } catch (ignored: Exception) {}
         }
 
-        // Fallback lấy title từ thẻ meta HTML nếu JSON không có
+        // Fallback lấy tiêu đề và ảnh bìa từ HTML nếu không có trong metadata
         if (title == "OK.ru Video #$videoId") {
             val doc = Jsoup.parse(response)
             val docTitle = doc.select("meta[property=og:title], meta[name=title]").attr("content")
