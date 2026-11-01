@@ -5,20 +5,14 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import org.json.JSONObject
-import java.util.Base64
 
-// =====================================================================================
-// 1. CẤU HÌNH API KEY VÀ PROXY
-// =====================================================================================
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
+// TODO: Thay thế bằng API key TMDB hợp lệ của bạn
 private const val TMDB_API_KEY = "b9e1ff7ff423790bf7df202e661377ca"
 private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
 private const val TRAKT_ACCESS_TOKEN = "" 
 
-// =====================================================================================
-// 2. CÁC HÀM GỌI API HỖ TRỢ
-// =====================================================================================
 object ApiServices {
     suspend fun getOmdbData(imdbId: String): String? {
         return try {
@@ -61,9 +55,6 @@ object ApiServices {
     }
 }
 
-// =====================================================================================
-// 3. LỚP PROVIDER CHÍNH
-// =====================================================================================
 class VidscmovProvider : MainAPI() {
     override var mainUrl = TMDB_BASE_URL
     override var name = "Vidscmov"
@@ -160,19 +151,18 @@ class VidscmovProvider : MainAPI() {
                     ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
                 }
             }
+            // Sửa lỗi: Truyền data chính xác
             return newTvSeriesLoadResponse(title, "vidscmov:tv:$tmdbIdInt", TvType.TvSeries, episodes) {
                 this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
             }
         } else {
+            // Sửa lỗi: Truyền data chính xác
             return newMovieLoadResponse(title, url, TvType.Movie, "vidscmov:movie:$tmdbIdInt") {
                 this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
             }
         }
     }
 
-    // =====================================================================================
-    // CÁC HÀM GIẢI MÃ (DECRYPTORS) TỪ VIDSRC
-    // =====================================================================================
     private fun decodeUrl(encType: String, url: String): String? {
         return when (encType) {
             "NdonQLf1Tzyx7bMG" -> bMGyx71TzQLfdonN(url)
@@ -273,9 +263,6 @@ class VidscmovProvider : MainAPI() {
         return e
     }
 
-    // =====================================================================================
-    // HÀM CHÍNH: LOAD LINKS
-    // =====================================================================================
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         val parts = data.split(":")
@@ -287,7 +274,6 @@ class VidscmovProvider : MainAPI() {
         val type = parts[1]
         val tmdbIdStr = parts[2]
         
-        // Sửa lỗi kiểm tra ID: chỉ cần chuyển sang số là được
         val tmdbId = tmdbIdStr.toIntOrNull()
         if (tmdbId == null) {
             ClipboardLogger.logAndCopy("Error", "TMDB ID không hợp lệ: $tmdbIdStr")
@@ -317,7 +303,6 @@ class VidscmovProvider : MainAPI() {
             val embedResponse = app.get(embedUrl, headers = headers).text
             ClipboardLogger.logAndCopy("Embed Response", embedResponse)
 
-            // Bước 1: Tìm iframe (trỏ đến vidsrc.sh)
             val iframeRegex = Regex("""<iframe[^>]*src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             val iframeUrl = iframeRegex.find(embedResponse)?.groupValues?.get(1)
 
@@ -327,14 +312,12 @@ class VidscmovProvider : MainAPI() {
             }
             ClipboardLogger.logAndCopy("Iframe Found", iframeUrl)
 
-            // Bước 2: Fetch trang vidsrc.sh
             val iframeResponse = app.get(iframeUrl, headers = mapOf(
                 "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
                 "Referer" to "https://vidsrc.mov/"
             )).text
             ClipboardLogger.logAndCopy("Iframe Response", iframeResponse)
 
-            // Bước 3: Giải mã link từ thẻ div
             val rcpResponse = app.get(iframeUrl, headers = headers)
             var finalUrl: String? = null
             
@@ -346,7 +329,6 @@ class VidscmovProvider : MainAPI() {
                 finalUrl = decodeUrl(encType, encodedUrl)
             }
 
-            // Bước 4: Nếu không giải mã được, thử tìm link m3u8 trực tiếp trong HTML
             if (finalUrl.isNullOrEmpty()) {
                 val m3u8Regex = Regex("""(https?://[^"']*\.m3u8[^"']*)""", RegexOption.IGNORE_CASE)
                 finalUrl = m3u8Regex.find(iframeResponse)?.groupValues?.get(1)
@@ -365,7 +347,6 @@ class VidscmovProvider : MainAPI() {
                 if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
             )
 
-            // Xử lý phụ đề (nếu có)
             val subtitleRegex = Regex("""(https?://[^"']*\.(?:vtt|srt))""", RegexOption.IGNORE_CASE)
             subtitleRegex.findAll(iframeResponse).forEach { match ->
                 val subUrl = match.groupValues[1]
@@ -374,13 +355,12 @@ class VidscmovProvider : MainAPI() {
                 }
             }
 
-            // Bước 5: Gửi link với Referer chính xác đã bắt được từ Sniff
             callback.invoke(
                 ExtractorLink(
                     source = this.name,
                     name = "Vidscmov",
                     url = finalUrl,
-                    referer = "https://stellarconductornexus.com/", // BẮT BUỘC THEO SNIFF
+                    referer = "https://stellarconductornexus.com/",
                     quality = Qualities.P1080.value,
                     type = ExtractorLinkType.M3U8,
                     headers = mapOf(
