@@ -18,12 +18,7 @@ import java.net.URLEncoder
 // =====================================================================
 // ENTRY POINT
 // =====================================================================
-@CloudstreamPlugin
-class OkRuPlugin : Plugin() {
-    override fun load(context: Context) {
-        registerMainAPI(OkRuProvider())
-    }
-}
+
 
 // =====================================================================
 // PROVIDER
