@@ -8,6 +8,9 @@ import org.json.JSONObject
 import org.jsoup.Jsoup
 import java.net.URLDecoder
 import java.net.URLEncoder
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
+
 
 class OkRuProvider : MainAPI() {
     override var mainUrl = "https://ok.ru"
@@ -209,5 +212,12 @@ class OkRuProvider : MainAPI() {
             }
             false
         }.getOrDefault(false)
+    }
+}
+@CloudstreamPlugin
+class OkRuPlugin : Plugin() {
+    override fun load(context: android.content.Context) {
+        // Đăng ký lớp Provider của bạn vào hệ thống Cloudstream
+        registerMainAPI(OkRuProvider())
     }
 }
