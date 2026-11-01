@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import org.json.JSONObject
+import java.util.Base64
 
 // =====================================================================================
 // 1. CẤU HÌNH API KEY VÀ PROXY
@@ -16,10 +17,9 @@ private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0
 private const val TRAKT_ACCESS_TOKEN = "" 
 
 // =====================================================================================
-// 2. CÁC HÀM GỌI API HỖ TRỢ (Đã bỏ Gson)
+// 2. CÁC HÀM GỌI API HỖ TRỢ
 // =====================================================================================
 object ApiServices {
-    // --- OMDb ---
     suspend fun getOmdbData(imdbId: String): String? {
         return try {
             val res = app.get("https://www.omdbapi.com/?apikey=$OMDB_API_KEY&i=$imdbId").text
@@ -32,7 +32,6 @@ object ApiServices {
         }
     }
 
-    // --- Trakt ---
     suspend fun sendTraktScrobble(action: String, type: String, tmdbId: Int, progress: Float, season: Int? = null, episode: Int? = null) {
         if (TRAKT_ACCESS_TOKEN.isEmpty()) return
         val url = "https://api.trakt.tv/scrobble/$action"
@@ -40,7 +39,6 @@ object ApiServices {
             "Content-Type" to "application/json", "trakt-api-version" to "2",
             "trakt-api-key" to TRAKT_CLIENT_ID, "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
         )
-        
         val body = JSONObject()
         body.put("progress", progress)
         if (type == "movie") {
@@ -55,7 +53,6 @@ object ApiServices {
             episodeObj.put("number", episode ?: 1)
             body.put("episode", episodeObj)
         }
-        
         try {
             app.post(url, headers = headers, json = body).text
         } catch (e: Exception) {
@@ -172,12 +169,123 @@ class VidscmovProvider : MainAPI() {
         }
     }
 
+    // =====================================================================================
+    // CÁC HÀM GIẢI MÃ (DECRYPTORS) TỪ VIDSRC
+    // =====================================================================================
+    private fun decodeUrl(encType: String, url: String): String? {
+        return when (encType) {
+            "NdonQLf1Tzyx7bMG" -> bMGyx71TzQLfdonN(url)
+            "sXnL9MQIry" -> Iry9MQXnLs(url)
+            "IhWrImMIGL" -> IGLImMhWrI(url)
+            "xTyBxQyGTA" -> GTAxQyTyBx(url)
+            "ux8qjPHC66" -> C66jPHx8qu(url)
+            "eSfH1IRMyL" -> MyL1IRSfHe(url)
+            "KJHidj7det" -> detdj7JHiK(url)
+            "o2VSUnjnZl" -> nZlUnj2VSo(url)
+            "Oi3v1dAlaM" -> laM1dAi3vO(url)
+            "TsA2KGDGux" -> GuxKGDsA2T(url)
+            "JoAHUMCLXV" -> LXVUMCoAHJ(url)
+            else -> null
+        }
+    }
+
+    private fun bMGyx71TzQLfdonN(a: String): String {
+        val b = 3; val c = mutableListOf<String>(); var d = 0
+        while (d < a.length) { c.add(a.substring(d, minOf(d + b, a.length))); d += b }
+        return c.reversed().joinToString("")
+    }
+
+    private fun Iry9MQXnLs(a: String): String {
+        val b = "pWB9V)[*4I`nJpp?ozyB~dbr9yt!_n4u"
+        val d = a.chunked(2).map { it.toInt(16).toChar() }.joinToString("")
+        var c = ""
+        for (e in d.indices) { c += (d[e].code xor b[e % b.length].code).toChar() }
+        var e = ""
+        for (ch in c) { e += (ch.code - 3).toChar() }
+        return String(Base64.getDecoder().decode(e))
+    }
+
+    private fun IGLImMhWrI(a: String): String {
+        val b = a.reversed()
+        val c = b.map { when (it) { in 'a'..'m', in 'A'..'M' -> it + 13; in 'n'..'z', in 'N'..'Z' -> it - 13; else -> it } }.joinToString("")
+        val d = c.reversed()
+        return String(Base64.getDecoder().decode(d))
+    }
+
+    private fun GTAxQyTyBx(a: String): String {
+        val b = a.reversed()
+        val c = b.filterIndexed { index, _ -> index % 2 == 0 }
+        return String(Base64.getDecoder().decode(c))
+    }
+
+    private fun C66jPHx8qu(a: String): String {
+        val b = a.reversed()
+        val c = "X9a(O;FMV2-7VO5x;Ao:dN1NoFs?j,"
+        val d = b.chunked(2).map { it.toInt(16).toChar() }.joinToString("")
+        var e = ""
+        for (i in d.indices) { e += (d[i].code xor c[i % c.length].code).toChar() }
+        return e
+    }
+
+    private fun MyL1IRSfHe(a: String): String {
+        val b = a.reversed()
+        val c = b.map { (it.code - 1).toChar() }.joinToString("")
+        return c.chunked(2).map { it.toInt(16).toChar() }.joinToString("")
+    }
+
+    private fun detdj7JHiK(a: String): String {
+        val b = a.substring(10, a.length - 16)
+        val c = "3SAY~#%Y(V%>5d/Yg\"\$G[Lh1rK4a;7ok"
+        val d = String(Base64.getDecoder().decode(b))
+        val e = c.repeat((d.length + c.length - 1) / c.length).substring(0, d.length)
+        var f = ""
+        for (i in d.indices) { f += (d[i].code xor e[i].code).toChar() }
+        return f
+    }
+
+    private fun nZlUnj2VSo(a: String): String {
+        val b = mapOf('x' to 'a', 'y' to 'b', 'z' to 'c', 'a' to 'd', 'b' to 'e', 'c' to 'f', 'd' to 'g', 'e' to 'h', 'f' to 'i', 'g' to 'j', 'h' to 'k', 'i' to 'l', 'j' to 'm', 'k' to 'n', 'l' to 'o', 'm' to 'p', 'n' to 'q', 'o' to 'r', 'p' to 's', 'q' to 't', 'r' to 'u', 's' to 'v', 't' to 'w', 'u' to 'x', 'v' to 'y', 'w' to 'z', 'X' to 'A', 'Y' to 'B', 'Z' to 'C', 'A' to 'D', 'B' to 'E', 'C' to 'F', 'D' to 'G', 'E' to 'H', 'F' to 'I', 'G' to 'J', 'H' to 'K', 'I' to 'L', 'J' to 'M', 'K' to 'N', 'L' to 'O', 'M' to 'P', 'N' to 'Q', 'O' to 'R', 'P' to 'S', 'Q' to 'T', 'R' to 'U', 'S' to 'V', 'T' to 'W', 'U' to 'X', 'V' to 'Y', 'W' to 'Z')
+        return a.map { b[it] ?: it }.joinToString("")
+    }
+
+    private fun laM1dAi3vO(a: String): String {
+        val b = a.reversed().replace("-", "+").replace("_", "/")
+        val d = String(Base64.getDecoder().decode(b))
+        var e = ""
+        for (ch in d) { e += (ch.code - 5).toChar() }
+        return e
+    }
+
+    private fun GuxKGDsA2T(a: String): String {
+        val b = a.reversed().replace("-", "+").replace("_", "/")
+        val d = String(Base64.getDecoder().decode(b))
+        var e = ""
+        for (ch in d) { e += (ch.code - 7).toChar() }
+        return e
+    }
+
+    private fun LXVUMCoAHJ(a: String): String {
+        val b = a.reversed().replace("-", "+").replace("_", "/")
+        val d = String(Base64.getDecoder().decode(b))
+        var e = ""
+        for (ch in d) { e += (ch.code - 3).toChar() }
+        return e
+    }
+
+    // =====================================================================================
+    // HÀM CHÍNH: LOAD LINKS
+    // =====================================================================================
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         val parts = data.split(":")
         if (parts.size < 3) return false
         val type = parts[1]
         val tmdbId = parts[2]
+
+        if (!tmdbId.all { it.isDigit() }) {
+            ClipboardLogger.logAndCopy("Error", "TMDB ID không hợp lệ: $tmdbId")
+            return false
+        }
 
         ApiServices.sendTraktScrobble("start", type, tmdbId.toIntOrNull() ?: 0, 0f,
             if (type == "tv" && parts.size >= 5) parts[3].toIntOrNull() else null,
@@ -202,53 +310,79 @@ class VidscmovProvider : MainAPI() {
             val embedResponse = app.get(embedUrl, headers = headers).text
             ClipboardLogger.logAndCopy("Embed Response", embedResponse)
 
+            // Bước 1: Tìm iframe (trỏ đến vidsrc.sh)
             val iframeRegex = Regex("""<iframe[^>]*src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             val iframeUrl = iframeRegex.find(embedResponse)?.groupValues?.get(1)
+
+            if (iframeUrl == null) {
+                ClipboardLogger.logAndCopy("Error", "Không tìm thấy iframe trong vidsrc.mov.")
+                return false
+            }
+            ClipboardLogger.logAndCopy("Iframe Found", iframeUrl)
+
+            // Bước 2: Fetch trang vidsrc.sh
+            val iframeResponse = app.get(iframeUrl, headers = mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+                "Referer" to "https://vidsrc.mov/"
+            )).text
+            ClipboardLogger.logAndCopy("Iframe Response", iframeResponse)
+
+            // Bước 3: Giải mã link từ thẻ div
+            val rcpResponse = app.get(iframeUrl, headers = headers)
+            var finalUrl: String? = null
             
-            if (iframeUrl != null) {
-                ClipboardLogger.logAndCopy("Iframe Found", iframeUrl)
-                val iframeResponse = app.get(iframeUrl, headers = headers).text
-                ClipboardLogger.logAndCopy("Iframe Response", iframeResponse)
+            val encodedElement = rcpResponse.document.select("div#reporting_content+div")
+            if (encodedElement != null) {
+                val encType = encodedElement.attr("id")
+                val encodedUrl = encodedElement.text()
+                ClipboardLogger.logAndCopy("Decode Info", "Type: $encType, URL: $encodedUrl")
+                finalUrl = decodeUrl(encType, encodedUrl)
+            }
 
-                val rcpRegex = Regex("""(https?://[^"']*(?:rcp|prorcp)[^"']*)""", RegexOption.IGNORE_CASE)
-                val rcpUrl = rcpRegex.find(iframeResponse)?.groupValues?.get(1)
-                
-                if (rcpUrl != null) {
-                    ClipboardLogger.logAndCopy("RCP URL Found", rcpUrl)
-                    val rcpResponse = app.get(rcpUrl, headers = headers).text
-                    ClipboardLogger.logAndCopy("RCP Response", rcpResponse)
+            // Bước 4: Nếu không giải mã được, thử tìm link m3u8 trực tiếp trong HTML
+            if (finalUrl.isNullOrEmpty()) {
+                val m3u8Regex = Regex("""(https?://[^"']*\.m3u8[^"']*)""", RegexOption.IGNORE_CASE)
+                finalUrl = m3u8Regex.find(iframeResponse)?.groupValues?.get(1)
+                    ?: m3u8Regex.find(embedResponse)?.groupValues?.get(1)
+            }
 
-                    val m3u8Regex = Regex("""(https?://[^"']*\.m3u8[^"']*)""", RegexOption.IGNORE_CASE)
-                    val m3u8Url = m3u8Regex.find(rcpResponse)?.groupValues?.get(1)
-                        ?: m3u8Regex.find(iframeResponse)?.groupValues?.get(1)
+            if (finalUrl.isNullOrEmpty()) {
+                ClipboardLogger.logAndCopy("Error", "Không thể giải mã hoặc tìm thấy link stream cuối cùng.")
+                return false
+            }
+            
+            ClipboardLogger.logAndCopy("Success", "Final Stream URL: $finalUrl")
 
-                    if (m3u8Url != null) {
-                        ClipboardLogger.logAndCopy("Success", "M3U8 URL: $m3u8Url")
-                        ApiServices.sendTraktScrobble("stop", type, tmdbId.toIntOrNull() ?: 0, 100f,
-                            if (type == "tv" && parts.size >= 5) parts[3].toIntOrNull() else null,
-                            if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
-                        )
+            ApiServices.sendTraktScrobble("stop", type, tmdbId.toIntOrNull() ?: 0, 100f,
+                if (type == "tv" && parts.size >= 5) parts[3].toIntOrNull() else null,
+                if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
+            )
 
-                        val subtitleRegex = Regex("""(https?://[^"']*\.(?:vtt|srt))""", RegexOption.IGNORE_CASE)
-                        subtitleRegex.findAll(rcpResponse).forEach { match ->
-                            val subUrl = match.groupValues[1]
-                            if (subUrl.isNotEmpty()) {
-                                subtitleCallback.invoke(SubtitleFile("Unknown", subUrl))
-                            }
-                        }
-
-                        callback.invoke(
-                            ExtractorLink(
-                                source = this.name, name = "Vidscmov", url = m3u8Url, referer = "https://vidsrc.mov/",
-                                quality = Qualities.P1080.value, type = ExtractorLinkType.M3U8, headers = headers
-                            )
-                        )
-                        return true
-                    }
+            // Xử lý phụ đề (nếu có)
+            val subtitleRegex = Regex("""(https?://[^"']*\.(?:vtt|srt))""", RegexOption.IGNORE_CASE)
+            subtitleRegex.findAll(iframeResponse).forEach { match ->
+                val subUrl = match.groupValues[1]
+                if (subUrl.isNotEmpty()) {
+                    subtitleCallback.invoke(SubtitleFile("Unknown", subUrl))
                 }
             }
-            ClipboardLogger.logAndCopy("Error", "Không tìm thấy link stream trong các bước phân tích.")
-            return false
+
+            // Bước 5: Gửi link với Referer chính xác đã bắt được từ Sniff
+            callback.invoke(
+                ExtractorLink(
+                    source = this.name,
+                    name = "Vidscmov",
+                    url = finalUrl,
+                    referer = "https://stellarconductornexus.com/", // BẮT BUỘC THEO SNIFF
+                    quality = Qualities.P1080.value,
+                    type = ExtractorLinkType.M3U8,
+                    headers = mapOf(
+                        "Origin" to "https://stellarconductornexus.com",
+                        "Referer" to "https://stellarconductornexus.com/"
+                    )
+                )
+            )
+            return true
         } catch (e: Exception) {
             ClipboardLogger.logAndCopy("Exception", "Error: ${e.message}\nStackTrace: ${e.stackTraceToString()}")
             return false
