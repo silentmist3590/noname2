@@ -1,336 +1,351 @@
 package com.lagradost
 
+import android.content.Context
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
+import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.json.JSONArray
 import org.json.JSONObject
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import org.jsoup.parser.Parser
 import java.net.URLEncoder
 
+// =====================================================================
+// PROVIDER — Toàn bộ logic xử lý
+// =====================================================================
 class OkRuProvider : MainAPI() {
     override var mainUrl = "https://ok.ru"
-    override var name = "OK.ru"
+    override var name = "OkRu"
+    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
+    override var lang = "vi"
+    override val hasQuickSearch = true
     override val hasMainPage = true
-    override var lang = "ru"
-    override val hasDownloadSupport = true
-    override val supportedTypes = setOf(TvType.Movie)
 
-    companion object {
-        private const val USER_AGENT =
-            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-        // Để trống mặc định vì OK.ru phát công khai hoàn toàn mượt mà không cần tài khoản/cookie
-        private const val USER_COOKIE = ""
-    }
+    private val userAgent =
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    override val mainPage = mainPageOf(
-        "video/top" to "Thịnh hành (Top Videos)",
-        "video/popular" to "Phổ biến",
-        "video/movies" to "Phim & Hoạt hình",
-        "video/live" to "Trực tiếp (Live)"
-    )
+    // =================================================================
+    // TRANG CHỦ — Scrape recommendations từ các video "seed" có sẵn
+    // =================================================================
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
+        // Danh sách video seed công khai (lấy từ dữ liệu phân tích thực tế)
+        val seeds = listOf(
+            "7475662490142" to "Đề xuất cho bạn",
+            "5686752709150" to "Phổ biến",
+            "7407305296414" to "Khác"
+        )
+        val seen = mutableSetOf<String>()
+        val sections = mutableListOf<HomePageList>()
 
-    // -------------------------------------------------------------------------
-    // 1. TRANG CHÍNH (MAIN PAGE)
-    // -------------------------------------------------------------------------
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val path = request.data.trim().trimStart('/')
-        val url = if (page <= 1) {
-            "https://m.ok.ru/$path"
-        } else {
-            val sep = if (path.contains("?")) "&" else "?"
-            "https://m.ok.ru/$path${sep}st.page=$page"
+        for ((seedId, label) in seeds) {
+            try {
+                val doc = app.get(
+                    "$mainUrl/video/$seedId",
+                    headers = mapOf(
+                        "User-Agent" to userAgent,
+                        "Referer" to mainUrl,
+                        "Accept-Language" to "vi,en;q=0.9,ru;q=0.8"
+                    )
+                ).document
+
+                val linkCount = doc.select("a[href*=/video/]").size
+                android.util.Log.d("OkRuDebug", "Seed $seedId: $linkCount video links")
+
+                val items = mutableListOf<SearchResponse>()
+                doc.select("a[href*=/video/]").forEach { a ->
+                    val href = a.attr("href").trim()
+                    val m = Regex("""/video/(\d+)""").find(href) ?: return@forEach
+                    val vid = m.groupValues[1]
+                    if (vid == seedId) return@forEach
+                    if (!seen.add(vid)) return@forEach
+
+                    val title = a.attr("data-video-title").trim()
+                        .ifEmpty { a.attr("title").trim() }
+                        .ifEmpty { a.text().trim() }
+                        .ifEmpty {
+                            a.selectFirst("div.video-card_n, span.video-card_n, div.recommendations_block_video-card-base")
+                                ?.text()?.trim() ?: ""
+                        }
+                    if (title.isBlank() || title.length > 200) return@forEach
+
+                    val poster = a.selectFirst("img")
+                        ?.let { it.attr("src").ifEmpty { it.attr("data-src") } }
+                        ?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
+
+                    items.add(
+                        newMovieSearchResponse(title, "$mainUrl/video/$vid", TvType.Movie) {
+                            this.posterUrl = poster
+                        }
+                    )
+                }
+
+                android.util.Log.d("OkRuDebug", "Seed $seedId: parsed ${items.size} items")
+                if (items.isNotEmpty()) sections.add(HomePageList(label, items))
+            } catch (e: Exception) {
+                android.util.Log.e("OkRuDebug", "Seed $seedId failed", e)
+            }
         }
-        val items = fetchVideoList(url)
-        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+
+        if (sections.isEmpty()) {
+            android.util.Log.e("OkRuDebug", "getMainPage returned NULL — no items from any seed")
+            return null
+        }
+        return newHomePageResponse(sections)
     }
 
-    // -------------------------------------------------------------------------
-    // 2. TÌM KIẾM (SEARCH)
-    // -------------------------------------------------------------------------
-    override suspend fun search(query: String): List<SearchResponse> {
-        val q = URLEncoder.encode(query.trim(), "UTF-8")
-        if (q.isBlank()) return emptyList()
-        val url = "https://m.ok.ru/video/search?cmd=Search&st.query=$q"
-        return fetchVideoList(url)
+    // =================================================================
+    // TÌM KIẾM — Hỗ trợ paste URL video + thử search web
+    // =================================================================
+    override suspend fun search(query: String): List<SearchResponse>? {
+        val trimmed = query.trim()
+
+        // Nếu user paste URL hoặc ID video → xử lý trực tiếp
+        val urlMatch = Regex("""(?:/video/)?(\d{6,})""").find(trimmed)
+        if (urlMatch != null && (trimmed.contains("/video/") || trimmed.matches(Regex("""\d{6,}""")))) {
+            val videoId = urlMatch.groupValues[1]
+            android.util.Log.d("OkRuDebug", "Search query is direct video ID: $videoId")
+            return try {
+                val doc = app.get(
+                    "$mainUrl/video/$videoId",
+                    headers = mapOf("User-Agent" to userAgent, "Referer" to mainUrl)
+                ).document
+                val title = doc.selectFirst("meta[property=og:title]")?.attr("content")
+                    ?.takeIf { it.isNotBlank() } ?: "Video $videoId"
+                val poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
+                    ?.takeIf { it.isNotBlank() }
+                listOf(
+                    newMovieSearchResponse(title, "$mainUrl/video/$videoId", TvType.Movie) {
+                        this.posterUrl = poster
+                    }
+                )
+            } catch (e: Exception) {
+                android.util.Log.e("OkRuDebug", "Direct video fetch failed", e)
+                emptyList()
+            }
+        }
+
+        // Search web (có thể không hoạt động nếu ok.ru render JS)
+        return searchInternal(trimmed, 1)
     }
 
-    // -------------------------------------------------------------------------
-    // 3. CHI TIẾT VIDEO (LOAD)
-    // -------------------------------------------------------------------------
+    private suspend fun searchInternal(query: String, page: Int): List<SearchResponse> {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val urls = listOf(
+            "$mainUrl/search/video?st.query=$encoded&st.page=$page",
+            "$mainUrl/search?st.query=$encoded&st.mode=Video&st.page=$page",
+            "$mainUrl/video/search?st.query=$encoded&st.page=$page"
+        )
+        for (url in urls) {
+            try {
+                val doc = app.get(
+                    url,
+                    headers = mapOf(
+                        "User-Agent" to userAgent,
+                        "Accept-Language" to "vi,en;q=0.9,ru;q=0.8",
+                        "Referer" to mainUrl
+                    )
+                ).document
+                val count = doc.select("a[href*=/video/]").size
+                android.util.Log.d("OkRuDebug", "Search $url → $count links")
+
+                if (count > 0) {
+                    val results = mutableListOf<SearchResponse>()
+                    val seen = mutableSetOf<String>()
+                    doc.select("a[href*=/video/]").forEach { a ->
+                        val href = a.attr("href").trim()
+                        val m = Regex("""/video/(\d+)""").find(href) ?: return@forEach
+                        val vid = m.groupValues[1]
+                        if (!seen.add(vid)) return@forEach
+
+                        val title = a.attr("data-video-title").trim()
+                            .ifEmpty { a.attr("title").trim() }
+                            .ifEmpty { a.text().trim() }
+                            .ifEmpty {
+                                a.selectFirst("div.video-card_n, span.video-card_n")?.text()?.trim() ?: ""
+                            }
+                        if (title.isBlank() || title.length > 200) return@forEach
+
+                        val poster = a.selectFirst("img")
+                            ?.let { it.attr("src").ifEmpty { it.attr("data-src") } }
+                            ?.takeIf { it.isNotBlank() && !it.startsWith("data:") }
+
+                        results.add(
+                            newMovieSearchResponse(title, "$mainUrl/video/$vid", TvType.Movie) {
+                                this.posterUrl = poster
+                            }
+                        )
+                    }
+                    if (results.isNotEmpty()) return results
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("OkRuDebug", "Search URL failed: $url", e)
+            }
+        }
+        return emptyList()
+    }
+
+    // =================================================================
+    // LOAD CHI TIẾT
+    // =================================================================
     override suspend fun load(url: String): LoadResponse? {
-        val videoId = extractVideoId(url)
-        if (videoId.isBlank()) return null
-
-        val embedUrl = "https://ok.ru/videoembed/$videoId"
-        val res = app.get(embedUrl, headers = getHeaders("https://ok.ru/"))
-        val html = res.text
-
-        val match = Regex("""data-options=["']([^"']+)["']""").find(html) ?: return null
-        val rawJson = unescapeHtml(match.groupValues[1])
-        val rootObj = JSONObject(rawJson)
-        val flashvars = rootObj.optJSONObject("flashvars") ?: JSONObject()
-
-        val metadataObj = flashvars.optJSONObject("metadata")
-            ?: flashvars.optString("metadata").takeIf { it.isNotBlank() }?.let { JSONObject(it) }
-            ?: JSONObject()
-
-        val movieObj = metadataObj.optJSONObject("movie") ?: JSONObject()
-
-        val title = movieObj.optString("title").takeIf { it.isNotBlank() }
-            ?: rootObj.optString("movieTitle").takeIf { it.isNotBlank() }
-            ?: "Video $videoId"
-
-        var poster = movieObj.optString("poster").takeIf { it.isNotBlank() }
-            ?: rootObj.optString("poster").takeIf { it.isNotBlank() }
-        poster = poster?.let { formatUrl(it) }
-
-        val durationSec = movieObj.optInt("duration", 0).takeIf { it > 0 }
-        val author = metadataObj.optJSONObject("author")?.optString("name")
-            ?: movieObj.optString("author")
-
-        val pageUrl = "https://ok.ru/video/$videoId"
-
-        return newMovieLoadResponse(title, pageUrl, TvType.Movie, videoId) {
+        val videoId = extractVideoId(url) ?: return null
+        var title = "Video $videoId"
+        var poster: String? = null
+        try {
+            val doc = app.get(
+                "$mainUrl/video/$videoId",
+                headers = mapOf("User-Agent" to userAgent, "Referer" to mainUrl)
+            ).document
+            doc.selectFirst("meta[property=og:title]")?.attr("content")
+                ?.takeIf { it.isNotBlank() }?.let { title = it }
+            doc.selectFirst("meta[property=og:image]")?.attr("content")
+                ?.takeIf { it.isNotBlank() }?.let { poster = it }
+        } catch (e: Exception) {
+            android.util.Log.e("OkRuDebug", "load failed: ${e.message}")
+        }
+        return newMovieLoadResponse(title, url, TvType.Movie, videoId) {
             this.posterUrl = poster
-            this.duration = durationSec
-            this.plot = author.takeIf { !it.isNullOrBlank() }?.let { "Kênh / Người đăng: $it" }
         }
     }
 
-    // -------------------------------------------------------------------------
-    // 4. TRÍCH XUẤT LUỒNG PHÁT (LOAD LINKS) - KHÔNG CRASH, KHÔNG TREO
-    // -------------------------------------------------------------------------
+    // =================================================================
+    // LẤY LINK STREAM — HLS là chính, MP4 là fallback
+    // =================================================================
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val videoId = extractVideoId(data)
-        if (videoId.isBlank()) return false
+        val videoId = if (data.matches(Regex("""\d+"""))) data else extractVideoId(data)
+        if (videoId.isNullOrBlank()) return false
+        val referer = "$mainUrl/video/$videoId"
 
-        val embedUrl = "https://ok.ru/videoembed/$videoId"
-        val res = app.get(embedUrl, headers = getHeaders("https://ok.ru/"))
-        val html = res.text
-
-        val match = Regex("""data-options=["']([^"']+)["']""").find(html) ?: return false
-        val rawJson = unescapeHtml(match.groupValues[1])
-        val rootObj = JSONObject(rawJson)
-        val flashvars = rootObj.optJSONObject("flashvars") ?: JSONObject()
-
-        val metadataObj = flashvars.optJSONObject("metadata")
-            ?: flashvars.optString("metadata").takeIf { it.isNotBlank() }?.let { JSONObject(it) }
-            ?: JSONObject()
-
-        val movieObj = metadataObj.optJSONObject("movie") ?: JSONObject()
-        var foundLinks = false
-
-        // Phụ đề: Bọc try-catch và chuẩn hóa https:// để tuyệt đối không làm crash ExoPlayer
-        val subtitlesArr = movieObj.optJSONArray("subtitleTracks")
-            ?: metadataObj.optJSONArray("subtitleTracks")
-        if (subtitlesArr != null) {
-            for (i in 0 until subtitlesArr.length()) {
-                try {
-                    val subObj = subtitlesArr.optJSONObject(i) ?: continue
-                    var subUrl = subObj.optString("url", "").trim()
-                    if (subUrl.isBlank()) continue
-                    if (subUrl.startsWith("//")) subUrl = "https:$subUrl"
-                    if (!subUrl.startsWith("http")) continue
-                    val subTitle = subObj.optString("title").takeIf { it.isNotBlank() }
-                        ?: subObj.optString("manifestName").takeIf { it.isNotBlank() }
-                        ?: subObj.optString("language", "Phụ đề")
-                    subtitleCallback(SubtitleFile(subTitle, subUrl))
-                } catch (_: Throwable) {}
-            }
-        }
-
-        // Ưu tiên số 1: Direct MP4 Video Streams (Phát trực tiếp cực nhanh, tua mượt, không lỗi)
-        val videosArr = metadataObj.optJSONArray("videos")
-        if (videosArr != null && videosArr.length() > 0) {
-            data class VideoStream(val url: String, val quality: Int, val displayName: String)
-            val streamList = mutableListOf<VideoStream>()
-
-            for (i in 0 until videosArr.length()) {
-                val vObj = videosArr.optJSONObject(i) ?: continue
-                var vUrl = vObj.optString("url", "").trim()
-                if (vUrl.isBlank()) continue
-                if (vUrl.startsWith("//")) vUrl = "https:$vUrl"
-                if (!vUrl.startsWith("http")) continue
-
-                val vName = vObj.optString("name", "").lowercase().trim()
-                val (qVal, dName) = when (vName) {
-                    "ultra" -> Qualities.P2160.value to "OK.ru • 4K Ultra"
-                    "quad" -> Qualities.P1080.value to "OK.ru • 2K Quad"
-                    "full" -> Qualities.P1080.value to "OK.ru • 1080p FHD"
-                    "hd" -> Qualities.P720.value to "OK.ru • 720p HD"
-                    "sd" -> Qualities.P480.value to "OK.ru • 480p SD"
-                    "low" -> Qualities.P360.value to "OK.ru • 360p"
-                    "lowest" -> Qualities.P360.value to "OK.ru • 240p"
-                    "mobile" -> Qualities.Unknown.value to "OK.ru • 144p Mobile"
-                    else -> Qualities.Unknown.value to "OK.ru • $vName"
-                }
-                streamList.add(VideoStream(vUrl, qVal, dName))
-            }
-
-            // Sắp xếp giảm dần theo chất lượng (1080p -> 720p -> 480p -> 360p)
-            streamList.sortByDescending { it.quality }
-
-            for (stream in streamList) {
-                callback(
-                    newExtractorLink(
-                        source = name,
-                        name = stream.displayName,
-                        url = stream.url,
-                        type = ExtractorLinkType.VIDEO
-                    ) {
-                        this.referer = "https://ok.ru/"
-                        this.quality = stream.quality
-                        this.headers = mapOf(
-                            "User-Agent" to USER_AGENT,
-                            "Referer" to "https://ok.ru/"
-                        )
-                    }
-                )
-                foundLinks = true
-            }
-        }
-
-        // Ưu tiên số 2: HLS Stream (M3U8) dự phòng
-        val hlsUrl = metadataObj.optString("hlsManifestUrl", "").trim()
-        if (hlsUrl.isNotBlank()) {
-            val fixedHls = if (hlsUrl.startsWith("//")) "https:$hlsUrl" else hlsUrl
-            if (fixedHls.startsWith("http")) {
-                callback(
-                    newExtractorLink(
-                        source = name,
-                        name = "OK.ru • Tự động thích ứng (HLS)",
-                        url = fixedHls,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = "https://ok.ru/"
-                        this.quality = Qualities.Unknown.value
-                        this.headers = mapOf(
-                            "User-Agent" to USER_AGENT,
-                            "Referer" to "https://ok.ru/"
-                        )
-                    }
-                )
-                foundLinks = true
-            }
-        }
-
-        return foundLinks
-    }
-
-    // -------------------------------------------------------------------------
-    // CÁC HÀM TIỆN ÍCH TRỢ GIÚP (HELPERS)
-    // -------------------------------------------------------------------------
-    private fun extractVideoId(input: String): String {
-        val clean = input.trim()
-        val match = Regex("""(?:video(?:embed)?/)?(\d{5,})""").find(clean)
-        return match?.groupValues?.get(1) ?: clean.filter { it.isDigit() }
-    }
-
-    private fun formatUrl(url: String): String {
-        var clean = url.trim()
-        if (clean.startsWith("//")) {
-            clean = "https:$clean"
-        }
-        return clean
-    }
-
-    private fun getPosterUrl(item: JSONObject): String? {
-        item.optJSONObject("thumbnails")?.let { thumbs ->
-            val keys = listOf(
-                "STANDARD", "FULL", "FULL_HD_NO_CROP", "HD_NO_CROP", "HD",
-                "HIGH", "MEDIUM", "SMALL", "COLLAGE"
-            )
-            for (k in keys) {
-                val v = thumbs.optString(k, "").trim()
-                if (v.isNotBlank()) return formatUrl(v)
-            }
-        }
-        item.optJSONObject("thumbnailsObjects")?.let { tObjs ->
-            val keys = listOf("STANDARD", "FULL", "HD", "HIGH")
-            for (k in keys) {
-                val v = tObjs.optJSONObject(k)?.optString("thumbnail", "")?.trim()
-                if (!v.isNullOrBlank()) return formatUrl(v)
-            }
-        }
-        val direct = item.optString("imageUrl", "").takeIf { it.isNotBlank() }
-            ?: item.optString("poster", "").takeIf { it.isNotBlank() }
-            ?: item.optString("thumbnail", "").takeIf { it.isNotBlank() }
-            ?: item.optJSONObject("collage")?.optString("url", "")?.takeIf { it.isNotBlank() }
-
-        return direct?.let { formatUrl(it) }
-    }
-
-    private fun unescapeHtml(input: String): String {
-        return input
-            .replace("&quot;", "\"")
-            .replace("&amp;", "&")
-            .replace("&#39;", "'")
-            .replace("&apos;", "'")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&#34;", "\"")
-            .replace("&#38;", "&")
-            .replace("\\\"", "\"")
-    }
-
-    private fun getHeaders(referer: String = "https://ok.ru/"): Map<String, String> {
-        val map = mutableMapOf(
-            "User-Agent" to USER_AGENT,
-            "Referer" to referer,
-            "Accept" to "*/*"
-        )
-        if (USER_COOKIE.isNotBlank()) {
-            val sanitized = USER_COOKIE.filter { it.code in 32..126 }.trim()
-            if (sanitized.isNotBlank()) {
-                map["Cookie"] = sanitized
-            }
-        }
-        return map
-    }
-
-    private suspend fun fetchVideoList(url: String): List<SearchResponse> {
-        val list = mutableListOf<SearchResponse>()
         try {
-            val res = app.get(
-                url,
-                headers = getHeaders("https://m.ok.ru/")
-            )
-            val html = res.text
-            val match = Regex("""videos=["']([^"']+)["']""").find(html)
-            if (match != null) {
-                val unescaped = unescapeHtml(match.groupValues[1])
-                val root = JSONObject(unescaped)
-                val dataArray = root.optJSONObject("table")?.optJSONArray("data")
-                    ?: root.optJSONArray("data")
-                    ?: root.optJSONArray("videos")
+            val html = app.get(
+                referer,
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Referer" to mainUrl,
+                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language" to "vi,en;q=0.9,ru;q=0.8"
+                )
+            ).text
 
-                if (dataArray != null) {
-                    for (i in 0 until dataArray.length()) {
-                        val item = dataArray.optJSONObject(i) ?: continue
-                        val id = item.optString("id", "").takeIf { it.isNotBlank() } ?: continue
-                        val name = item.optString("name", "").takeIf { it.isNotBlank() }
-                            ?: item.optString("title", "").takeIf { it.isNotBlank() }
-                            ?: "Video $id"
+            val doc = Jsoup.parse(html)
+            val (metadata, hlsFromRegex) = extractMetadata(doc, html)
+            android.util.Log.d("OkRuDebug",
+                "metadata=${metadata != null}, hlsRegex=${hlsFromRegex != null}")
 
-                        val thumb = getPosterUrl(item)
-                        val videoPageUrl = "https://ok.ru/video/$id"
+            var success = false
 
-                        list.add(
-                            newMovieSearchResponse(name, videoPageUrl, TvType.Movie) {
-                                this.posterUrl = thumb
-                            }
-                        )
+            // 1. HLS (ưu tiên — đã được chứng minh hoạt động ổn định)
+            val hlsUrl = metadata?.optString("hlsManifestUrl")?.takeIf { it.isNotBlank() }
+                ?: hlsFromRegex
+            if (!hlsUrl.isNullOrBlank()) {
+                callback(
+                    newExtractorLink(name, "HLS (tự động)", hlsUrl, ExtractorLinkType.M3U8) {
+                        this.quality = Qualities.Unknown.value
+                        this.referer = referer
                     }
+                )
+                success = true
+                android.util.Log.d("OkRuDebug", "Emitted HLS OK")
+            }
+
+            // 2. MP4 theo chất lượng (fallback)
+            metadata?.optJSONArray("videos")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val v = arr.optJSONObject(i) ?: continue
+                    val url = v.optString("url").takeIf { it.isNotBlank() } ?: continue
+                    val label = v.optString("name", "")
+                    callback(
+                        newExtractorLink(name, label, url, ExtractorLinkType.VIDEO) {
+                            this.quality = mapQuality(label)
+                            this.referer = referer
+                        }
+                    )
+                    success = true
                 }
             }
-        } catch (_: Throwable) {}
-        return list
+
+            if (!success) android.util.Log.e("OkRuDebug", "No links for $videoId")
+            return success
+        } catch (e: Exception) {
+            android.util.Log.e("OkRuDebug", "loadLinks failed", e)
+        }
+        return false
     }
+
+    // =================================================================
+    // METADATA EXTRACTION — 3 phương pháp độc lập
+    // =================================================================
+    private fun extractMetadata(doc: Document, html: String): Pair<JSONObject?, String?> {
+        // Method 1: data-options
+        for (el in doc.select("[data-options]")) {
+            val raw = el.attr("data-options")
+            if (!raw.contains("flashvars") && !raw.contains("metadata")) continue
+            try {
+                val unescaped = Parser.unescapeEntities(raw, true)
+                val outer = JSONObject(unescaped)
+                val metaStr = outer.optJSONObject("flashvars")
+                    ?.optString("metadata")
+                    ?.takeIf { it.isNotBlank() } ?: continue
+                val metadata = JSONObject(metaStr)
+                val hls = metadata.optString("hlsManifestUrl").takeIf { it.isNotBlank() }
+                android.util.Log.d("OkRuDebug", "Method 1 (data-options) OK")
+                return Pair(metadata, hls)
+            } catch (e: Exception) {
+                android.util.Log.e("OkRuDebug", "Method 1 failed: ${e.message}")
+            }
+        }
+
+        // Method 2: OKVideo.start({...}) script
+        for (script in doc.select("script")) {
+            val data = script.data()
+            val m = Regex("""OKVideo\.start\((\{.+?\})\)""").find(data) ?: continue
+            try {
+                val outer = JSONObject(m.groupValues[1])
+                val metaStr = outer.optJSONObject("flashvars")
+                    ?.optString("metadata")
+                    ?.takeIf { it.isNotBlank() } ?: continue
+                val metadata = JSONObject(metaStr)
+                val hls = metadata.optString("hlsManifestUrl").takeIf { it.isNotBlank() }
+                android.util.Log.d("OkRuDebug", "Method 2 (script) OK")
+                return Pair(metadata, hls)
+            } catch (e: Exception) { /* ignore */ }
+        }
+
+        // Method 3: regex trên HTML đã unescape
+        try {
+            val unescaped = Parser.unescapeEntities(html, true)
+            val m = Regex("""https://[^"'\s<>]+\.m3u8[^"'\s<>]*""").find(unescaped)
+            if (m != null) {
+                android.util.Log.d("OkRuDebug", "Method 3 (regex m3u8) OK")
+                return Pair(null, m.value)
+            }
+        } catch (e: Exception) { /* ignore */ }
+
+        return Pair(null, null)
+    }
+
+    // =================================================================
+    // HELPERS
+    // =================================================================
+    private fun mapQuality(label: String): Int = when {
+        label.equals("mobile", true) -> Qualities.P144.value
+        label.equals("lowest", true) -> Qualities.P240.value
+        label.equals("low", true) -> Qualities.P360.value
+        label.equals("sd", true) -> Qualities.P480.value
+        label.equals("hd", true) -> Qualities.P720.value
+        label.equals("full", true) -> Qualities.P1080.value
+        else -> Qualities.Unknown.value
+    }
+
+    private fun extractVideoId(url: String): String? =
+        Regex("""/video/(\d+)""").find(url)?.groupValues?.get(1)
 }
