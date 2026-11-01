@@ -5,14 +5,20 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import org.json.JSONObject
+import java.util.Base64 // BỔ SUNG IMPORT NÀY ĐỂ SỬA LỖI
 
+// =====================================================================================
+// 1. CẤU HÌNH API KEY VÀ PROXY
+// =====================================================================================
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
-// TODO: Thay thế bằng API key TMDB hợp lệ của bạn
-private const val TMDB_API_KEY = "b9e1ff7ff423790bf7df202e661377ca"
+private const val TMDB_API_KEY = "b9e1ff7ff423790bf7df202e661377ca" // Nhớ thay key hợp lệ
 private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
 private const val TRAKT_ACCESS_TOKEN = "" 
 
+// =====================================================================================
+// 2. CÁC HÀM GỌI API HỖ TRỢ
+// =====================================================================================
 object ApiServices {
     suspend fun getOmdbData(imdbId: String): String? {
         return try {
@@ -55,6 +61,9 @@ object ApiServices {
     }
 }
 
+// =====================================================================================
+// 3. LỚP PROVIDER CHÍNH
+// =====================================================================================
 class VidscmovProvider : MainAPI() {
     override var mainUrl = TMDB_BASE_URL
     override var name = "Vidscmov"
@@ -151,18 +160,19 @@ class VidscmovProvider : MainAPI() {
                     ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
                 }
             }
-            // Sửa lỗi: Truyền data chính xác
             return newTvSeriesLoadResponse(title, "vidscmov:tv:$tmdbIdInt", TvType.TvSeries, episodes) {
                 this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
             }
         } else {
-            // Sửa lỗi: Truyền data chính xác
             return newMovieLoadResponse(title, url, TvType.Movie, "vidscmov:movie:$tmdbIdInt") {
                 this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
             }
         }
     }
 
+    // =====================================================================================
+    // CÁC HÀM GIẢI MÃ (DECRYPTORS) TỪ VIDSRC
+    // =====================================================================================
     private fun decodeUrl(encType: String, url: String): String? {
         return when (encType) {
             "NdonQLf1Tzyx7bMG" -> bMGyx71TzQLfdonN(url)
@@ -188,11 +198,11 @@ class VidscmovProvider : MainAPI() {
 
     private fun Iry9MQXnLs(a: String): String {
         val b = "pWB9V)[*4I`nJpp?ozyB~dbr9yt!_n4u"
-        val d = a.chunked(2).map { it.toInt(16).toChar() }.joinToString("")
+        val d = a.chunked(2).map { Char(it.toInt(16)) }.joinToString("")
         var c = ""
-        for (e in d.indices) { c += (d[e].code xor b[e % b.length].code).toChar() }
+        for (e in d.indices) { c += Char(d[e].code xor b[e % b.length].code) }
         var e = ""
-        for (ch in c) { e += (ch.code - 3).toChar() }
+        for (ch in c) { e += Char(ch.code - 3) }
         return String(Base64.getDecoder().decode(e))
     }
 
@@ -212,16 +222,16 @@ class VidscmovProvider : MainAPI() {
     private fun C66jPHx8qu(a: String): String {
         val b = a.reversed()
         val c = "X9a(O;FMV2-7VO5x;Ao:dN1NoFs?j,"
-        val d = b.chunked(2).map { it.toInt(16).toChar() }.joinToString("")
+        val d = b.chunked(2).map { Char(it.toInt(16)) }.joinToString("")
         var e = ""
-        for (i in d.indices) { e += (d[i].code xor c[i % c.length].code).toChar() }
+        for (i in d.indices) { e += Char(d[i].code xor c[i % c.length].code) }
         return e
     }
 
     private fun MyL1IRSfHe(a: String): String {
         val b = a.reversed()
-        val c = b.map { (it.code - 1).toChar() }.joinToString("")
-        return c.chunked(2).map { it.toInt(16).toChar() }.joinToString("")
+        val c = b.map { Char(it.code - 1) }.joinToString("")
+        return c.chunked(2).map { Char(it.toInt(16)) }.joinToString("")
     }
 
     private fun detdj7JHiK(a: String): String {
@@ -230,7 +240,7 @@ class VidscmovProvider : MainAPI() {
         val d = String(Base64.getDecoder().decode(b))
         val e = c.repeat((d.length + c.length - 1) / c.length).substring(0, d.length)
         var f = ""
-        for (i in d.indices) { f += (d[i].code xor e[i].code).toChar() }
+        for (i in d.indices) { f += Char(d[i].code xor e[i].code) }
         return f
     }
 
@@ -243,7 +253,7 @@ class VidscmovProvider : MainAPI() {
         val b = a.reversed().replace("-", "+").replace("_", "/")
         val d = String(Base64.getDecoder().decode(b))
         var e = ""
-        for (ch in d) { e += (ch.code - 5).toChar() }
+        for (ch in d) { e += Char(ch.code - 5) }
         return e
     }
 
@@ -251,7 +261,7 @@ class VidscmovProvider : MainAPI() {
         val b = a.reversed().replace("-", "+").replace("_", "/")
         val d = String(Base64.getDecoder().decode(b))
         var e = ""
-        for (ch in d) { e += (ch.code - 7).toChar() }
+        for (ch in d) { e += Char(ch.code - 7) }
         return e
     }
 
@@ -259,10 +269,13 @@ class VidscmovProvider : MainAPI() {
         val b = a.reversed().replace("-", "+").replace("_", "/")
         val d = String(Base64.getDecoder().decode(b))
         var e = ""
-        for (ch in d) { e += (ch.code - 3).toChar() }
+        for (ch in d) { e += Char(ch.code - 3) }
         return e
     }
 
+    // =====================================================================================
+    // HÀM CHÍNH: LOAD LINKS
+    // =====================================================================================
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         val parts = data.split(":")
