@@ -4,8 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
-import com.google.gson.Gson
-import com.google.gson.annotations.SerializedName
 import org.json.JSONObject
 
 // =====================================================================================
@@ -19,38 +17,17 @@ private const val TRAKT_ACCESS_TOKEN = "" // Để trống nếu không dùng Tr
 
 
 // =====================================================================================
-// 2. DATA CLASSES CHO CÁC API
-// =====================================================================================
-data class OmdbResponse(
-    @SerializedName("imdbRating") val imdbRating: String?,
-    @SerializedName("imdbVotes") val imdbVotes: String?,
-    @SerializedName("Awards") val awards: String?,
-    @SerializedName("Response") val response: String?
-)
-
-data class TraktScrobbleRequest(
-    @SerializedName("movie") val movie: TraktMovie? = null,
-    @SerializedName("episode") val episode: TraktEpisode? = null,
-    @SerializedName("progress") val progress: Float
-)
-data class TraktMovie(@SerializedName("ids") val ids: TraktIds)
-data class TraktEpisode(
-    @SerializedName("season") val season: Int,
-    @SerializedName("number") val number: Int
-)
-data class TraktIds(@SerializedName("tmdb") val tmdb: Int?)
-
-
-// =====================================================================================
-// 3. CÁC HÀM GỌI API HỖ TRỢ
+// 2. CÁC HÀM GỌI API HỖ TRỢ (Đã bỏ Gson)
 // =====================================================================================
 object ApiServices {
 
     // --- OMDb ---
-    suspend fun getOmdbData(imdbId: String): OmdbResponse? {
+    suspend fun getOmdbData(imdbId: String): String? {
         return try {
             val res = app.get("https://www.omdbapi.com/?apikey=$OMDB_API_KEY&i=$imdbId").text
-            Gson().fromJson(res, OmdbResponse::class.java)
+            val json = JSONObject(res)
+            val rating = json.optString("imdbRating")
+            if (rating.isNotEmpty() && rating != "N/A") rating else null
         } catch (e: Exception) {
             ClipboardLogger.logAndCopy("OMDb Error", e.message ?: "Unknown")
             null
@@ -59,12 +36,7 @@ object ApiServices {
 
     // --- Trakt ---
     suspend fun sendTraktScrobble(
-        action: String, // "start" hoặc "stop"
-        type: String,   // "movie" hoặc "tv"
-        tmdbId: Int,
-        progress: Float,
-        season: Int? = null,
-        episode: Int? = null
+        action: String, type: String, tmdbId: Int, progress: Float, season: Int? = null, episode: Int? = null
     ) {
         if (TRAKT_ACCESS_TOKEN.isEmpty()) return
         val url = "https://api.trakt.tv/scrobble/$action"
@@ -74,11 +46,22 @@ object ApiServices {
             "trakt-api-key" to TRAKT_CLIENT_ID,
             "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
         )
-        val body = if (type == "movie") {
-            TraktScrobbleRequest(movie = TraktMovie(TraktIds(tmdbId)), progress = progress)
+        
+        val body = JSONObject()
+        body.put("progress", progress)
+        if (type == "movie") {
+            val movie = JSONObject()
+            val ids = JSONObject()
+            ids.put("tmdb", tmdbId)
+            movie.put("ids", ids)
+            body.put("movie", movie)
         } else {
-            TraktScrobbleRequest(episode = TraktEpisode(season ?: 1, episode ?: 1), progress = progress)
+            val episodeObj = JSONObject()
+            episodeObj.put("season", season ?: 1)
+            episodeObj.put("number", episode ?: 1)
+            body.put("episode", episodeObj)
         }
+        
         try {
             app.post(url, headers = headers, json = body).text
         } catch (e: Exception) {
@@ -89,7 +72,7 @@ object ApiServices {
 
 
 // =====================================================================================
-// 4. LỚP PROVIDER CHÍNH
+// 3. LỚP PROVIDER CHÍNH
 // =====================================================================================
 class TwoNembedProvider : MainAPI() {
     override var mainUrl = TMDB_BASE_URL
@@ -104,9 +87,6 @@ class TwoNembedProvider : MainAPI() {
         "$mainUrl/tv/popular?api_key=$TMDB_API_KEY" to "Popular TV Shows"
     )
 
-    // ---------------------------------------------------------------------------------
-    // LẤY TRANG CHỦ
-    // ---------------------------------------------------------------------------------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val response = app.get("${request.data}&page=$page").text
         val json = JSONObject(response)
@@ -126,9 +106,6 @@ class TwoNembedProvider : MainAPI() {
         return newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
     }
 
-    // ---------------------------------------------------------------------------------
-    // TÌM KIẾM
-    // ---------------------------------------------------------------------------------
     override suspend fun search(query: String): List<SearchResponse> {
         val response = app.get("$mainUrl/search/multi?api_key=$TMDB_API_KEY&query=$query").text
         val json = JSONObject(response)
@@ -149,9 +126,6 @@ class TwoNembedProvider : MainAPI() {
         return searchResults
     }
 
-    // ---------------------------------------------------------------------------------
-    // TẢI CHI TIẾT PHIM / TV
-    // ---------------------------------------------------------------------------------
     override suspend fun load(url: String): LoadResponse? {
         val parts = url.split(":")
         if (parts.size < 3) return null
@@ -168,11 +142,8 @@ class TwoNembedProvider : MainAPI() {
 
         var imdbScore: Score? = null
         if (imdbId.isNotEmpty()) {
-            ApiServices.getOmdbData(imdbId)?.let { omdb ->
-                val ratingStr = omdb.imdbRating
-                if (!ratingStr.isNullOrEmpty() && ratingStr != "N/A") {
-                    imdbScore = Score.from10(ratingStr.toDouble())
-                }
+            ApiServices.getOmdbData(imdbId)?.let { ratingStr ->
+                imdbScore = Score.from10(ratingStr.toDouble())
             }
         }
 
@@ -208,19 +179,13 @@ class TwoNembedProvider : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------------------------
-    // TRÍCH XUẤT LINK STREAM TỪ 2EMBED.CC (Xử lý chuyển hướng đặc biệt)
-    // ---------------------------------------------------------------------------------
     override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
+        data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
     ): Boolean {
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         val parts = data.split(":")
         if (parts.size < 3) return false
-        val type = parts[1] // "movie" hoặc "tv"
+        val type = parts[1]
         val tmdbId = parts[2]
 
         ApiServices.sendTraktScrobble("start", type, tmdbId.toIntOrNull() ?: 0, 0f,
@@ -228,7 +193,6 @@ class TwoNembedProvider : MainAPI() {
             if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
         )
 
-        // Xây dựng URL nhúng ban đầu của 2embed.cc
         val embedUrl = if (type == "movie") {
             "https://www.2embed.cc/embed/$tmdbId"
         } else {
@@ -244,29 +208,21 @@ class TwoNembedProvider : MainAPI() {
 
         try {
             ClipboardLogger.logAndCopy("API Request", "Embed URL: $embedUrl")
+            var currentHtml = app.get(embedUrl, headers = headers).text
+            ClipboardLogger.logAndCopy("Embed Response", currentHtml)
 
-            // Bước 1: Lấy trang nhúng (OkHttp tự động theo dõi chuyển hướng)
-            val embedResponse = app.get(embedUrl, headers = headers).text
-            ClipboardLogger.logAndCopy("Embed Response", embedResponse)
-
-            // Hàm phụ để tìm iframe trong một đoạn HTML
             fun findIframe(html: String): String? {
-                // Ưu tiên tìm iframe có id cụ thể (như logic cũ của 2embed)
                 val idRegex = Regex("""<iframe[^>]*id=["'](iframesrc|framesrc)["'][^>]*src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
                 idRegex.find(html)?.let { return it.groupValues[2] }
-                // Nếu không có id, tìm iframe đầu tiên
                 val generalRegex = Regex("""<iframe[^>]*src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
                 return generalRegex.find(html)?.groupValues?.get(1)
             }
 
-            var currentHtml = embedResponse
             var m3u8Url: String? = null
             var depth = 0
-            val maxDepth = 5 // Giới hạn số lớp iframe để tránh vòng lặp vô hạn
+            val maxDepth = 5
 
-            // Bước 2: Lặp để đi sâu vào các lớp iframe
             while (depth < maxDepth) {
-                // Thử tìm m3u8 trực tiếp trong HTML hiện tại trước
                 val m3u8Regex = Regex("""file:\s*["'](.*?m3u8.*?)["']""", RegexOption.IGNORE_CASE)
                 m3u8Url = m3u8Regex.find(currentHtml)?.groupValues?.get(1)
                     ?: Regex("""(https?://[^"']*\.m3u8[^"']*)""", RegexOption.IGNORE_CASE).find(currentHtml)?.groupValues?.get(1)
@@ -276,18 +232,15 @@ class TwoNembedProvider : MainAPI() {
                     break
                 }
 
-                // Nếu chưa có m3u8, tìm iframe tiếp theo
                 val nextIframe = findIframe(currentHtml)
                 if (nextIframe == null) {
                     ClipboardLogger.logAndCopy("Info", "Không tìm thấy iframe ở depth $depth.")
                     break
                 }
 
-                // Chuẩn hóa URL iframe (nếu là relative URL)
                 val absoluteIframeUrl = if (nextIframe.startsWith("http")) {
                     nextIframe
                 } else {
-                    // Xử lý URL tương đối dựa trên domain hiện tại (có thể là 2embed.cc, 2embed.skin, hoặc movieuniverse.skin)
                     val baseUrl = when {
                         currentHtml.contains("2embed.skin") -> "https://www.2embed.skin"
                         currentHtml.contains("movieuniverse.skin") -> "https://movieuniverse.skin"
@@ -297,8 +250,6 @@ class TwoNembedProvider : MainAPI() {
                 }
 
                 ClipboardLogger.logAndCopy("Iframe Found (depth $depth)", absoluteIframeUrl)
-
-                // Tải nội dung của iframe tiếp theo
                 currentHtml = app.get(absoluteIframeUrl, headers = headers).text
                 ClipboardLogger.logAndCopy("Iframe Response (depth $depth)", currentHtml)
                 depth++
@@ -314,7 +265,6 @@ class TwoNembedProvider : MainAPI() {
                 if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
             )
 
-            // Xử lý phụ đề (nếu có trong response cuối cùng)
             val subtitleRegex = Regex("""(https?://[^"']*\.(?:vtt|srt))""", RegexOption.IGNORE_CASE)
             subtitleRegex.findAll(currentHtml).forEach { match ->
                 val subUrl = match.groupValues[1]
@@ -325,17 +275,11 @@ class TwoNembedProvider : MainAPI() {
 
             callback.invoke(
                 ExtractorLink(
-                    source = this.name,
-                    name = "2nembed",
-                    url = m3u8Url,
-                    referer = "https://www.2embed.cc/", // Referer gốc thường được chấp nhận
-                    quality = Qualities.P1080.value,
-                    type = ExtractorLinkType.M3U8,
-                    headers = headers
+                    source = this.name, name = "2nembed", url = m3u8Url, referer = "https://www.2embed.cc/",
+                    quality = Qualities.P1080.value, type = ExtractorLinkType.M3U8, headers = headers
                 )
             )
             return true
-
         } catch (e: Exception) {
             ClipboardLogger.logAndCopy("Exception", "Error: ${e.message}\nStackTrace: ${e.stackTraceToString()}")
             return false
