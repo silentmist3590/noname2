@@ -4,220 +4,333 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink
+import org.json.JSONArray
 import org.json.JSONObject
-import org.jsoup.Jsoup
-import java.net.URLDecoder
 import java.net.URLEncoder
-import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
-import com.lagradost.cloudstream3.plugins.Plugin
-
 
 class OkRuProvider : MainAPI() {
     override var mainUrl = "https://ok.ru"
     override var name = "OK.ru"
     override val hasMainPage = true
-    override var lang = "vi"
+    override var lang = "ru"
     override val hasDownloadSupport = true
-    override val supportedTypes = setOf(TvType.Movie, TvType.Others)
+    override val supportedTypes = setOf(TvType.Movie)
 
-    private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    companion object {
+        private const val USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        // Để trống mặc định vì OK.ru phát công khai hoàn toàn mượt mà không cần tài khoản/cookie
+        private const val USER_COOKIE = ""
+    }
 
     override val mainPage = mainPageOf(
-        "/video/top" to "Video Thịnh Hành",
-        "/video/live" to "Trực Tiếp (Live)",
-        "/video/channels" to "Kênh Phổ Biến"
+        "video/top" to "Thịnh hành (Top Videos)",
+        "video/popular" to "Phổ biến",
+        "video/movies" to "Phim & Hoạt hình",
+        "video/live" to "Trực tiếp (Live)"
     )
 
-    private fun getHeaders(): Map<String, String> {
-        return mapOf(
-            "User-Agent" to userAgent,
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language" to "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Referer" to "$mainUrl/"
-        )
-    }
-
-    // =========================================================================
-    // 1. TRANG CHỦ (MAIN PAGE) - SỬ DỤNG JSOUP SELECTOR AN TOÀN
-    // =========================================================================
+    // -------------------------------------------------------------------------
+    // 1. TRANG CHÍNH (MAIN PAGE)
+    // -------------------------------------------------------------------------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val targetUrl = "$mainUrl${request.data}"
-        val response = runCatching {
-            app.get(targetUrl, headers = getHeaders(), timeout = 15L).text
-        }.getOrNull() ?: return newHomePageResponse(request.name, emptyList())
-
-        val document = Jsoup.parse(response)
-        val videos = mutableListOf<SearchResponse>()
-
-        // Quét các thẻ bao bọc class video phổ biến trên cấu trúc DOM của OK.ru
-        document.select("div.video-card, div.vid-card, complex-video-card, div.ugc-grid_i").forEach { element ->
-            val anchor = element.select("a[href*=/video/]").firstOrNull() ?: return@forEach
-            val href = anchor.attr("href")
-            val id = href.substringAfter("/video/").substringBefore("?").substringBefore("/")
-            
-            if (id.isNotBlank() && !id.contains("search") && !id.contains("top")) {
-                val title = element.select(".video-card_n, .vid-card_n, .video-card_title, a.textWrap").text().takeIf { it.isNotBlank() }
-                    ?: anchor.text().takeIf { it.isNotBlank() }
-                    ?: "Video $id"
-
-                var thumb = element.select("img.video-card_img, img.vid-card_img, img").attr("src")
-                if (thumb.startsWith("//")) {
-                    thumb = "https:$thumb"
-                }
-
-                videos.add(
-                    newMovieSearchResponse(
-                        name = title,
-                        url = "$mainUrl/video/$id",
-                        type = TvType.Movie
-                    ) {
-                        this.posterUrl = thumb
-                    }
-                )
-            }
+        val path = request.data.trim().trimStart('/')
+        val url = if (page <= 1) {
+            "https://m.ok.ru/$path"
+        } else {
+            val sep = if (path.contains("?")) "&" else "?"
+            "https://m.ok.ru/$path${sep}st.page=$page"
         }
-
-        return newHomePageResponse(request.name, videos.distinctBy { it.url }, hasNext = false)
+        val items = fetchVideoList(url)
+        return newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
     }
 
-    // =========================================================================
+    // -------------------------------------------------------------------------
     // 2. TÌM KIẾM (SEARCH)
-    // =========================================================================
+    // -------------------------------------------------------------------------
     override suspend fun search(query: String): List<SearchResponse> {
-        val encodedQuery = URLEncoder.encode(query.trim(), "UTF-8")
-        val searchUrl = "$mainUrl/video/search/$encodedQuery"
-
-        val response = runCatching {
-            app.get(searchUrl, headers = getHeaders(), timeout = 15L).text
-        }.getOrNull() ?: return emptyList()
-
-        val document = Jsoup.parse(response)
-        val results = mutableListOf<SearchResponse>()
-
-        document.select("div.video-card, div.vid-card, complex-video-card").forEach { element ->
-            val anchor = element.select("a[href*=/video/]").firstOrNull() ?: return@forEach
-            val href = anchor.attr("href")
-            val id = href.substringAfter("/video/").substringBefore("?").substringBefore("/")
-
-            if (id.isNotBlank()) {
-                val title = element.select(".video-card_n, .vid-card_n, .video-card_title").text().takeIf { it.isNotBlank() }
-                    ?: anchor.text()
-                var thumb = element.select("img").attr("src")
-                if (thumb.startsWith("//")) {
-                    thumb = "https:$thumb"
-                }
-
-                results.add(
-                    newMovieSearchResponse(
-                        name = title,
-                        url = "$mainUrl/video/$id",
-                        type = TvType.Movie
-                    ) {
-                        this.posterUrl = thumb
-                    }
-                )
-            }
-        }
-
-        return results.distinctBy { it.url }
+        val q = URLEncoder.encode(query.trim(), "UTF-8")
+        if (q.isBlank()) return emptyList()
+        val url = "https://m.ok.ru/video/search?cmd=Search&st.query=$q"
+        return fetchVideoList(url)
     }
 
-    // =========================================================================
-    // 3. CHI TIẾT VIDEO (LOAD INFO)
-    // =========================================================================
-    override suspend fun load(url: String): LoadResponse {
-        val id = url.substringAfter("/video/").substringBefore("?").substringBefore("/")
-        
-        val response = app.get(url, headers = getHeaders()).text
-        val document = Jsoup.parse(response)
-        
-        val title = document.select("h1.video-layer_hd, .vp-layer_info_title, title").text()
-            .substringBefore(" •").replace(" - OK.RU", "").trim()
-            
-        val thumb = document.select("meta[property=og:image]").attr("content")
+    // -------------------------------------------------------------------------
+    // 3. CHI TIẾT VIDEO (LOAD)
+    // -------------------------------------------------------------------------
+    override suspend fun load(url: String): LoadResponse? {
+        val videoId = extractVideoId(url)
+        if (videoId.isBlank()) return null
 
-        return newMovieLoadResponse(title, url, TvType.Movie, url) {
-            this.posterUrl = thumb
-            this.plot = "Video ID: $id phân phối trên nền tảng OK.ru"
+        val embedUrl = "https://ok.ru/videoembed/$videoId"
+        val res = app.get(embedUrl, headers = getHeaders("https://ok.ru/"))
+        val html = res.text
+
+        val match = Regex("""data-options=["']([^"']+)["']""").find(html) ?: return null
+        val rawJson = unescapeHtml(match.groupValues[1])
+        val rootObj = JSONObject(rawJson)
+        val flashvars = rootObj.optJSONObject("flashvars") ?: JSONObject()
+
+        val metadataObj = flashvars.optJSONObject("metadata")
+            ?: flashvars.optString("metadata").takeIf { it.isNotBlank() }?.let { JSONObject(it) }
+            ?: JSONObject()
+
+        val movieObj = metadataObj.optJSONObject("movie") ?: JSONObject()
+
+        val title = movieObj.optString("title").takeIf { it.isNotBlank() }
+            ?: rootObj.optString("movieTitle").takeIf { it.isNotBlank() }
+            ?: "Video $videoId"
+
+        var poster = movieObj.optString("poster").takeIf { it.isNotBlank() }
+            ?: rootObj.optString("poster").takeIf { it.isNotBlank() }
+        poster = poster?.let { formatUrl(it) }
+
+        val durationSec = movieObj.optInt("duration", 0).takeIf { it > 0 }
+        val author = metadataObj.optJSONObject("author")?.optString("name")
+            ?: movieObj.optString("author")
+
+        val pageUrl = "https://ok.ru/video/$videoId"
+
+        return newMovieLoadResponse(title, pageUrl, TvType.Movie, videoId) {
+            this.posterUrl = poster
+            this.duration = durationSec
+            this.plot = author.takeIf { !it.isNullOrBlank() }?.let { "Kênh / Người đăng: $it" }
         }
     }
 
-    // =========================================================================
-    // 4. TRÍCH XUẤT LUỒNG PHÁT VIDEO (LOAD LINKS) - ĐÃ ĐỒNG BỘ SIGNATURE MỚI
-    // =========================================================================
+    // -------------------------------------------------------------------------
+    // 4. TRÍCH XUẤT LUỒNG PHÁT (LOAD LINKS) - KHÔNG CRASH, KHÔNG TREO
+    // -------------------------------------------------------------------------
     override suspend fun loadLinks(
         data: String,
-        isDataJob: Boolean,
+        isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val response = runCatching {
-            app.get(data, headers = getHeaders()).text
-        }.getOrNull() ?: return false
+        val videoId = extractVideoId(data)
+        if (videoId.isBlank()) return false
 
-        // Tìm thuộc tính mã hóa dữ liệu phát JSON ẩn trong thẻ div đặc trưng của OK.ru
-        val match = Regex("""data-options="([^"]+)"""").find(response) ?: return false
-        val unescapedJson = match.groupValues[1]
+        val embedUrl = "https://ok.ru/videoembed/$videoId"
+        val res = app.get(embedUrl, headers = getHeaders("https://ok.ru/"))
+        val html = res.text
+
+        val match = Regex("""data-options=["']([^"']+)["']""").find(html) ?: return false
+        val rawJson = unescapeHtml(match.groupValues[1])
+        val rootObj = JSONObject(rawJson)
+        val flashvars = rootObj.optJSONObject("flashvars") ?: JSONObject()
+
+        val metadataObj = flashvars.optJSONObject("metadata")
+            ?: flashvars.optString("metadata").takeIf { it.isNotBlank() }?.let { JSONObject(it) }
+            ?: JSONObject()
+
+        val movieObj = metadataObj.optJSONObject("movie") ?: JSONObject()
+        var foundLinks = false
+
+        // Phụ đề: Bọc try-catch và chuẩn hóa https:// để tuyệt đối không làm crash ExoPlayer
+        val subtitlesArr = movieObj.optJSONArray("subtitleTracks")
+            ?: metadataObj.optJSONArray("subtitleTracks")
+        if (subtitlesArr != null) {
+            for (i in 0 until subtitlesArr.length()) {
+                try {
+                    val subObj = subtitlesArr.optJSONObject(i) ?: continue
+                    var subUrl = subObj.optString("url", "").trim()
+                    if (subUrl.isBlank()) continue
+                    if (subUrl.startsWith("//")) subUrl = "https:$subUrl"
+                    if (!subUrl.startsWith("http")) continue
+                    val subTitle = subObj.optString("title").takeIf { it.isNotBlank() }
+                        ?: subObj.optString("manifestName").takeIf { it.isNotBlank() }
+                        ?: subObj.optString("language", "Phụ đề")
+                    subtitleCallback(SubtitleFile(subTitle, subUrl))
+                } catch (_: Throwable) {}
+            }
+        }
+
+        // Ưu tiên số 1: Direct MP4 Video Streams (Phát trực tiếp cực nhanh, tua mượt, không lỗi)
+        val videosArr = metadataObj.optJSONArray("videos")
+        if (videosArr != null && videosArr.length() > 0) {
+            data class VideoStream(val url: String, val quality: Int, val displayName: String)
+            val streamList = mutableListOf<VideoStream>()
+
+            for (i in 0 until videosArr.length()) {
+                val vObj = videosArr.optJSONObject(i) ?: continue
+                var vUrl = vObj.optString("url", "").trim()
+                if (vUrl.isBlank()) continue
+                if (vUrl.startsWith("//")) vUrl = "https:$vUrl"
+                if (!vUrl.startsWith("http")) continue
+
+                val vName = vObj.optString("name", "").lowercase().trim()
+                val (qVal, dName) = when (vName) {
+                    "ultra" -> Qualities.P2160.value to "OK.ru • 4K Ultra"
+                    "quad" -> Qualities.P1080.value to "OK.ru • 2K Quad"
+                    "full" -> Qualities.P1080.value to "OK.ru • 1080p FHD"
+                    "hd" -> Qualities.P720.value to "OK.ru • 720p HD"
+                    "sd" -> Qualities.P480.value to "OK.ru • 480p SD"
+                    "low" -> Qualities.P360.value to "OK.ru • 360p"
+                    "lowest" -> Qualities.P360.value to "OK.ru • 240p"
+                    "mobile" -> Qualities.Unknown.value to "OK.ru • 144p Mobile"
+                    else -> Qualities.Unknown.value to "OK.ru • $vName"
+                }
+                streamList.add(VideoStream(vUrl, qVal, dName))
+            }
+
+            // Sắp xếp giảm dần theo chất lượng (1080p -> 720p -> 480p -> 360p)
+            streamList.sortByDescending { it.quality }
+
+            for (stream in streamList) {
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = stream.displayName,
+                        url = stream.url,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = "https://ok.ru/"
+                        this.quality = stream.quality
+                        this.headers = mapOf(
+                            "User-Agent" to USER_AGENT,
+                            "Referer" to "https://ok.ru/"
+                        )
+                    }
+                )
+                foundLinks = true
+            }
+        }
+
+        // Ưu tiên số 2: HLS Stream (M3U8) dự phòng
+        val hlsUrl = metadataObj.optString("hlsManifestUrl", "").trim()
+        if (hlsUrl.isNotBlank()) {
+            val fixedHls = if (hlsUrl.startsWith("//")) "https:$hlsUrl" else hlsUrl
+            if (fixedHls.startsWith("http")) {
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name = "OK.ru • Tự động thích ứng (HLS)",
+                        url = fixedHls,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = "https://ok.ru/"
+                        this.quality = Qualities.Unknown.value
+                        this.headers = mapOf(
+                            "User-Agent" to USER_AGENT,
+                            "Referer" to "https://ok.ru/"
+                        )
+                    }
+                )
+                foundLinks = true
+            }
+        }
+
+        return foundLinks
+    }
+
+    // -------------------------------------------------------------------------
+    // CÁC HÀM TIỆN ÍCH TRỢ GIÚP (HELPERS)
+    // -------------------------------------------------------------------------
+    private fun extractVideoId(input: String): String {
+        val clean = input.trim()
+        val match = Regex("""(?:video(?:embed)?/)?(\d{5,})""").find(clean)
+        return match?.groupValues?.get(1) ?: clean.filter { it.isDigit() }
+    }
+
+    private fun formatUrl(url: String): String {
+        var clean = url.trim()
+        if (clean.startsWith("//")) {
+            clean = "https:$clean"
+        }
+        return clean
+    }
+
+    private fun getPosterUrl(item: JSONObject): String? {
+        item.optJSONObject("thumbnails")?.let { thumbs ->
+            val keys = listOf(
+                "STANDARD", "FULL", "FULL_HD_NO_CROP", "HD_NO_CROP", "HD",
+                "HIGH", "MEDIUM", "SMALL", "COLLAGE"
+            )
+            for (k in keys) {
+                val v = thumbs.optString(k, "").trim()
+                if (v.isNotBlank()) return formatUrl(v)
+            }
+        }
+        item.optJSONObject("thumbnailsObjects")?.let { tObjs ->
+            val keys = listOf("STANDARD", "FULL", "HD", "HIGH")
+            for (k in keys) {
+                val v = tObjs.optJSONObject(k)?.optString("thumbnail", "")?.trim()
+                if (!v.isNullOrBlank()) return formatUrl(v)
+            }
+        }
+        val direct = item.optString("imageUrl", "").takeIf { it.isNotBlank() }
+            ?: item.optString("poster", "").takeIf { it.isNotBlank() }
+            ?: item.optString("thumbnail", "").takeIf { it.isNotBlank() }
+            ?: item.optJSONObject("collage")?.optString("url", "")?.takeIf { it.isNotBlank() }
+
+        return direct?.let { formatUrl(it) }
+    }
+
+    private fun unescapeHtml(input: String): String {
+        return input
             .replace("&quot;", "\"")
             .replace("&amp;", "&")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&#34;", "\"")
+            .replace("&#38;", "&")
+            .replace("\\\"", "\"")
+    }
 
-        return runCatching {
-            val json = JSONObject(unescapedJson)
-            val flashvars = json.optJSONObject("flashvars") ?: return false
-            val metadataUrl = flashvars.optString("metadataUrl")
+    private fun getHeaders(referer: String = "https://ok.ru/"): Map<String, String> {
+        val map = mutableMapOf(
+            "User-Agent" to USER_AGENT,
+            "Referer" to referer,
+            "Accept" to "*/*"
+        )
+        if (USER_COOKIE.isNotBlank()) {
+            val sanitized = USER_COOKIE.filter { it.code in 32..126 }.trim()
+            if (sanitized.isNotBlank()) {
+                map["Cookie"] = sanitized
+            }
+        }
+        return map
+    }
 
-            if (metadataUrl.isNotBlank()) {
-                // Gọi API lấy dữ liệu luồng stream từ phân vùng cấu hình hệ thống
-                val metaResponse = app.post(
-                    metadataUrl,
-                    headers = mapOf(
-                        "User-Agent" to userAgent,
-                        "Content-Type" to "application/x-www-form-urlencoded",
-                        "Referer" to data
-                    )
-                ).text
+    private suspend fun fetchVideoList(url: String): List<SearchResponse> {
+        val list = mutableListOf<SearchResponse>()
+        try {
+            val res = app.get(
+                url,
+                headers = getHeaders("https://m.ok.ru/")
+            )
+            val html = res.text
+            val match = Regex("""videos=["']([^"']+)["']""").find(html)
+            if (match != null) {
+                val unescaped = unescapeHtml(match.groupValues[1])
+                val root = JSONObject(unescaped)
+                val dataArray = root.optJSONObject("table")?.optJSONArray("data")
+                    ?: root.optJSONArray("data")
+                    ?: root.optJSONArray("videos")
 
-                val metaJson = JSONObject(metaResponse)
-                val videosArray = metaJson.optJSONArray("videos") ?: return false
+                if (dataArray != null) {
+                    for (i in 0 until dataArray.length()) {
+                        val item = dataArray.optJSONObject(i) ?: continue
+                        val id = item.optString("id", "").takeIf { it.isNotBlank() } ?: continue
+                        val name = item.optString("name", "").takeIf { it.isNotBlank() }
+                            ?: item.optString("title", "").takeIf { it.isNotBlank() }
+                            ?: "Video $id"
 
-                for (i in 0 until videosArray.length()) {
-                    val videoObj = videosArray.optJSONObject(i) ?: continue
-                    val streamUrl = videoObj.optString("url")
-                    val nameSetting = videoObj.optString("name") // mobile, lowest, low, medium, high, highest
+                        val thumb = getPosterUrl(item)
+                        val videoPageUrl = "https://ok.ru/video/$id"
 
-                    if (streamUrl.isNotBlank()) {
-                        val quality = when (nameSetting.lowercase()) {
-                            "mobile" -> Qualities.P240.value
-                            "lowest" -> Qualities.P360.value
-                            "low" -> Qualities.P480.value
-                            "medium" -> Qualities.P720.value
-                            "high" -> Qualities.P1080.value
-                            "highest" -> Qualities.P1440.value
-                            else -> Qualities.Unknown.value
-                        }
-
-                        callback.invoke(
-                            ExtractorLink(
-                                source = this.name,
-                                name = "${this.name} - ${nameSetting.uppercase()}",
-                                url = streamUrl,
-                                referer = "$mainUrl/",
-                                quality = quality,
-                                type = if (streamUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                            )
+                        list.add(
+                            newMovieSearchResponse(name, videoPageUrl, TvType.Movie) {
+                                this.posterUrl = thumb
+                            }
                         )
                     }
                 }
-                return true
             }
-            false
-        }.getOrDefault(false)
-    }
-}
-@CloudstreamPlugin
-class OkRuPlugin : Plugin() {
-    override fun load(context: android.content.Context) {
-        // Đăng ký lớp Provider của bạn vào hệ thống Cloudstream
-        registerMainAPI(OkRuProvider())
+        } catch (_: Throwable) {}
+        return list
     }
 }
