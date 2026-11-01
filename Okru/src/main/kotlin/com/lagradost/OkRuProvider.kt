@@ -140,7 +140,7 @@ class OkRuProvider : MainAPI() {
     }
 
     // =========================================================================
-    // 4. TRÍCH XUẤT LUỒNG PHÁT VIDEO (LOAD LINKS) - ĐÃ CẬP NHẬT SIGNATURE
+    // 4. TRÍCH XUẤT LUỒNG PHÁT VIDEO (LOAD LINKS) - ĐÃ ĐỒNG BỘ SIGNATURE MỚI
     // =========================================================================
     override suspend fun loadLinks(
         data: String,
