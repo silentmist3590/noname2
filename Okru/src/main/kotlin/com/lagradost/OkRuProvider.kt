@@ -18,7 +18,12 @@ import java.net.URLEncoder
 // =====================================================================
 // ENTRY POINT
 // =====================================================================
-
+@CloudstreamPlugin
+class OkRuPlugin : Plugin() {
+    override fun load(context: Context) {
+        registerMainAPI(OkRuProvider())
+    }
+}
 
 // =====================================================================
 // PROVIDER
@@ -39,19 +44,28 @@ class OkRuProvider : MainAPI() {
         "Referer" to "https://ok.ru/"
     )
 
+    // Danh sách seed mở rộng để hỗ trợ phân trang
+    private val seeds = listOf(
+        "7475662490142", "5686752709150", "7407305296414",
+        "5367224338974", "5465143118366", "5402777684510",
+        "7475662490150", "7475662490151", "7475662490152"
+    )
+
     // =================================================================
-    // TRANG CHỦ — Scrape recommendations từ video seed
+    // TRANG CHỦ — Hỗ trợ tải thêm (hasNext)
     // =================================================================
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse? {
-        val seeds = listOf(
-            "7475662490142" to "Đề xuất cho bạn",
-            "5686752709150" to "Phổ biến",
-            "7407305296414" to "Khác"
-        )
+        // Mỗi page lấy 3 seed khác nhau
+        val seedsPerPage = 3
+        val startIdx = (page - 1) * seedsPerPage
+        val endIdx = minOf(startIdx + seedsPerPage, seeds.size)
+        if (startIdx >= seeds.size) return null
+
+        val seedSlice = seeds.subList(startIdx, endIdx)
         val seen = mutableSetOf<String>()
         val sections = mutableListOf<HomePageList>()
 
-        for ((seedId, label) in seeds) {
+        for (seedId in seedSlice) {
             try {
                 val doc = app.get(
                     "$mainUrl/video/$seedId",
@@ -61,9 +75,6 @@ class OkRuProvider : MainAPI() {
                         "Accept-Language" to "vi,en;q=0.9,ru;q=0.8"
                     )
                 ).document
-
-                val linkCount = doc.select("a[href*=/video/]").size
-                android.util.Log.d("OkRuDebug", "Seed $seedId: $linkCount video links")
 
                 val items = mutableListOf<SearchResponse>()
                 doc.select("a[href*=/video/]").forEach { a ->
@@ -84,25 +95,37 @@ class OkRuProvider : MainAPI() {
                     )
                 }
 
-                android.util.Log.d("OkRuDebug", "Seed $seedId: parsed ${items.size} items")
-                if (items.isNotEmpty()) sections.add(HomePageList(label, items))
+                android.util.Log.d("OkRuDebug", "MainPage page=$page seed=$seedId → ${items.size}")
+                if (items.isNotEmpty()) {
+                    val label = when (page) {
+                        1 -> "Đề xuất cho bạn"
+                        2 -> "Phổ biến"
+                        3 -> "Mới nhất"
+                        else -> "Khám phá"
+                    }
+                    sections.add(HomePageList(label, items))
+                }
             } catch (e: Exception) {
                 android.util.Log.e("OkRuDebug", "Seed $seedId failed", e)
             }
         }
 
         if (sections.isEmpty()) return null
-        return newHomePageResponse(sections)
+
+        // hasNext = true nếu còn seed chưa dùng
+        val hasNext = endIdx < seeds.size
+        android.util.Log.d("OkRuDebug", "MainPage page=$page done, hasNext=$hasNext, sections=${sections.size}")
+        return newHomePageResponse(sections, hasNext)
     }
 
     // =================================================================
-    // TÌM KIẾM — Khôi phục logic fetchVideoList từ bản trước
+    // TÌM KIẾM — Kết hợp 3 lớp + lặp trang
     // =================================================================
     override suspend fun search(query: String): List<SearchResponse>? {
         val trimmed = query.trim()
         if (trimmed.isBlank()) return emptyList()
 
-        // Ưu tiên 1: Nếu user paste URL hoặc ID video → xử lý trực tiếp
+        // Lớp 0: Nếu là URL/ID video → xử lý trực tiếp
         val directMatch = Regex("""(?:/video/)?(\d{6,})""").find(trimmed)
         if (directMatch != null &&
             (trimmed.contains("/video/") || trimmed.matches(Regex("""\d{6,}""")))) {
@@ -111,130 +134,123 @@ class OkRuProvider : MainAPI() {
             return directVideoSearch(videoId)
         }
 
-        // Ưu tiên 2: Khôi phục fetchVideoList từ bản trước
-        android.util.Log.d("OkRuDebug", "Search: trying fetchVideoList for '$trimmed'")
-        val fromJson = fetchVideoList(trimmed)
-        if (fromJson.isNotEmpty()) {
-            android.util.Log.d("OkRuDebug", "Search: fetchVideoList returned ${fromJson.size} items")
-            return fromJson
-        }
+        val encoded = URLEncoder.encode(trimmed, "UTF-8")
+        val all = mutableListOf<SearchResponse>()
+        val seen = mutableSetOf<String>()
 
-        // Ưu tiên 3: Fallback scrape HTML từ trang search
-        android.util.Log.d("OkRuDebug", "Search: fetchVideoList empty, trying HTML scrape")
-        return scrapeSearchHtml(trimmed)
-    }
+        // Lặp 5 trang
+        for (page in 1..5) {
+            var addedThisPage = 0
 
-    /**
-     * Khôi phục logic từ bản trước: tìm JSON nhúng dạng videos=[...]
-     * trong HTML của trang search di động.
-     */
-    private suspend fun fetchVideoList(query: String): List<SearchResponse> {
-        val encoded = URLEncoder.encode(query, "UTF-8")
-        val url = "https://m.ok.ru/video/search?cmd=Search&st.query=$encoded"
-
-        try {
-            val html = app.get(
-                url,
-                headers = mapOf(
-                    "User-Agent" to userAgent,
-                    "Referer" to "https://m.ok.ru/",
-                    "Accept-Language" to "vi,en;q=0.9,ru;q=0.8"
-                )
-            ).text
-
-            android.util.Log.d("OkRuDebug", "fetchVideoList: fetched ${html.length} chars")
-
-            // Tìm mẫu videos=["..."] hoặc videos='...'
-            val match = Regex("""videos=(['"])(.+?)\1""").find(html) ?: run {
-                android.util.Log.d("OkRuDebug", "fetchVideoList: no 'videos=' pattern")
-                return emptyList()
-            }
-
-            val unescaped = unescapeHtml(match.groupValues[2])
-            val root = JSONObject(unescaped)
-
-            val dataArray = root.optJSONObject("table")?.optJSONArray("data")
-                ?: root.optJSONArray("data")
-                ?: root.optJSONArray("videos")
-                ?: run {
-                    android.util.Log.d("OkRuDebug", "fetchVideoList: no data array in JSON")
-                    return emptyList()
-                }
-
-            val results = mutableListOf<SearchResponse>()
-            for (i in 0 until dataArray.length()) {
-                val item = dataArray.optJSONObject(i) ?: continue
-                val id = item.optString("id").takeIf { it.isNotBlank() } ?: continue
-                val title = item.optString("name").takeIf { it.isNotBlank() }
-                    ?: item.optString("title").takeIf { it.isNotBlank() }
-                    ?: "Video $id"
-
-                val poster = getPosterFromJson(item)
-                results.add(
-                    newMovieSearchResponse(title, "$mainUrl/video/$id", TvType.Movie) {
-                        this.posterUrl = poster
-                        this.posterHeaders = posterHeaders
-                    }
-                )
-            }
-            return results
-        } catch (e: Exception) {
-            android.util.Log.e("OkRuDebug", "fetchVideoList failed", e)
-            return emptyList()
-        }
-    }
-
-    /**
-     * Fallback: scrape HTML trực tiếp từ trang search nếu fetchVideoList thất bại.
-     */
-    private suspend fun scrapeSearchHtml(query: String): List<SearchResponse> {
-        val encoded = URLEncoder.encode(query, "UTF-8")
-        val urls = listOf(
-            "$mainUrl/search/video?st.query=$encoded",
-            "$mainUrl/search?st.query=$encoded&st.mode=Video"
-        )
-
-        for (url in urls) {
+            // Lớp 1: JSON nhúng từ m.ok.ru
+            val jsonUrl = "https://m.ok.ru/video/search?cmd=Search&st.query=$encoded&st.page=$page"
             try {
-                val doc = app.get(
-                    url,
-                    headers = mapOf(
-                        "User-Agent" to userAgent,
-                        "Referer" to mainUrl,
-                        "Accept-Language" to "vi,en;q=0.9,ru;q=0.8"
-                    )
-                ).document
-
-                val links = doc.select("a[href*=/video/]")
-                android.util.Log.d("OkRuDebug", "scrapeSearchHtml: $url → ${links.size} links")
-                if (links.isEmpty()) continue
-
-                val results = mutableListOf<SearchResponse>()
-                val seen = mutableSetOf<String>()
-
-                links.forEach { a ->
-                    val href = a.attr("href").trim()
-                    val m = Regex("""/video/(\d+)""").find(href) ?: return@forEach
-                    val vid = m.groupValues[1]
-                    if (!seen.add(vid)) return@forEach
-
-                    val title = extractTitle(a) ?: return@forEach
-                    val (poster, headers) = extractPoster(a)
-
-                    results.add(
-                        newMovieSearchResponse(title, "$mainUrl/video/$vid", TvType.Movie) {
-                            this.posterUrl = poster
-                            this.posterHeaders = headers
-                        }
-                    )
+                val jsonItems = fetchFromJsonPage(jsonUrl)
+                for (item in jsonItems) {
+                    if (seen.add(item.url)) {
+                        all.add(item)
+                        addedThisPage++
+                    }
                 }
-
-                if (results.isNotEmpty()) return results
+                if (jsonItems.isNotEmpty()) {
+                    android.util.Log.d("OkRuDebug", "Search p$page JSON → ${jsonItems.size}")
+                    continue
+                }
             } catch (e: Exception) {
-                android.util.Log.e("OkRuDebug", "scrapeSearchHtml failed: $url", e)
+                android.util.Log.e("OkRuDebug", "Search p$page JSON failed", e)
             }
+
+            // Lớp 2: Scrape HTML desktop
+            val htmlUrl = "$mainUrl/video/search?st.query=$encoded&st.page=$page"
+            try {
+                val htmlItems = scrapeSearchPage(htmlUrl)
+                for (item in htmlItems) {
+                    if (seen.add(item.url)) {
+                        all.add(item)
+                        addedThisPage++
+                    }
+                }
+                android.util.Log.d("OkRuDebug", "Search p$page HTML → ${htmlItems.size}")
+            } catch (e: Exception) {
+                android.util.Log.e("OkRuDebug", "Search p$page HTML failed", e)
+            }
+
+            // Nếu cả 2 lớp đều không thêm gì → hết dữ liệu
+            if (addedThisPage == 0) break
         }
-        return emptyList()
+
+        android.util.Log.d("OkRuDebug", "Search '$trimmed' total=${all.size}")
+        return all
+    }
+
+    /**
+     * Lớp 1: Tìm JSON nhúng `videos=["..."]` trong HTML mobile.
+     */
+    private suspend fun fetchFromJsonPage(url: String): List<SearchResponse> {
+        val html = app.get(
+            url,
+            headers = mapOf(
+                "User-Agent" to userAgent,
+                "Referer" to "https://m.ok.ru/",
+                "Accept-Language" to "vi,en;q=0.9,ru;q=0.8"
+            )
+        ).text
+
+        val match = Regex("""videos=(['"])(.+?)\1""").find(html) ?: return emptyList()
+        val unescaped = unescapeHtml(match.groupValues[2])
+        val root = JSONObject(unescaped)
+
+        val dataArray = root.optJSONObject("table")?.optJSONArray("data")
+            ?: root.optJSONArray("data")
+            ?: root.optJSONArray("videos")
+            ?: return emptyList()
+
+        val results = mutableListOf<SearchResponse>()
+        for (i in 0 until dataArray.length()) {
+            val item = dataArray.optJSONObject(i) ?: continue
+            val id = item.optString("id").takeIf { it.isNotBlank() } ?: continue
+            val title = item.optString("name").takeIf { it.isNotBlank() }
+                ?: item.optString("title").takeIf { it.isNotBlank() }
+                ?: "Video $id"
+            val poster = getPosterFromJson(item)
+            results.add(
+                newMovieSearchResponse(title, "$mainUrl/video/$id", TvType.Movie) {
+                    this.posterUrl = poster
+                    this.posterHeaders = posterHeaders
+                }
+            )
+        }
+        return results
+    }
+
+    /**
+     * Lớp 2: Scrape HTML desktop.
+     */
+    private suspend fun scrapeSearchPage(url: String): List<SearchResponse> {
+        val doc = app.get(
+            url,
+            headers = mapOf(
+                "User-Agent" to userAgent,
+                "Referer" to mainUrl,
+                "Accept-Language" to "vi,en;q=0.9,ru;q=0.8"
+            )
+        ).document
+
+        val results = mutableListOf<SearchResponse>()
+        doc.select("a[href*=/video/]").forEach { a ->
+            val href = a.attr("href").trim()
+            val m = Regex("""/video/(\d+)""").find(href) ?: return@forEach
+            val vid = m.groupValues[1]
+            val title = extractTitle(a) ?: return@forEach
+            val (poster, headers) = extractPoster(a)
+            results.add(
+                newMovieSearchResponse(title, "$mainUrl/video/$vid", TvType.Movie) {
+                    this.posterUrl = poster
+                    this.posterHeaders = headers
+                }
+            )
+        }
+        return results.distinctBy { it.url }
     }
 
     private suspend fun directVideoSearch(videoId: String): List<SearchResponse> {
@@ -243,13 +259,11 @@ class OkRuProvider : MainAPI() {
                 "$mainUrl/video/$videoId",
                 headers = mapOf("User-Agent" to userAgent, "Referer" to mainUrl)
             ).document
-
             val title = doc.selectFirst("meta[property=og:title]")?.attr("content")
                 ?.takeIf { it.isNotBlank() } ?: "Video $videoId"
-            var poster = doc.selectFirst("meta[property=og:image]")?.attr("content")
-                ?.takeIf { it.isNotBlank() }
-            poster = normalizePosterUrl(poster)
-
+            val poster = normalizePosterUrl(
+                doc.selectFirst("meta[property=og:image]")?.attr("content")
+            )
             listOf(
                 newMovieSearchResponse(title, "$mainUrl/video/$videoId", TvType.Movie) {
                     this.posterUrl = poster
@@ -269,7 +283,6 @@ class OkRuProvider : MainAPI() {
         val videoId = extractVideoId(url) ?: return null
         var title = "Video $videoId"
         var poster: String? = null
-
         try {
             val doc = app.get(
                 "$mainUrl/video/$videoId",
@@ -283,7 +296,6 @@ class OkRuProvider : MainAPI() {
         } catch (e: Exception) {
             android.util.Log.e("OkRuDebug", "load failed: ${e.message}")
         }
-
         return newMovieLoadResponse(title, url, TvType.Movie, videoId) {
             this.posterUrl = poster
             this.posterHeaders = posterHeaders
@@ -291,7 +303,7 @@ class OkRuProvider : MainAPI() {
     }
 
     // =================================================================
-    // LẤY LINK STREAM — GIỮ NGUYÊN (đã hoạt động)
+    // LẤY LINK STREAM — GIỮ NGUYÊN (đang hoạt động)
     // =================================================================
     override suspend fun loadLinks(
         data: String,
@@ -362,7 +374,6 @@ class OkRuProvider : MainAPI() {
     // METADATA EXTRACTION
     // =================================================================
     private fun extractMetadata(doc: Document, html: String): Pair<JSONObject?, String?> {
-        // Method 1: data-options
         for (el in doc.select("[data-options]")) {
             val raw = el.attr("data-options")
             if (!raw.contains("flashvars") && !raw.contains("metadata")) continue
@@ -374,13 +385,13 @@ class OkRuProvider : MainAPI() {
                     ?.takeIf { it.isNotBlank() } ?: continue
                 val metadata = JSONObject(metaStr)
                 val hls = metadata.optString("hlsManifestUrl").takeIf { it.isNotBlank() }
+                android.util.Log.d("OkRuDebug", "Method 1 (data-options) OK")
                 return Pair(metadata, hls)
             } catch (e: Exception) {
                 android.util.Log.e("OkRuDebug", "Method 1 failed: ${e.message}")
             }
         }
 
-        // Method 2: OKVideo.start({...})
         for (script in doc.select("script")) {
             val data = script.data()
             val m = Regex("""OKVideo\.start\((\{.+?\})\)""").find(data) ?: continue
@@ -391,105 +402,65 @@ class OkRuProvider : MainAPI() {
                     ?.takeIf { it.isNotBlank() } ?: continue
                 val metadata = JSONObject(metaStr)
                 val hls = metadata.optString("hlsManifestUrl").takeIf { it.isNotBlank() }
+                android.util.Log.d("OkRuDebug", "Method 2 (script) OK")
                 return Pair(metadata, hls)
             } catch (e: Exception) { /* ignore */ }
         }
 
-        // Method 3: regex trên HTML
         try {
             val unescaped = Parser.unescapeEntities(html, true)
             val m = Regex("""https://[^"'\s<>]+\.m3u8[^"'\s<>]*""").find(unescaped)
-            if (m != null) return Pair(null, m.value)
+            if (m != null) {
+                android.util.Log.d("OkRuDebug", "Method 3 (regex m3u8) OK")
+                return Pair(null, m.value)
+            }
         } catch (e: Exception) { /* ignore */ }
 
         return Pair(null, null)
     }
 
     // =================================================================
-    // POSTER EXTRACTION — Sửa lỗi ảnh không hiển thị
+    // POSTER EXTRACTION
     // =================================================================
-
-    /**
-     * Tìm poster từ thẻ <a> và các container cha.
-     * Thử lần lượt: img trong <a> → img trong parent → img trong grandparent.
-     */
     private fun extractPoster(anchor: Element): Pair<String?, Map<String, String>?> {
-        // Thử tìm img trong chính thẻ <a>
         var img = anchor.selectFirst("img")
-
-        // Nếu không có, thử tìm trong parent
-        if (img == null) {
-            img = anchor.parent()?.selectFirst("img")
-        }
-
-        // Nếu vẫn không có, thử grandparent
-        if (img == null) {
-            img = anchor.parent()?.parent()?.selectFirst("img")
-        }
-
+        if (img == null) img = anchor.parent()?.selectFirst("img")
+        if (img == null) img = anchor.parent()?.parent()?.selectFirst("img")
         if (img == null) return Pair(null, null)
 
         val rawUrl = img.attr("src").ifEmpty {
-            img.attr("data-src").ifEmpty {
-                img.attr("data-original").ifEmpty { "" }
-            }
+            img.attr("data-src").ifEmpty { img.attr("data-original").ifEmpty { "" } }
         }
-
         val normalized = normalizePosterUrl(rawUrl) ?: return Pair(null, null)
-
-        // Thêm header Referer để CDN ok.ru chấp nhận
         return Pair(normalized, posterHeaders)
     }
 
-    /**
-     * Lấy poster từ JSON item (dùng cho fetchVideoList).
-     * Cấu trúc: thumbnails{STANDARD, FULL, ...} hoặc thumbnailsObjects{...}
-     */
     private fun getPosterFromJson(item: JSONObject): String? {
-        // Thử thumbnails
         item.optJSONObject("thumbnails")?.let { thumbs ->
-            val keys = listOf(
-                "STANDARD", "FULL", "FULL_HD_NO_CROP", "HD_NO_CROP", "HD",
-                "HIGH", "MEDIUM", "SMALL"
-            )
-            for (k in keys) {
+            for (k in listOf("STANDARD", "FULL", "FULL_HD_NO_CROP", "HD_NO_CROP",
+                "HD", "HIGH", "MEDIUM", "SMALL")) {
                 val v = thumbs.optString(k, "").trim()
                 if (v.isNotBlank()) return normalizePosterUrl(v)
             }
         }
-
-        // Thử thumbnailsObjects
         item.optJSONObject("thumbnailsObjects")?.let { tObjs ->
             for (k in listOf("STANDARD", "FULL", "HD", "HIGH")) {
                 val v = tObjs.optJSONObject(k)?.optString("thumbnail", "")?.trim()
                 if (!v.isNullOrBlank()) return normalizePosterUrl(v)
             }
         }
-
-        // Fallback các trường trực tiếp
         val direct = item.optString("imageUrl").takeIf { it.isNotBlank() }
             ?: item.optString("poster").takeIf { it.isNotBlank() }
             ?: item.optString("thumbnail").takeIf { it.isNotBlank() }
-
         return normalizePosterUrl(direct)
     }
 
-    /**
-     * Chuẩn hóa URL poster:
-     * - Thêm "https:" nếu bắt đầu bằng "//"
-     * - Thay `&amp;` bằng `&`
-     * - Trả về null nếu rỗng
-     */
     private fun normalizePosterUrl(url: String?): String? {
         if (url.isNullOrBlank()) return null
         var clean = url.trim()
             .replace("&amp;", "&")
             .replace("\\/", "/")
-
-        if (clean.startsWith("//")) {
-            clean = "https:$clean"
-        }
-
+        if (clean.startsWith("//")) clean = "https:$clean"
         return clean.takeIf { it.startsWith("http") }
     }
 
