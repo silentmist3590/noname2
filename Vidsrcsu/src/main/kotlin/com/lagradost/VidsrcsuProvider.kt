@@ -4,8 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
-import com.google.gson.Gson
-import com.google.gson.annotations.SerializedName
 import org.json.JSONObject
 import java.util.Base64
 
@@ -16,42 +14,19 @@ private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev
 private const val TMDB_API_KEY = "b9e1ff7ff423790bf7df202e661377ca"
 private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
-private const val TRAKT_ACCESS_TOKEN = "" // Để trống nếu không dùng Trakt
-
-
-// =====================================================================================
-// 2. DATA CLASSES CHO CÁC API
-// =====================================================================================
-data class OmdbResponse(
-    @SerializedName("imdbRating") val imdbRating: String?,
-    @SerializedName("imdbVotes") val imdbVotes: String?,
-    @SerializedName("Awards") val awards: String?,
-    @SerializedName("Response") val response: String?
-)
-
-data class TraktScrobbleRequest(
-    @SerializedName("movie") val movie: TraktMovie? = null,
-    @SerializedName("episode") val episode: TraktEpisode? = null,
-    @SerializedName("progress") val progress: Float
-)
-data class TraktMovie(@SerializedName("ids") val ids: TraktIds)
-data class TraktEpisode(
-    @SerializedName("season") val season: Int,
-    @SerializedName("number") val number: Int
-)
-data class TraktIds(@SerializedName("tmdb") val tmdb: Int?)
-
+private const val TRAKT_ACCESS_TOKEN = "" 
 
 // =====================================================================================
-// 3. CÁC HÀM GỌI API HỖ TRỢ
+// 2. CÁC HÀM GỌI API HỖ TRỢ (Đã bỏ Gson)
 // =====================================================================================
 object ApiServices {
-
     // --- OMDb ---
-    suspend fun getOmdbData(imdbId: String): OmdbResponse? {
+    suspend fun getOmdbData(imdbId: String): String? {
         return try {
             val res = app.get("https://www.omdbapi.com/?apikey=$OMDB_API_KEY&i=$imdbId").text
-            Gson().fromJson(res, OmdbResponse::class.java)
+            val json = JSONObject(res)
+            val rating = json.optString("imdbRating")
+            if (rating.isNotEmpty() && rating != "N/A") rating else null
         } catch (e: Exception) {
             ClipboardLogger.logAndCopy("OMDb Error", e.message ?: "Unknown")
             null
@@ -59,26 +34,26 @@ object ApiServices {
     }
 
     // --- Trakt ---
-    suspend fun sendTraktScrobble(
-        action: String, // "start" hoặc "stop"
-        type: String,   // "movie" hoặc "tv"
-        tmdbId: Int,
-        progress: Float,
-        season: Int? = null,
-        episode: Int? = null
-    ) {
+    suspend fun sendTraktScrobble(action: String, type: String, tmdbId: Int, progress: Float, season: Int? = null, episode: Int? = null) {
         if (TRAKT_ACCESS_TOKEN.isEmpty()) return
         val url = "https://api.trakt.tv/scrobble/$action"
         val headers = mapOf(
-            "Content-Type" to "application/json",
-            "trakt-api-version" to "2",
-            "trakt-api-key" to TRAKT_CLIENT_ID,
-            "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
+            "Content-Type" to "application/json", "trakt-api-version" to "2",
+            "trakt-api-key" to TRAKT_CLIENT_ID, "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
         )
-        val body = if (type == "movie") {
-            TraktScrobbleRequest(movie = TraktMovie(TraktIds(tmdbId)), progress = progress)
+        val body = JSONObject()
+        body.put("progress", progress)
+        if (type == "movie") {
+            val movie = JSONObject()
+            val ids = JSONObject()
+            ids.put("tmdb", tmdbId)
+            movie.put("ids", ids)
+            body.put("movie", movie)
         } else {
-            TraktScrobbleRequest(episode = TraktEpisode(season ?: 1, episode ?: 1), progress = progress)
+            val episodeObj = JSONObject()
+            episodeObj.put("season", season ?: 1)
+            episodeObj.put("number", episode ?: 1)
+            body.put("episode", episodeObj)
         }
         try {
             app.post(url, headers = headers, json = body).text
@@ -88,9 +63,8 @@ object ApiServices {
     }
 }
 
-
 // =====================================================================================
-// 4. LỚP PROVIDER CHÍNH
+// 3. LỚP PROVIDER CHÍNH
 // =====================================================================================
 class VidsrcsuProvider : MainAPI() {
     override var mainUrl = TMDB_BASE_URL
@@ -105,9 +79,6 @@ class VidsrcsuProvider : MainAPI() {
         "$mainUrl/tv/popular?api_key=$TMDB_API_KEY" to "Popular TV Shows"
     )
 
-    // ---------------------------------------------------------------------------------
-    // LẤY TRANG CHỦ
-    // ---------------------------------------------------------------------------------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val response = app.get("${request.data}&page=$page").text
         val json = JSONObject(response)
@@ -127,9 +98,6 @@ class VidsrcsuProvider : MainAPI() {
         return newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
     }
 
-    // ---------------------------------------------------------------------------------
-    // TÌM KIẾM
-    // ---------------------------------------------------------------------------------
     override suspend fun search(query: String): List<SearchResponse> {
         val response = app.get("$mainUrl/search/multi?api_key=$TMDB_API_KEY&query=$query").text
         val json = JSONObject(response)
@@ -150,9 +118,6 @@ class VidsrcsuProvider : MainAPI() {
         return searchResults
     }
 
-    // ---------------------------------------------------------------------------------
-    // TẢI CHI TIẾT PHIM / TV
-    // ---------------------------------------------------------------------------------
     override suspend fun load(url: String): LoadResponse? {
         val parts = url.split(":")
         if (parts.size < 3) return null
@@ -169,11 +134,8 @@ class VidsrcsuProvider : MainAPI() {
 
         var imdbScore: Score? = null
         if (imdbId.isNotEmpty()) {
-            ApiServices.getOmdbData(imdbId)?.let { omdb ->
-                val ratingStr = omdb.imdbRating
-                if (!ratingStr.isNullOrEmpty() && ratingStr != "N/A") {
-                    imdbScore = Score.from10(ratingStr.toDouble())
-                }
+            ApiServices.getOmdbData(imdbId)?.let { ratingStr ->
+                imdbScore = Score.from10(ratingStr.toDouble())
             }
         }
 
@@ -209,9 +171,7 @@ class VidsrcsuProvider : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------------------------
-    // CÁC HÀM GIẢI MÃ LINK STREAM (Từ VidSrc PR #1205)
-    // ---------------------------------------------------------------------------------
+    // --- CÁC HÀM GIẢI MÃ CỦA VIDSRC.SU ---
     private fun decodeUrl(encType: String, url: String): String? {
         return when (encType) {
             "NdonQLf1Tzyx7bMG" -> bMGyx71TzQLfdonN(url)
@@ -312,20 +272,11 @@ class VidsrcsuProvider : MainAPI() {
         return e
     }
 
-
-    // ---------------------------------------------------------------------------------
-    // TRÍCH XUẤT LINK STREAM TỪ VIDSRC.SU
-    // ---------------------------------------------------------------------------------
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         val parts = data.split(":")
         if (parts.size < 3) return false
-        val type = parts[1] // "movie" hoặc "tv"
+        val type = parts[1]
         val tmdbId = parts[2]
 
         ApiServices.sendTraktScrobble("start", type, tmdbId.toIntOrNull() ?: 0, 0f,
@@ -333,7 +284,6 @@ class VidsrcsuProvider : MainAPI() {
             if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
         )
 
-        // Xây dựng URL nhúng của VidSrc.su
         val embedUrl = if (type == "movie") {
             "https://vidsrc.su/embed/movie/$tmdbId"
         } else {
@@ -349,12 +299,9 @@ class VidsrcsuProvider : MainAPI() {
 
         try {
             ClipboardLogger.logAndCopy("API Request", "Embed URL: $embedUrl")
-
-            // Bước 1: Lấy trang nhúng
             val embedResponse = app.get(embedUrl, headers = headers).text
             ClipboardLogger.logAndCopy("Embed Response", embedResponse)
 
-            // Bước 2: Tìm iframe (thường trỏ đến cloudnestra.com)
             val iframeRegex = Regex("""<iframe[^>]*src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
             val iframeUrl = iframeRegex.find(embedResponse)?.groupValues?.get(1)
 
@@ -364,11 +311,9 @@ class VidsrcsuProvider : MainAPI() {
             }
             ClipboardLogger.logAndCopy("Iframe Found", iframeUrl)
 
-            // Bước 3: Lấy trang iframe
             val iframeResponse = app.get(iframeUrl, headers = headers).text
             ClipboardLogger.logAndCopy("Iframe Response", iframeResponse)
 
-            // Bước 4: Tìm link RCP trong iframe
             val rcpRegex = Regex("""(https?://[^"']*\/rcp\/[^"']*)""", RegexOption.IGNORE_CASE)
             val rcpUrl = rcpRegex.find(iframeResponse)?.groupValues?.get(1)
 
@@ -378,24 +323,19 @@ class VidsrcsuProvider : MainAPI() {
             }
             ClipboardLogger.logAndCopy("RCP URL Found", rcpUrl)
 
-            // Bước 5: Lấy trang RCP và giải mã link prorcp
             val rcpResponse = app.get(rcpUrl, headers = headers)
             val rcpText = rcpResponse.text
             ClipboardLogger.logAndCopy("RCP Response", rcpText)
 
             var finalUrl: String? = null
-
-            // Trích xuất mã hóa và nội dung từ thẻ div (dựa trên PR #1205)
             val encodedElement = rcpResponse.document.select("div#reporting_content+div")
             if (encodedElement != null) {
                 val encType = encodedElement.attr("id")
                 val encodedUrl = encodedElement.text()
                 ClipboardLogger.logAndCopy("Decode Info", "Type: $encType, URL: $encodedUrl")
-                
                 finalUrl = decodeUrl(encType, encodedUrl)
             }
 
-            // Nếu không giải mã được từ div, thử tìm link m3u8 trực tiếp trong response
             if (finalUrl == null) {
                 val m3u8Regex = Regex("""(https?://[^"']*\.m3u8[^"']*)""", RegexOption.IGNORE_CASE)
                 finalUrl = m3u8Regex.find(rcpText)?.groupValues?.get(1)
@@ -415,7 +355,6 @@ class VidsrcsuProvider : MainAPI() {
                 if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
             )
 
-            // Xử lý phụ đề (nếu có)
             val subtitleRegex = Regex("""(https?://[^"']*\.(?:vtt|srt))""", RegexOption.IGNORE_CASE)
             subtitleRegex.findAll(rcpText).forEach { match ->
                 val subUrl = match.groupValues[1]
@@ -426,17 +365,11 @@ class VidsrcsuProvider : MainAPI() {
 
             callback.invoke(
                 ExtractorLink(
-                    source = this.name,
-                    name = "Vidsrcsu",
-                    url = finalUrl,
-                    referer = "https://vidsrc.su/",
-                    quality = Qualities.P1080.value,
-                    type = ExtractorLinkType.M3U8,
-                    headers = headers
+                    source = this.name, name = "Vidsrcsu", url = finalUrl, referer = "https://vidsrc.su/",
+                    quality = Qualities.P1080.value, type = ExtractorLinkType.M3U8, headers = headers
                 )
             )
             return true
-
         } catch (e: Exception) {
             ClipboardLogger.logAndCopy("Exception", "Error: ${e.message}\nStackTrace: ${e.stackTraceToString()}")
             return false
