@@ -6,21 +6,22 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import com.lagradost.cloudstream3.APIHolder
+import com.lagradost.cloudstream3.CloudStreamApp // SỬA LỖI: Dùng CloudStreamApp
 
 object ClipboardLogger {
-    private const val TAG = "VidsrcmePlugin"
+    private const val TAG = "PluginLogger"
 
     fun logAndCopy(title: String, message: String) {
         val logMessage = "=== [$title] ===\n$message\n==================="
         Log.d(TAG, logMessage)
 
         try {
-            val context = APIHolder.context ?: return
+            // SỬA LỖI: Lấy context từ CloudStreamApp
+            val context = CloudStreamApp.context ?: return
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
 
             Handler(Looper.getMainLooper()).post {
-                val clip = ClipData.newPlainText("Vidsrcme Log", logMessage)
+                val clip = ClipData.newPlainText("Plugin Log", logMessage)
                 clipboard.setPrimaryClip(clip)
             }
         } catch (e: Exception) {
