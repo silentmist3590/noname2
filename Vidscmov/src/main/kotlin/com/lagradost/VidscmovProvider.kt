@@ -120,9 +120,10 @@ class VidscmovProvider : MainAPI() {
         val parts = url.split(":")
         if (parts.size < 3) return null
         val mediaType = parts[1]
-        val tmdbId = parts[2]
+        val tmdbIdStr = parts[2]
+        val tmdbIdInt = tmdbIdStr.toIntOrNull() ?: return null
 
-        val response = app.get("$mainUrl/$mediaType/$tmdbId?api_key=$TMDB_API_KEY").text
+        val response = app.get("$mainUrl/$mediaType/$tmdbIdInt?api_key=$TMDB_API_KEY").text
         val json = JSONObject(response)
         val title = json.optString("title", json.optString("name"))
         val description = json.optString("overview")
@@ -142,12 +143,12 @@ class VidscmovProvider : MainAPI() {
             val seasonsCount = json.optInt("number_of_seasons", 1)
             for (s in 1..seasonsCount) {
                 try {
-                    val seasonRes = app.get("$mainUrl/tv/$tmdbId/season/$s?api_key=$TMDB_API_KEY").text
+                    val seasonRes = app.get("$mainUrl/tv/$tmdbIdInt/season/$s?api_key=$TMDB_API_KEY").text
                     val seasonJson = JSONObject(seasonRes)
                     val eps = seasonJson.getJSONArray("episodes")
                     for (e in 0 until eps.length()) {
                         val ep = eps.getJSONObject(e)
-                        episodes.add(newEpisode("vidscmov:tv:$tmdbId:${ep.getInt("season_number")}:${ep.getInt("episode_number")}") {
+                        episodes.add(newEpisode("vidscmov:tv:$tmdbIdInt:${ep.getInt("season_number")}:${ep.getInt("episode_number")}") {
                             this.name = ep.optString("name")
                             this.episode = ep.getInt("episode_number")
                             this.season = ep.getInt("season_number")
@@ -159,11 +160,11 @@ class VidscmovProvider : MainAPI() {
                     ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
                 }
             }
-            return newTvSeriesLoadResponse(title, "vidscmov:tv:$tmdbId", TvType.TvSeries, episodes) {
+            return newTvSeriesLoadResponse(title, "vidscmov:tv:$tmdbIdInt", TvType.TvSeries, episodes) {
                 this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
             }
         } else {
-            return newMovieLoadResponse(title, url, TvType.Movie, "vidscmov:movie:$tmdbId") {
+            return newMovieLoadResponse(title, url, TvType.Movie, "vidscmov:movie:$tmdbIdInt") {
                 this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
             }
         }
@@ -278,16 +279,22 @@ class VidscmovProvider : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         val parts = data.split(":")
-        if (parts.size < 3) return false
+        if (parts.size < 3) {
+            ClipboardLogger.logAndCopy("Error", "Invalid data format: $data")
+            return false
+        }
+        
         val type = parts[1]
-        val tmdbId = parts[2]
-
-        if (!tmdbId.all { it.isDigit() }) {
-            ClipboardLogger.logAndCopy("Error", "TMDB ID không hợp lệ: $tmdbId")
+        val tmdbIdStr = parts[2]
+        
+        // Sửa lỗi kiểm tra ID: chỉ cần chuyển sang số là được
+        val tmdbId = tmdbIdStr.toIntOrNull()
+        if (tmdbId == null) {
+            ClipboardLogger.logAndCopy("Error", "TMDB ID không hợp lệ: $tmdbIdStr")
             return false
         }
 
-        ApiServices.sendTraktScrobble("start", type, tmdbId.toIntOrNull() ?: 0, 0f,
+        ApiServices.sendTraktScrobble("start", type, tmdbId, 0f,
             if (type == "tv" && parts.size >= 5) parts[3].toIntOrNull() else null,
             if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
         )
@@ -353,7 +360,7 @@ class VidscmovProvider : MainAPI() {
             
             ClipboardLogger.logAndCopy("Success", "Final Stream URL: $finalUrl")
 
-            ApiServices.sendTraktScrobble("stop", type, tmdbId.toIntOrNull() ?: 0, 100f,
+            ApiServices.sendTraktScrobble("stop", type, tmdbId, 100f,
                 if (type == "tv" && parts.size >= 5) parts[3].toIntOrNull() else null,
                 if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
             )
