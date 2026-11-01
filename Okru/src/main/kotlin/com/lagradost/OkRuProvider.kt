@@ -1,4 +1,3 @@
-
 package com.lagradost
 
 import com.lagradost.cloudstream3.*
@@ -141,11 +140,12 @@ class OkRuProvider : MainAPI() {
     }
 
     // =========================================================================
-    // 4. TRÍCH XUẤT LUỒNG PHÁT VIDEO (LOAD LINKS) - TỰ ĐỘNG GIẢI MÃ METADATA
+    // 4. TRÍCH XUẤT LUỒNG PHÁT VIDEO (LOAD LINKS) - ĐÃ CẬP NHẬT SIGNATURE
     // =========================================================================
     override suspend fun loadLinks(
         data: String,
-        isCae: Boolean,
+        isDataJob: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val response = runCatching {
@@ -211,4 +211,3 @@ class OkRuProvider : MainAPI() {
         }.getOrDefault(false)
     }
 }
-
