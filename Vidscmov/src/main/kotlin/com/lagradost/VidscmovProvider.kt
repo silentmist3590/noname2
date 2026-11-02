@@ -357,29 +357,28 @@ class VidscmovProvider : MainAPI() {
         val iframeRegex = Regex("""<iframe[^>]*src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
 
         try {
-            // Bước 1: vidsrc.mov -> iframe (vidsrc.sh)
-            val r1 = app.get(embedUrl, headers = mapOf("User-Agent" to ua, "Referer" to "https://vidsrc.mov/"))
-            ClipboardLogger.logAndCopy("Step1 vidsrc.mov", "HTTP ${r1.code}, ${r1.text.length} bytes\n" + r1.text.take(600))
-            val if1 = iframeRegex.find(r1.text)?.groupValues?.get(1)?.let { absUrl(embedUrl, cleanJsUrl(it)) }
-            ClipboardLogger.logAndCopy("Step1 iframe", "$if1")
+            // Bước 1: vidsrc.mov -> iframe vidsrc.sh (chỉ để log/kiểm tra)
+            val shEmbed = if (type == "movie") "https://vidsrc.sh/embed/movie/$tmdbId/" else "https://vidsrc.sh/embed/tv/$tmdbId/$season/$episode/"
+            ClipboardLogger.logAndCopy("Step1", "Embed vidsrc.sh: $shEmbed")
 
-            // Bước 2: vidsrc.sh -> iframe (stellarconductornexus.com/embed/...?vs=...)
+            // Bước 2: API vidsrc.sh/vs_src.php trả JSON {"src":"https://stellarconductornexus.com/embed/...?vs=TOKEN"} (token hết hạn rất nhanh)
+            val srcApi = if (type == "movie") "https://vidsrc.sh/vs_src.php?type=movie&id=$tmdbId"
+            else "https://vidsrc.sh/vs_src.php?type=tv&id=$tmdbId&season=$season&episode=$episode"
+            val r2 = app.get(srcApi, headers = mapOf("User-Agent" to ua, "Accept" to "application/json", "Referer" to shEmbed, "Origin" to "https://vidsrc.sh"))
+            ClipboardLogger.logAndCopy("Step2 vs_src.php", "HTTP ${r2.code}\n${r2.text.take(500)}")
+            val if2 = Regex("\"src\"\\s*:\\s*\"([^\"]+)\"").find(r2.text)?.groupValues?.get(1)?.let { cleanJsUrl(it) }
+            ClipboardLogger.logAndCopy("Step2 src", "$if2")
+
+            // Bước 3: trang landing của stellarconductornexus có CFG.playerUrl
             var playerPage: String? = null
-            var if2: String? = null
-            if (if1 != null) {
-                val r2 = app.get(if1, headers = mapOf("User-Agent" to ua, "Referer" to "https://vidsrc.mov/"))
-                ClipboardLogger.logAndCopy("Step2 vidsrc.sh", "HTTP ${r2.code}, ${r2.text.length} bytes\n" + r2.text.take(600))
-                if2 = iframeRegex.find(r2.text)?.groupValues?.get(1)?.let { absUrl(if1, cleanJsUrl(it)) }
-                ClipboardLogger.logAndCopy("Step2 iframe", "$if2")
-                // Bước 3: trang landing có CFG.playerUrl
-                if (if2 != null) {
-                    val r3 = app.get(if2, headers = mapOf("User-Agent" to ua, "Referer" to if1))
-                    ClipboardLogger.logAndCopy("Step3 landing", "HTTP ${r3.code}, ${r3.text.length} bytes")
-                    val pu = Regex("\"playerUrl\"\\s*:\\s*\"([^\"]+)\"").find(r3.text)?.groupValues?.get(1)
-                    ClipboardLogger.logAndCopy("Step3 playerUrl", "$pu")
-                    if (pu != null) playerPage = absUrl(if2, cleanJsUrl(pu))
-                }
+            if (if2 != null) {
+                val r3 = app.get(if2, headers = mapOf("User-Agent" to ua, "Referer" to "https://vidsrc.sh/"))
+                ClipboardLogger.logAndCopy("Step3 landing", "HTTP ${r3.code}, ${r3.text.length} bytes\n" + r3.text.take(300))
+                val pu = Regex("\"playerUrl\"\\s*:\\s*\"([^\"]+)\"").find(r3.text)?.groupValues?.get(1)
+                ClipboardLogger.logAndCopy("Step3 playerUrl", "$pu")
+                if (pu != null) playerPage = absUrl(if2, cleanJsUrl(pu))
             }
+            val if1: String? = shEmbed
 
             // Bước 4: mở trang player trong WebView và bắt link m3u8 (WASM giải mã chạy trong WebView)
             val target = playerPage ?: if2 ?: if1 ?: embedUrl
