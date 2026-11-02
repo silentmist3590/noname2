@@ -11,7 +11,7 @@ import java.util.Base64 // BỔ SUNG IMPORT NÀY ĐỂ SỬA LỖI
 // 1. CẤU HÌNH API KEY VÀ PROXY
 // =====================================================================================
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
-private const val TMDB_API_KEY = "b9e1ff7ff423790bf7df202e661377ca" // Nhớ thay key hợp lệ
+private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547" // Nhớ thay key hợp lệ
 private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
 private const val TRAKT_ACCESS_TOKEN = "" 
