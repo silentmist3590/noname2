@@ -8,7 +8,7 @@ import org.json.JSONObject
 import java.net.URLEncoder
 
 // =====================================================================================
-// 1. CẤU HÌNH TMDB VÀ PROXY ẢNH
+// 1. CẤU HÌNH TMDB
 // =====================================================================================
 private const val TMDB_BASE_URL = "https://api.themoviedb.org/3"
 private const val OMDB_API_KEY = "a116862a"
@@ -16,6 +16,7 @@ private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0
 private const val TRAKT_ACCESS_TOKEN = ""
 
 object TmdbConfig {
+    // Danh sách API Key dự phòng
     val apiKeys = listOf(
         "e716f19ab4d25edc5247239a8f3494f8",
         "8476a7ab80ad76f0936744df0430e67c",
@@ -23,6 +24,7 @@ object TmdbConfig {
         "b9e1ff7ff423790bf7df202e661377ca"
     )
 
+    // Danh sách Domain trực tiếp
     val directDomains = listOf(
         "https://api.tmdb.org/3",
         "https://api.themoviedb.org/3",
@@ -30,6 +32,7 @@ object TmdbConfig {
         "https://daili.smdhb.com/3"
     )
 
+    // Danh sách Proxy CORS
     val corsProxies: List<(String) -> String> = listOf(
         { url -> "https://api.codetabs.com/v1/proxy/?quest=${URLEncoder.encode(url, "UTF-8")}" },
         { url -> "https://api.allorigins.win/raw?url=${URLEncoder.encode(url, "UTF-8")}" },
@@ -40,46 +43,44 @@ object TmdbConfig {
     private const val IMG_PROXY = "https://wsrv.nl/?url="
 
     /**
-     * Lấy dữ liệu TMDB với endpoint CHUẨN (ví dụ: "/trending/all/day" hoặc "/movie/123").
-     * Hàm này sẽ tự động thêm "?api_key=" nếu endpoint chưa có query string.
+     * Lấy dữ liệu TMDB với URL ĐẦY ĐỦ.
+     * Ví dụ: getTmdbData("/trending/all/day?page=1")
      */
-    suspend fun fetchTmdb(endpoint: String, queryParams: String = ""): JSONObject? {
-        // Đảm bảo endpoint bắt đầu bằng "/"
-        val cleanEndpoint = if (endpoint.startsWith("/")) endpoint else "/$endpoint"
+    suspend fun getTmdbData(pathWithQuery: String): JSONObject? {
+        // Đảm bảo path bắt đầu bằng "/"
+        val path = if (pathWithQuery.startsWith("/")) pathWithQuery else "/$pathWithQuery"
         
-        // Xây dựng query string đầy đủ
-        val fullQuery = if (queryParams.isNotEmpty()) {
-            if (cleanEndpoint.contains("?")) "&$queryParams" else "?$queryParams"
-        } else {
-            if (cleanEndpoint.contains("?")) "&" else "?"
-        }
-
         for (key in apiKeys) {
-            // Thử domain trực tiếp
+            // 1. Thử domain trực tiếp
             for (domain in directDomains) {
                 try {
-                    val url = "$domain$cleanEndpoint${fullQuery}api_key=$key"
-                    val res = app.get(url).text
+                    // Tự động thêm api_key vào URL
+                    val separator = if (path.contains("?")) "&" else "?"
+                    val fullUrl = "$domain$path${separator}api_key=$key"
+                    val res = app.get(fullUrl).text
+                    
                     if (res.startsWith("{") && !res.contains("Invalid API key")) {
                         val json = JSONObject(res)
                         if (json.has("results") || json.has("id") || json.has("success")) {
                             return json
                         }
                     }
-                } catch (e: Exception) { }
+                } catch (e: Exception) { /* Bỏ qua lỗi */ }
             }
-            // Thử qua proxy
+            // 2. Thử qua Proxy
             for (proxy in corsProxies) {
                 try {
-                    val baseUrl = "https://api.themoviedb.org/3$cleanEndpoint${fullQuery}api_key=$key"
+                    val separator = if (path.contains("?")) "&" else "?"
+                    val baseUrl = "https://api.themoviedb.org/3$path${separator}api_key=$key"
                     val res = app.get(proxy(baseUrl)).text
+                    
                     if (res.startsWith("{") && !res.contains("Invalid API key")) {
                         val json = JSONObject(res)
                         if (json.has("results") || json.has("id") || json.has("success")) {
                             return json
                         }
                     }
-                } catch (e: Exception) { }
+                } catch (e: Exception) { /* Bỏ qua lỗi */ }
             }
         }
         return null
@@ -148,14 +149,13 @@ class VidsrcsuProvider : MainAPI() {
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     override val mainPage = mainPageOf(
-        "trending/all/day" to "Trending Today",
-        "movie/popular" to "Popular Movies",
-        "tv/popular" to "Popular TV Shows"
+        "/trending/all/day" to "Trending Today",
+        "/movie/popular" to "Popular Movies",
+        "/tv/popular" to "Popular TV Shows"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Endpoint đã được cấu hình sẵn trong mainPage, chỉ cần thêm page
-        val json = TmdbConfig.fetchTmdb("/${request.data}", "page=$page")
+        val json = TmdbConfig.getTmdbData("${request.data}?page=$page")
         if (json == null || !json.has("results")) {
             ClipboardLogger.logAndCopy("MainPage Error", "Không lấy được results cho ${request.data}")
             return newHomePageResponse(request.name, emptyList())
@@ -179,7 +179,7 @@ class VidsrcsuProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
-        val json = TmdbConfig.fetchTmdb("/search/multi", "query=$encodedQuery") ?: return emptyList()
+        val json = TmdbConfig.getTmdbData("/search/multi?query=$encodedQuery") ?: return emptyList()
         
         if (!json.has("results")) return emptyList()
         
@@ -209,7 +209,7 @@ class VidsrcsuProvider : MainAPI() {
         val mediaType = idMatch.groupValues[1]
         val tmdbIdInt = idMatch.groupValues[2].toIntOrNull() ?: return null
 
-        val json = TmdbConfig.fetchTmdb("/$mediaType/$tmdbIdInt") ?: run {
+        val json = TmdbConfig.getTmdbData("/$mediaType/$tmdbIdInt") ?: run {
             ClipboardLogger.logAndCopy("Load Error", "Không lấy được dữ liệu TMDB cho $mediaType:$tmdbIdInt")
             return null
         }
@@ -232,7 +232,7 @@ class VidsrcsuProvider : MainAPI() {
             val seasonsCount = json.optInt("number_of_seasons", 1)
             for (s in 1..seasonsCount) {
                 try {
-                    val seasonJson = TmdbConfig.fetchTmdb("/tv/$tmdbIdInt/season/$s") ?: continue
+                    val seasonJson = TmdbConfig.getTmdbData("/tv/$tmdbIdInt/season/$s") ?: continue
                     val eps = seasonJson.getJSONArray("episodes")
                     for (e in 0 until eps.length()) {
                         val ep = eps.getJSONObject(e)
