@@ -6,23 +6,36 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import com.lagradost.cloudstream3.CloudStreamApp // SỬA LỖI: Dùng CloudStreamApp
+import com.lagradost.cloudstream3.CloudStreamApp
 
 object ClipboardLogger {
     private const val TAG = "PluginLogger"
+    private const val MAX_CHARS = 60_000
+    private val buffer = StringBuilder()
 
+    /** Xoá log cũ (gọi ở đầu mỗi phiên làm việc, vd. loadLinks). */
+    @Synchronized
+    fun reset() {
+        buffer.setLength(0)
+    }
+
+    /** Ghi nối tiếp vào bộ đệm rồi copy TOÀN BỘ log vào clipboard (trước đây mỗi lần ghi đè lần trước nên log bị ngắn). */
+    @Synchronized
     fun logAndCopy(title: String, message: String) {
-        val logMessage = "=== [$title] ===\n$message\n==================="
-        Log.d(TAG, logMessage)
-
+        val entry = "=== [$title] ===\n$message\n"
+        Log.d(TAG, entry)
+        buffer.append(entry).append('\n')
+        if (buffer.length > MAX_CHARS) buffer.delete(0, buffer.length - MAX_CHARS)
+        val text = buffer.toString()
         try {
-            // SỬA LỖI: Lấy context từ CloudStreamApp
             val context = CloudStreamApp.context ?: return
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-
             Handler(Looper.getMainLooper()).post {
-                val clip = ClipData.newPlainText("Plugin Log", logMessage)
-                clipboard.setPrimaryClip(clip)
+                try {
+                    clipboard.setPrimaryClip(ClipData.newPlainText("Plugin Log", text))
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to copy to clipboard", e)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to copy to clipboard", e)

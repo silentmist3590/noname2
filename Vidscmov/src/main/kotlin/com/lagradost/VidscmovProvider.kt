@@ -1,7 +1,9 @@
 package com.lagradost
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import org.json.JSONObject
@@ -110,6 +112,7 @@ class VidscmovProvider : MainAPI() {
                     this.posterUrl = poster(item.optString("poster_path"))
                 })
             }
+            ClipboardLogger.logAndCopy("MainPage ${request.name}", "items=${home.size}, poster0=${home.firstOrNull()?.posterUrl}")
             newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
@@ -313,8 +316,20 @@ class VidscmovProvider : MainAPI() {
 
     // =====================================================================================
     // HÀM CHÍNH: LOAD LINKS
+    // vidsrc.mov hiện chạy theo chuỗi: vidsrc.mov -> vidsrc.sh -> stellarconductornexus.com (embed) -> player.
+    // Dữ liệu stream được giải mã bằng WebAssembly trong trình duyệt nên plugin dùng WebView để bắt link .m3u8.
     // =====================================================================================
+    private fun cleanJsUrl(s: String) = s.replace("\\u0026", "&").replace("\\/", "/").replace("&amp;", "&")
+
+    private fun absUrl(base: String, u: String): String {
+        if (u.startsWith("http")) return u
+        if (u.startsWith("//")) return "https:$u"
+        val host = Regex("""^(https?://[^/]+)""").find(base)?.groupValues?.get(1) ?: return u
+        return if (u.startsWith("/")) host + u else "$host/$u"
+    }
+
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         val ref = parseRef(data)
         if (ref == null) {
@@ -339,73 +354,66 @@ class VidscmovProvider : MainAPI() {
         }
 
         val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-        val headers = mapOf("User-Agent" to ua, "Referer" to "https://vidsrc.mov/", "Origin" to "https://vidsrc.mov")
+        val iframeRegex = Regex("""<iframe[^>]*src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
 
         try {
-            ClipboardLogger.logAndCopy("API Request", "Embed URL: $embedUrl")
-            val embedResponse = app.get(embedUrl, headers = headers).text
-            ClipboardLogger.logAndCopy("Embed Response", embedResponse.take(1500))
+            // Bước 1: vidsrc.mov -> iframe (vidsrc.sh)
+            val r1 = app.get(embedUrl, headers = mapOf("User-Agent" to ua, "Referer" to "https://vidsrc.mov/"))
+            ClipboardLogger.logAndCopy("Step1 vidsrc.mov", "HTTP ${r1.code}, ${r1.text.length} bytes\n" + r1.text.take(600))
+            val if1 = iframeRegex.find(r1.text)?.groupValues?.get(1)?.let { absUrl(embedUrl, cleanJsUrl(it)) }
+            ClipboardLogger.logAndCopy("Step1 iframe", "$if1")
 
-            val iframeRegex = Regex("""<iframe[^>]*src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-            var iframeUrl = iframeRegex.find(embedResponse)?.groupValues?.get(1)
-            if (iframeUrl == null) {
-                ClipboardLogger.logAndCopy("Error", "Không tìm thấy iframe trong vidsrc.mov.")
-                return false
-            }
-            if (iframeUrl.startsWith("//")) iframeUrl = "https:$iframeUrl"
-            ClipboardLogger.logAndCopy("Iframe Found", iframeUrl)
-
-            val rcpResponse = app.get(iframeUrl, headers = headers)
-            val iframeResponse = rcpResponse.text
-            ClipboardLogger.logAndCopy("Iframe Response", iframeResponse.take(1500))
-
-            var finalUrl: String? = null
-            val encodedElement = rcpResponse.document.select("div#reporting_content+div")
-            if (encodedElement.isNotEmpty()) {
-                val encType = encodedElement.attr("id")
-                val encodedUrl = encodedElement.text()
-                ClipboardLogger.logAndCopy("Decode Info", "Type: $encType, URL: ${encodedUrl.take(80)}")
-                finalUrl = try { decodeUrl(encType, encodedUrl) } catch (e: Exception) { null }
+            // Bước 2: vidsrc.sh -> iframe (stellarconductornexus.com/embed/...?vs=...)
+            var playerPage: String? = null
+            var if2: String? = null
+            if (if1 != null) {
+                val r2 = app.get(if1, headers = mapOf("User-Agent" to ua, "Referer" to "https://vidsrc.mov/"))
+                ClipboardLogger.logAndCopy("Step2 vidsrc.sh", "HTTP ${r2.code}, ${r2.text.length} bytes\n" + r2.text.take(600))
+                if2 = iframeRegex.find(r2.text)?.groupValues?.get(1)?.let { absUrl(if1, cleanJsUrl(it)) }
+                ClipboardLogger.logAndCopy("Step2 iframe", "$if2")
+                // Bước 3: trang landing có CFG.playerUrl
+                if (if2 != null) {
+                    val r3 = app.get(if2, headers = mapOf("User-Agent" to ua, "Referer" to if1))
+                    ClipboardLogger.logAndCopy("Step3 landing", "HTTP ${r3.code}, ${r3.text.length} bytes")
+                    val pu = Regex("\"playerUrl\"\\s*:\\s*\"([^\"]+)\"").find(r3.text)?.groupValues?.get(1)
+                    ClipboardLogger.logAndCopy("Step3 playerUrl", "$pu")
+                    if (pu != null) playerPage = absUrl(if2, cleanJsUrl(pu))
+                }
             }
 
-            if (finalUrl.isNullOrEmpty()) {
-                val m3u8Regex = Regex("""(https?://[^"']*\.m3u8[^"']*)""", RegexOption.IGNORE_CASE)
-                finalUrl = m3u8Regex.find(iframeResponse)?.groupValues?.get(1)
-                    ?: m3u8Regex.find(embedResponse)?.groupValues?.get(1)
-            }
-
-            if (finalUrl.isNullOrEmpty()) {
-                ClipboardLogger.logAndCopy("Error", "Không thể giải mã hoặc tìm thấy link stream cuối cùng.")
-                return false
-            }
-
-            ClipboardLogger.logAndCopy("Success", "Final Stream URL: $finalUrl")
-            ApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
-
-            val subtitleRegex = Regex("""(https?://[^"']*\.(?:vtt|srt))""", RegexOption.IGNORE_CASE)
-            subtitleRegex.findAll(iframeResponse).forEach { match ->
-                val subUrl = match.groupValues[1]
-                if (subUrl.isNotEmpty()) subtitleCallback.invoke(SubtitleFile("Unknown", subUrl))
-            }
-
-            callback.invoke(
-                ExtractorLink(
-                    source = this.name,
-                    name = "Vidscmov",
-                    url = finalUrl,
-                    referer = "https://stellarconductornexus.com/",
-                    quality = Qualities.P1080.value,
-                    type = ExtractorLinkType.M3U8,
-                    headers = mapOf(
-                        "Origin" to "https://stellarconductornexus.com",
-                        "Referer" to "https://stellarconductornexus.com/"
-                    )
+            // Bước 4: mở trang player trong WebView và bắt link m3u8 (WASM giải mã chạy trong WebView)
+            val target = playerPage ?: if2 ?: if1 ?: embedUrl
+            val refererForWv = if2 ?: if1 ?: "https://vidsrc.mov/"
+            ClipboardLogger.logAndCopy("Step4 WebView", "Mở: $target\nReferer: $refererForWv")
+            val captured = app.get(
+                target,
+                referer = refererForWv,
+                interceptor = WebViewResolver(
+                    interceptUrl = Regex("""\.m3u8"""),
+                    timeout = 30_000L
                 )
+            )
+            val finalUrl = captured.url
+            ClipboardLogger.logAndCopy("Step4 kết quả", "url=$finalUrl\nHTTP ${captured.code}")
+
+            if (!finalUrl.contains(".m3u8")) {
+                ClipboardLogger.logAndCopy("Error", "WebView không bắt được .m3u8 (có thể bị Turnstile/captcha chặn hoặc cần bấm Play).\nTrang cuối: ${captured.text.take(600)}")
+                return false
+            }
+
+            ApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
+            val origin = Regex("""^(https?://[^/]+)""").find(refererForWv)?.groupValues?.get(1) ?: "https://vidsrc.mov"
+            callback.invoke(
+                newExtractorLink(this.name, "Vidscmov", finalUrl, ExtractorLinkType.M3U8) {
+                    this.referer = "$origin/"
+                    this.quality = Qualities.P1080.value
+                    this.headers = mapOf("Origin" to origin, "Referer" to "$origin/", "User-Agent" to ua)
+                }
             )
             return true
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
-            ClipboardLogger.logAndCopy("Exception", "Error: ${e.message}\nStackTrace: ${e.stackTraceToString()}")
+            ClipboardLogger.logAndCopy("Exception", "Error: ${e.message}\nStackTrace: ${e.stackTraceToString().take(1500)}")
             return false
         }
     }
