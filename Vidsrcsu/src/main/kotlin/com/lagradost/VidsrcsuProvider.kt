@@ -43,33 +43,42 @@ object TmdbConfig {
     // Proxy ảnh để vượt chặn DNS tại VN
     private const val IMG_PROXY = "https://wsrv.nl/?url="
 
-    // Hàm lấy dữ liệu TMDB thông minh
+    // Hàm lấy dữ liệu TMDB thông minh, có kiểm tra lỗi
     suspend fun fetchTmdb(endpoint: String): JSONObject? {
         for (key in apiKeys) {
+            // 1. Thử domain trực tiếp
             for (domain in directDomains) {
                 try {
                     val fullUrl = "$domain$endpoint&api_key=$key"
                     val res = app.get(fullUrl).text
-                    if (!res.contains("Invalid API key") && res.startsWith("{")) {
-                        return JSONObject(res)
+                    // Kiểm tra phản hồi có hợp lệ không
+                    if (res.startsWith("{") && !res.contains("Invalid API key")) {
+                        val json = JSONObject(res)
+                        if (json.has("results") || json.has("id")) {
+                            return json
+                        }
                     }
-                } catch (e: Exception) { }
+                } catch (e: Exception) { /* Bỏ qua lỗi */ }
             }
+            // 2. Thử qua Proxy CORS
             for (proxy in corsProxies) {
                 try {
                     val baseUrl = "https://api.themoviedb.org/3$endpoint&api_key=$key"
                     val proxiedUrl = proxy(baseUrl)
                     val res = app.get(proxiedUrl).text
-                    if (!res.contains("Invalid API key") && res.startsWith("{")) {
-                        return JSONObject(res)
+                    if (res.startsWith("{") && !res.contains("Invalid API key")) {
+                        val json = JSONObject(res)
+                        if (json.has("results") || json.has("id")) {
+                            return json
+                        }
                     }
-                } catch (e: Exception) { }
+                } catch (e: Exception) { /* Bỏ qua lỗi */ }
             }
         }
         return null
     }
 
-    // Hàm tạo URL ảnh an toàn (vượt chặn)
+    // Hàm tạo URL ảnh an toàn (vượt chặn DNS)
     fun safeImageUrl(path: String?): String? {
         if (path.isNullOrEmpty()) return null
         val originalUrl = "https://image.tmdb.org/t/p/w500$path"
@@ -126,7 +135,7 @@ object ApiServices {
 // 3. LỚP PROVIDER CHÍNH
 // =====================================================================================
 class VidsrcsuProvider : MainAPI() {
-    override var mainUrl = "https://vidsrc.su" // Sửa lỗi: Trang chủ của Vidsrc.su
+    override var mainUrl = "https://vidsrc.su"
     override var name = "Vidsrcsu"
     override var lang = "en"
     override val hasMainPage = true
@@ -140,7 +149,14 @@ class VidsrcsuProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val endpoint = request.data.substringAfter("api_key=").substringBefore("&")
-        val json = TmdbConfig.fetchTmdb("/$endpoint?page=$page") ?: return newHomePageResponse(request.name, emptyList())
+        
+        // SỬA LỖI: Kiểm tra kỹ phản hồi trước khi đọc "results"
+        val json = TmdbConfig.fetchTmdb("/$endpoint?page=$page") 
+        if (json == null || !json.has("results")) {
+            ClipboardLogger.logAndCopy("MainPage Error", "Không lấy được results cho $endpoint")
+            return newHomePageResponse(request.name, emptyList())
+        }
+        
         val results = json.getJSONArray("results")
         val home = mutableListOf<SearchResponse>()
 
@@ -161,6 +177,9 @@ class VidsrcsuProvider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         val encodedQuery = URLEncoder.encode(query, "UTF-8")
         val json = TmdbConfig.fetchTmdb("/search/multi?query=$encodedQuery") ?: return emptyList()
+        
+        if (!json.has("results")) return emptyList()
+        
         val results = json.getJSONArray("results")
         val searchResults = mutableListOf<SearchResponse>()
 
@@ -180,7 +199,6 @@ class VidsrcsuProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        // Sửa lỗi: Dùng Regex để đọc ID an toàn
         val idMatch = Regex("""vidsrcsu:(movie|tv):(\d+)""").find(url)
         if (idMatch == null) {
             ClipboardLogger.logAndCopy("Load Error", "URL không hợp lệ: $url")
@@ -241,7 +259,6 @@ class VidsrcsuProvider : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         
-        // Sửa lỗi: Dùng Regex an toàn
         val idMatch = Regex("""vidsrcsu:(movie|tv):(\d+)(?::(\d+):(\d+))?""").find(data)
         if (idMatch == null) {
             ClipboardLogger.logAndCopy("Error", "Invalid data format: $data")
@@ -254,8 +271,6 @@ class VidsrcsuProvider : MainAPI() {
 
         ApiServices.sendTraktScrobble("start", type, tmdbId, 0f, season, episode)
 
-        // Vidsrc.su: Không còn iframe tĩnh, phải gọi API nội bộ
-        // Dựa trên phân tích cấu trúc React App, endpoint API thường là /api/ hoặc /rcp/
         val headers = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
             "Referer" to "https://vidsrc.su/",
@@ -263,7 +278,6 @@ class VidsrcsuProvider : MainAPI() {
         )
 
         try {
-            // Bước 1: Lấy nội dung của trang embed để tìm API endpoint hoặc link stream
             val embedUrl = if (type == "movie") {
                 "https://vidsrc.su/embed/movie/$tmdbId"
             } else {
@@ -275,15 +289,14 @@ class VidsrcsuProvider : MainAPI() {
             val embedResponse = app.get(embedUrl, headers = headers).text
             ClipboardLogger.logAndCopy("Embed Response", embedResponse)
 
-            // Bước 2: Tìm link m3u8 trong HTML (nếu có)
+            // Vì Vidsrc.su trả về React App, ta thử tìm link m3u8 trong HTML
+            // Hoặc gọi API nội bộ nếu có
             var finalUrl: String? = null
             val m3u8Regex = Regex("""(https?://[^"']*\.m3u8[^"']*)""", RegexOption.IGNORE_CASE)
             finalUrl = m3u8Regex.find(embedResponse)?.groupValues?.get(1)
 
-            // Bước 3: Nếu không có, thử gọi API nội bộ của Vidsrc.su
+            // Nếu không có, thử gọi API nội bộ
             if (finalUrl.isNullOrEmpty()) {
-                // Vidsrc.su thường có endpoint /rcp/ hoặc /api/
-                // Thử gọi API rcp (phổ biến)
                 val rcpUrl = if (type == "movie") {
                     "https://vidsrc.su/rcp/movie/$tmdbId"
                 } else {
@@ -307,7 +320,6 @@ class VidsrcsuProvider : MainAPI() {
 
             ApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
 
-            // Xử lý phụ đề
             val subtitleRegex = Regex("""(https?://[^"']*\.(?:vtt|srt))""", RegexOption.IGNORE_CASE)
             subtitleRegex.findAll(embedResponse).forEach { match ->
                 val subUrl = match.groupValues[1]
