@@ -1,14 +1,23 @@
 package com.lagradost
 
+import android.annotation.SuppressLint
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.net.URLEncoder
 
 // =====================================================================================
-// 1. CẤU HÌNH TMDB VÀ PROXY ẢNH (GIỮ NGUYÊN)
+// 1. CẤU HÌNH TMDB ĐA TẦNG (Giữ nguyên)
 // =====================================================================================
 private const val TMDB_BASE_URL = "https://api.themoviedb.org/3"
 private const val OMDB_API_KEY = "a116862a"
@@ -47,7 +56,7 @@ object TmdbConfig {
                         val json = JSONObject(res)
                         if (json.has("results") || json.has("id") || json.has("success")) return json
                     }
-                } catch (e: Exception) {}
+                } catch (e: Exception) { }
             }
             for (proxy in corsProxies) {
                 try {
@@ -57,7 +66,7 @@ object TmdbConfig {
                         val json = JSONObject(res)
                         if (json.has("results") || json.has("id") || json.has("success")) return json
                     }
-                } catch (e: Exception) {}
+                } catch (e: Exception) { }
             }
         }
         return null
@@ -69,7 +78,7 @@ object TmdbConfig {
 }
 
 // =====================================================================================
-// 2. API HỖ TRỢ (GIỮ NGUYÊN)
+// 2. API HỖ TRỢ (OMDb & Trakt)
 // =====================================================================================
 object ApiServices {
     suspend fun getOmdbData(imdbId: String): String? {
@@ -194,6 +203,56 @@ class VidsrcsuProvider : MainAPI() {
         }
     }
 
+    // =====================================================================================
+    // HÀM WEBVIEW ĐỂ BẮT LINK M3U8
+    // =====================================================================================
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun extractWithWebView(url: String, referer: String): String? = withContext(Dispatchers.Main) {
+        val deferredUrl = CompletableDeferred<String?>()
+        val webView = WebView(CloudStreamApp.context)
+
+        webView.settings.javaScriptEnabled = true
+        webView.settings.domStorageEnabled = true
+        webView.settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+        webView.settings.mediaPlaybackRequiresUserGesture = false
+
+        webView.webViewClient = object : WebViewClient() {
+            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                val reqUrl = request?.url.toString()
+                if (reqUrl.contains(".m3u8") || reqUrl.contains(".mp4")) {
+                    if (!deferredUrl.isCompleted) {
+                        deferredUrl.complete(reqUrl)
+                    }
+                }
+                return super.shouldInterceptRequest(view, request)
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                // Tự động click nút Play hoặc gọi video.play()
+                view?.evaluateJavascript("""
+                    setTimeout(function() {
+                        var videoEl = document.querySelector('video');
+                        if (videoEl) { videoEl.play(); }
+                        var playBtn = document.querySelector('.jw-display-icon-display, .jw-icon-playback, .vjs-big-play-button');
+                        if (playBtn) { playBtn.click(); }
+                    }, 2000);
+                """.trimIndent(), null)
+            }
+        }
+
+        webView.loadUrl(url, mapOf("Referer" to referer))
+
+        val result = withTimeoutOrNull(15000) {
+            deferredUrl.await()
+        }
+
+        webView.stopLoading()
+        webView.destroy()
+        
+        result
+    }
+
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         
@@ -207,85 +266,61 @@ class VidsrcsuProvider : MainAPI() {
 
         val headers = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-            "Referer" to "https://vidsrc.su/",
-            "Origin" to "https://vidsrc.su"
+            "Referer" to "https://vidsrc.sh/",
+            "Origin" to "https://vidsrc.sh"
         )
 
         try {
-            // BƯỚC 1: Gọi trang /movie/{id} hoặc /tv/{id}/{s}/{e} (KHÔNG DÙNG /embed/)
-            val pageUrl = if (type == "movie") {
-                "https://vidsrc.su/movie/$tmdbId"
+            // Bước 1: Lấy link src từ API vs_src.php
+            val apiUrl = if (type == "movie") {
+                "https://vidsrc.sh/vs_src.php?type=movie&id=$tmdbId"
             } else {
                 if (season == null || episode == null) return false
-                "https://vidsrc.su/tv/$tmdbId/$season/$episode"
+                "https://vidsrc.sh/vs_src.php?type=tv&id=$tmdbId&season=$season&episode=$episode"
             }
             
-            ClipboardLogger.logAndCopy("API Request", "Page URL: $pageUrl")
-            val pageResponse = app.get(pageUrl, headers = headers).text
-            ClipboardLogger.logAndCopy("Page Response", pageResponse)
+            ClipboardLogger.logAndCopy("API Request", "vs_src URL: $apiUrl")
+            val apiRes = app.get(apiUrl, headers = headers).text
+            ClipboardLogger.logAndCopy("vs_src Response", apiRes)
 
-            // BƯỚC 2: Tìm link m3u8 trong HTML
-            var finalUrl: String? = null
-            val m3u8Regex = Regex("""(https?://[^"']*\.m3u8[^"']*)""", RegexOption.IGNORE_CASE)
-            finalUrl = m3u8Regex.find(pageResponse)?.groupValues?.get(1)
-
-            // BƯỚC 3: Nếu không có, thử gọi API nội bộ (thử một số endpoint phổ biến)
-            if (finalUrl.isNullOrEmpty()) {
-                val apiEndpoints = listOf(
-                    "https://vidsrc.su/rcp/movie/$tmdbId",
-                    "https://vidsrc.su/api/movie/$tmdbId",
-                    "https://vidsrc.su/rcp/tv/$tmdbId/$season/$episode",
-                    "https://vidsrc.su/api/tv/$tmdbId/$season/$episode"
-                )
-                for (api in apiEndpoints) {
-                    try {
-                        val apiRes = app.get(api, headers = headers).text
-                        ClipboardLogger.logAndCopy("API Try", "URL: $api\nResponse: $apiRes")
-                        val match = m3u8Regex.find(apiRes)?.groupValues?.get(1)
-                        if (match != null) {
-                            finalUrl = match
-                            break
-                        }
-                    } catch (e: Exception) {}
-                }
-            }
-
-            // BƯỚC 4: Nếu vẫn không có, thử tìm trong script của trang
-            if (finalUrl.isNullOrEmpty()) {
-                val scriptRegex = Regex("""(?:file|src|source):\s*["'](.*?m3u8.*?)["']""", RegexOption.IGNORE_CASE)
-                finalUrl = scriptRegex.find(pageResponse)?.groupValues?.get(1)
-            }
-
-            if (finalUrl.isNullOrEmpty()) {
-                ClipboardLogger.logAndCopy("Error", "Không tìm thấy link m3u8 trong trang hoặc API của Vidsrc.su.")
+            val srcUrl = JSONObject(apiRes).optString("src")
+            if (srcUrl.isEmpty()) {
+                ClipboardLogger.logAndCopy("Error", "Không tìm thấy 'src' trong response.")
                 return false
             }
-            
-            ClipboardLogger.logAndCopy("Success", "Final Stream URL: $finalUrl")
 
-            ApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
+            // Bước 2: Thử trích xuất tĩnh trước (nếu may mắn có m3u8 trong HTML)
+            ClipboardLogger.logAndCopy("Fetching SRC", srcUrl)
+            val playerHtml = app.get(srcUrl, headers = headers).text
+            val m3u8Regex = Regex("""(https?://[^"']*\.m3u8[^"']*)""")
+            var finalUrl = m3u8Regex.find(playerHtml)?.groupValues?.get(1)
 
-            // Xử lý phụ đề
-            val subtitleRegex = Regex("""(https?://[^"']*\.(?:vtt|srt))""", RegexOption.IGNORE_CASE)
-            subtitleRegex.findAll(pageResponse).forEach { match ->
-                val subUrl = match.groupValues[1]
-                if (subUrl.isNotEmpty()) {
-                    subtitleCallback.invoke(SubtitleFile("Unknown", subUrl))
-                }
+            // Bước 3: Nếu không có, sử dụng WebView để bắt link
+            if (finalUrl == null) {
+                ClipboardLogger.logAndCopy("WebView", "Đang dùng WebView để bắt m3u8...")
+                finalUrl = extractWithWebView(srcUrl, "https://stellarconductornexus.com/")
             }
 
-            callback.invoke(
-                ExtractorLink(
-                    source = this.name,
-                    name = "Vidsrcsu",
-                    url = finalUrl,
-                    referer = "https://vidsrc.su/", // Referer bắt buộc từ log sniff
-                    quality = Qualities.P1080.value,
-                    type = ExtractorLinkType.M3U8,
-                    headers = mapOf("Referer" to "https://vidsrc.su/", "Origin" to "https://vidsrc.su")
+            if (finalUrl != null) {
+                ClipboardLogger.logAndCopy("Success", "Final URL: $finalUrl")
+                ApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
+                
+                callback.invoke(
+                    ExtractorLink(
+                        source = this.name,
+                        name = "Vidsrcsu",
+                        url = finalUrl,
+                        referer = "https://stellarconductornexus.com/",
+                        quality = Qualities.P1080.value,
+                        type = ExtractorLinkType.M3U8,
+                        headers = mapOf("Origin" to "https://stellarconductornexus.com")
+                    )
                 )
-            )
-            return true
+                return true
+            } else {
+                ClipboardLogger.logAndCopy("Error", "WebView không bắt được link m3u8.")
+                return false
+            }
         } catch (e: Exception) {
             ClipboardLogger.logAndCopy("Exception", "Error: ${e.message}\nStackTrace: ${e.stackTraceToString()}")
             return false
