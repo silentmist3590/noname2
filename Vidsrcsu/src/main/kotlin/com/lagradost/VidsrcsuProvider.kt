@@ -17,7 +17,7 @@ import org.json.JSONObject
 import java.net.URLEncoder
 
 // =====================================================================================
-// 1. CẤU HÌNH TMDB ĐA TẦNG (Giữ nguyên)
+// 1. CẤU HÌNH TMDB ĐA TẦNG
 // =====================================================================================
 private const val TMDB_BASE_URL = "https://api.themoviedb.org/3"
 private const val OMDB_API_KEY = "a116862a"
@@ -208,8 +208,10 @@ class VidsrcsuProvider : MainAPI() {
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun extractWithWebView(url: String, referer: String): String? = withContext(Dispatchers.Main) {
+        // SỬA LỖI: Xử lý null safety cho context
+        val context = CloudStreamApp.context ?: return@withContext null
         val deferredUrl = CompletableDeferred<String?>()
-        val webView = WebView(CloudStreamApp.context)
+        val webView = WebView(context)
 
         webView.settings.javaScriptEnabled = true
         webView.settings.domStorageEnabled = true
@@ -229,7 +231,6 @@ class VidsrcsuProvider : MainAPI() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                // Tự động click nút Play hoặc gọi video.play()
                 view?.evaluateJavascript("""
                     setTimeout(function() {
                         var videoEl = document.querySelector('video');
@@ -289,7 +290,7 @@ class VidsrcsuProvider : MainAPI() {
                 return false
             }
 
-            // Bước 2: Thử trích xuất tĩnh trước (nếu may mắn có m3u8 trong HTML)
+            // Bước 2: Thử trích xuất tĩnh trước
             ClipboardLogger.logAndCopy("Fetching SRC", srcUrl)
             val playerHtml = app.get(srcUrl, headers = headers).text
             val m3u8Regex = Regex("""(https?://[^"']*\.m3u8[^"']*)""")
