@@ -11,6 +11,8 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
@@ -204,11 +206,10 @@ class VidsrcsuProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // HÀM WEBVIEW ĐỂ BẮT LINK M3U8
+    // HÀM WEBVIEW NÂNG CAO: HOOK JAVASCRIPT ĐỂ BẮT LINK TỪ WASM
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun extractWithWebView(url: String, referer: String): String? = withContext(Dispatchers.Main) {
-        // SỬA LỖI: Xử lý null safety cho context
         val context = CloudStreamApp.context ?: return@withContext null
         val deferredUrl = CompletableDeferred<String?>()
         val webView = WebView(context)
@@ -217,11 +218,16 @@ class VidsrcsuProvider : MainAPI() {
         webView.settings.domStorageEnabled = true
         webView.settings.userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
         webView.settings.mediaPlaybackRequiresUserGesture = false
+        webView.settings.allowFileAccess = true
+        webView.settings.allowContentAccess = true
+        webView.settings.loadWithOverviewMode = true
+        webView.settings.useWideViewPort = true
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                 val reqUrl = request?.url.toString()
-                if (reqUrl.contains(".m3u8") || reqUrl.contains(".mp4")) {
+                // Bắt tất cả các request có chứa .m3u8 hoặc .mp4
+                if (reqUrl.contains(".m3u8", ignoreCase = true) || reqUrl.contains(".mp4", ignoreCase = true)) {
                     if (!deferredUrl.isCompleted) {
                         deferredUrl.complete(reqUrl)
                     }
@@ -231,21 +237,78 @@ class VidsrcsuProvider : MainAPI() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                view?.evaluateJavascript("""
-                    setTimeout(function() {
-                        var videoEl = document.querySelector('video');
-                        if (videoEl) { videoEl.play(); }
-                        var playBtn = document.querySelector('.jw-display-icon-display, .jw-icon-playback, .vjs-big-play-button');
-                        if (playBtn) { playBtn.click(); }
-                    }, 2000);
-                """.trimIndent(), null)
+                // Tiêm mã JavaScript để hook fetch và XHR
+                val js = """
+                    (function() {
+                        window.__captured_m3u8 = null;
+                        // Hook fetch
+                        const originalFetch = window.fetch;
+                        window.fetch = async function(...args) {
+                            try {
+                                const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
+                                if (url && url.includes('.m3u8')) {
+                                    window.__captured_m3u8 = url;
+                                }
+                                const response = await originalFetch.apply(this, args);
+                                return response;
+                            } catch (e) { console.error(e); }
+                        };
+                        // Hook XHR
+                        const originalXHR = window.XMLHttpRequest;
+                        window.XMLHttpRequest = function() {
+                            const xhr = new originalXHR();
+                            xhr.addEventListener('load', function() {
+                                if (xhr.responseURL && xhr.responseURL.includes('.m3u8')) {
+                                    window.__captured_m3u8 = xhr.responseURL;
+                                }
+                            });
+                            return xhr;
+                        };
+                        // Tự động click play
+                        setInterval(function() {
+                            var videoEl = document.querySelector('video');
+                            if (videoEl && videoEl.paused) { 
+                                videoEl.play().catch(function(){}); 
+                            }
+                            var playBtn = document.querySelector('.jw-display-icon-display, .jw-icon-playback, .vjs-big-play-button, button[aria-label="Play"]');
+                            if (playBtn) { playBtn.click(); }
+                        }, 2000);
+                    })();
+                """.trimIndent()
+                view?.evaluateJavascript(js, null)
             }
         }
 
-        webView.loadUrl(url, mapOf("Referer" to referer))
+        // Thêm &autoplay=true vào URL để kích hoạt phát tự động
+        val finalUrl = if (url.contains("?")) "$url&autoplay=true" else "$url?autoplay=true"
+        val extraHeaders = mapOf("Referer" to referer)
+        webView.loadUrl(finalUrl, extraHeaders)
 
-        val result = withTimeoutOrNull(15000) {
-            deferredUrl.await()
+        // Polling kiểm tra link mỗi 1 giây, tối đa 30 giây
+        val result = withTimeoutOrNull(30000) {
+            while (isActive) {
+                delay(1000)
+                var foundUrl: String? = null
+                val jsResult = CompletableDeferred<String>()
+                webView.evaluateJavascript("window.__captured_m3u8") { value ->
+                    jsResult.complete(value)
+                }
+                val value = jsResult.await()
+                if (value != null && value != "null" && value.length > 2) {
+                    // Bỏ dấu ngoặc kép ở đầu và cuối
+                    foundUrl = value.substring(1, value.length - 1)
+                }
+
+                if (foundUrl != null) {
+                    return@withTimeoutOrNull foundUrl
+                }
+                
+                // Fallback: Kiểm tra xem có request nào bị chặn không
+                if (deferredUrl.isCompleted) {
+                    return@withTimeoutOrNull deferredUrl.await()
+                }
+            }
+            null
         }
 
         webView.stopLoading()
@@ -272,7 +335,6 @@ class VidsrcsuProvider : MainAPI() {
         )
 
         try {
-            // Bước 1: Lấy link src từ API vs_src.php
             val apiUrl = if (type == "movie") {
                 "https://vidsrc.sh/vs_src.php?type=movie&id=$tmdbId"
             } else {
@@ -290,17 +352,8 @@ class VidsrcsuProvider : MainAPI() {
                 return false
             }
 
-            // Bước 2: Thử trích xuất tĩnh trước
-            ClipboardLogger.logAndCopy("Fetching SRC", srcUrl)
-            val playerHtml = app.get(srcUrl, headers = headers).text
-            val m3u8Regex = Regex("""(https?://[^"']*\.m3u8[^"']*)""")
-            var finalUrl = m3u8Regex.find(playerHtml)?.groupValues?.get(1)
-
-            // Bước 3: Nếu không có, sử dụng WebView để bắt link
-            if (finalUrl == null) {
-                ClipboardLogger.logAndCopy("WebView", "Đang dùng WebView để bắt m3u8...")
-                finalUrl = extractWithWebView(srcUrl, "https://stellarconductornexus.com/")
-            }
+            ClipboardLogger.logAndCopy("WebView", "Đang dùng WebView để bắt m3u8...")
+            val finalUrl = extractWithWebView(srcUrl, "https://stellarconductornexus.com/")
 
             if (finalUrl != null) {
                 ClipboardLogger.logAndCopy("Success", "Final URL: $finalUrl")
@@ -313,7 +366,7 @@ class VidsrcsuProvider : MainAPI() {
                         url = finalUrl,
                         referer = "https://stellarconductornexus.com/",
                         quality = Qualities.P1080.value,
-                        type = ExtractorLinkType.M3U8,
+                        type = if (finalUrl.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
                         headers = mapOf("Origin" to "https://stellarconductornexus.com")
                     )
                 )
