@@ -26,18 +26,14 @@ class OkRuProvider : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    // Dán Cookie hoặc giá trị AUTHCOOKIE vào đây nếu cần (dùng dấu 3 nháy """ để không bị lỗi dấu $)
-    // Ví dụ: var userCookie: String = """AUTHCOOKIE=abc..."""
-    var userCookie: String = """AUTHCOOKIE=oRrnLKkxktrtxRO4HVuvbnuxpWEaMFa3WoA55Jfm7yD0cDWl5z_Q2ZbmlaxQrZLrWhBWhPAMW_NtpcylxxXNo-XGOLMW6TG-28vkWAzBcmX6g_XpG7AI7dVc8g3KoakkdDVGopB4h31qyLGk_g_5"""
+    // Dán Cookie hoặc giá trị AUTHCOOKIE vào đây nếu có (dùng 3 dấu nháy kép """ để không bị lỗi ký tự $)
+    var userCookie: String = """"""
 
     private val uaMobile =
         "Mozilla/5.0 (Linux; Android 10; SM-G981B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
     private val uaDesktop =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-    /**
-     * Hàm tự giải mã HTML Entities không phụ thuộc vào thư viện AndroidX (chống lỗi compile trên GitHub Actions)
-     */
     private fun unescapeHtml(text: String): String {
         return text
             .replace("&quot;", "\"")
@@ -46,6 +42,8 @@ class OkRuProvider : MainAPI() {
             .replace("&gt;", ">")
             .replace("&#39;", "'")
             .replace("&apos;", "'")
+            .replace("&#34;", "\"")
+            .replace("&#38;", "&")
     }
 
     private fun getHeaders(isMobile: Boolean = true): Map<String, String> {
@@ -78,6 +76,32 @@ class OkRuProvider : MainAPI() {
         "$mainUrl/video?st.page=4" to "Khám Phá Thêm"
     )
 
+    /**
+     * Tra cứu nhanh tiêu đề gốc và ảnh bìa từ trang Embed của OK.ru
+     */
+    private suspend fun fetchVideoMetadata(id: String): Pair<String, String?> {
+        return runCatching {
+            val embedUrl = "https://ok.ru/videoembed/$id"
+            val html = app.get(embedUrl, headers = mapOf("User-Agent" to uaDesktop)).text
+            val optMatch = Regex("""data-options="([^"]+)"""").find(html)?.groupValues?.get(1)
+            if (optMatch != null) {
+                val optJson = JSONObject(unescapeHtml(optMatch))
+                val flashvars = optJson.optJSONObject("flashvars")
+                val metaStr = flashvars?.optString("metadata")
+                if (!metaStr.isNullOrBlank()) {
+                    val meta = JSONObject(metaStr)
+                    val movie = meta.optJSONObject("movie")
+                    val title = movie?.optString("title")
+                    val poster = movie?.optString("poster")?.let { fixUrl(it) }
+                    if (!title.isNullOrBlank()) {
+                        return@runCatching Pair(title, poster)
+                    }
+                }
+            }
+            Pair("OK.ru Video $id", null)
+        }.getOrDefault(Pair("OK.ru Video $id", null))
+    }
+
     private fun parseVideoItem(item: JSONObject): SearchResponse? {
         val id = item.optString("id").takeIf { it.isNotBlank() } ?: return null
         val title = item.optString("name").takeIf { it.isNotBlank() }
@@ -102,43 +126,90 @@ class OkRuProvider : MainAPI() {
         }
 
         val videoUrl = "$mainUrl/video/$id"
-
         return newMovieSearchResponse(title, videoUrl, TvType.Movie) {
             this.posterUrl = fixUrl(poster)
         }
     }
 
-    private suspend fun fetchVideoList(url: String): List<SearchResponse> {
+    /**
+     * Bóc tách danh sách video hỗ trợ đồng thời cả Mobile JSON và Desktop HTML
+     */
+    private suspend fun fetchVideoList(url: String, isMobile: Boolean = true): List<SearchResponse> {
         val list = mutableListOf<SearchResponse>()
-        try {
-            val responseText = app.get(url, headers = getHeaders(isMobile = true)).text
+        val seenIds = mutableSetOf<String>()
 
-            // OK.ru nhúng bảng video trong thuộc tính videos="..."
+        try {
+            val responseText = app.get(url, headers = getHeaders(isMobile = isMobile)).text
+
+            // 1. Tầng 1: Đọc bảng JSON trong thuộc tính videos="..." (thường có trên Mobile)
             val match = Regex("""videos="([^"]+)"""").find(responseText)?.groupValues?.get(1)
             if (!match.isNullOrBlank()) {
-                val unescaped = unescapeHtml(match)
-                val dataObj = JSONObject(unescaped)
-                val tableData = dataObj.optJSONObject("table")?.optJSONArray("data") ?: JSONArray()
-                for (i in 0 until tableData.length()) {
-                    val item = tableData.optJSONObject(i) ?: continue
-                    parseVideoItem(item)?.let { list.add(it) }
+                runCatching {
+                    val unescaped = unescapeHtml(match)
+                    val dataObj = JSONObject(unescaped)
+                    val tableData = dataObj.optJSONObject("table")?.optJSONArray("data") ?: JSONArray()
+                    for (i in 0 until tableData.length()) {
+                        val item = tableData.optJSONObject(i) ?: continue
+                        parseVideoItem(item)?.let {
+                            if (seenIds.add(it.url)) list.add(it)
+                        }
+                    }
                 }
             }
 
-            // Dự phòng: Tìm trực tiếp các link video nếu thuộc tính videos không có
+            // 2. Tầng 2: Bóc tách thẻ HTML Video Card (Desktop & Search page)
+            // Lấy chính xác Video ID, Poster và Tên Phim thật từ thuộc tính alt của ảnh
+            val cardRegex = Regex(
+                """href=["']/video/(\d{8,})[^"']*["'][^>]*>\s*<img[^>]+(?:src=["']([^"']+)["'][^>]+alt=["']([^"']+)["']|alt=["']([^"']+)["'][^>]+src=["']([^"']+)["'])""",
+                RegexOption.IGNORE_CASE
+            )
+            for (m in cardRegex.findAll(responseText)) {
+                val id = m.groupValues[1]
+                val posterRaw = m.groupValues[2].ifBlank { m.groupValues[5] }
+                val titleRaw = m.groupValues[3].ifBlank { m.groupValues[4] }
+                val title = unescapeHtml(titleRaw).trim()
+
+                if (title.isNotBlank() && !title.startsWith("http") && seenIds.add("$mainUrl/video/$id")) {
+                    list.add(
+                        newMovieSearchResponse(title, "$mainUrl/video/$id", TvType.Movie) {
+                            this.posterUrl = fixUrl(unescapeHtml(posterRaw))
+                        }
+                    )
+                }
+            }
+
+            // 3. Tầng 3: Quét qua thẻ có thuộc tính title="..."
+            val titleAttrRegex = Regex("""href=["']/video/(\d{8,})[^"']*["'][^>]*?title=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+            for (m in titleAttrRegex.findAll(responseText)) {
+                val id = m.groupValues[1]
+                val title = unescapeHtml(m.groupValues[2]).trim()
+                if (title.isNotBlank() && !title.startsWith("http") && seenIds.add("$mainUrl/video/$id")) {
+                    list.add(newMovieSearchResponse(title, "$mainUrl/video/$id", TvType.Movie))
+                }
+            }
+
+            // 4. Tầng 4: Nếu chỉ quét được ID số thô, tự động gọi Metadata để lấy tên gốc
             if (list.isEmpty()) {
-                val links = Regex("""/video/(\d{8,})""").findAll(responseText)
-                val seen = mutableSetOf<String>()
-                for (m in links) {
-                    val id = m.groupValues[1]
-                    if (seen.add(id)) {
+                val rawIdRegex = Regex("""/video/(\d{8,})""")
+                val foundIds = rawIdRegex.findAll(responseText)
+                    .map { it.groupValues[1] }
+                    .distinct()
+                    .take(8)
+                    .toList()
+
+                for (id in foundIds) {
+                    if (seenIds.add("$mainUrl/video/$id")) {
+                        val (realTitle, realPoster) = fetchVideoMetadata(id)
                         list.add(
-                            newMovieSearchResponse("Video $id", "$mainUrl/video/$id", TvType.Movie)
+                            newMovieSearchResponse(realTitle, "$mainUrl/video/$id", TvType.Movie) {
+                                this.posterUrl = realPoster
+                            }
                         )
                     }
                 }
             }
         } catch (_: Exception) { }
+
         return list
     }
 
@@ -148,7 +219,7 @@ class OkRuProvider : MainAPI() {
         } else {
             "${request.data}&st.page=$page"
         }
-        val items = fetchVideoList(targetUrl)
+        val items = fetchVideoList(targetUrl, isMobile = true)
         return newHomePageResponse(
             HomePageList(request.name, items, isHorizontalImages = true),
             hasNext = items.isNotEmpty() && page < 10
@@ -162,48 +233,39 @@ class OkRuProvider : MainAPI() {
         val results = mutableListOf<SearchResponse>()
         val seenIds = mutableSetOf<String>()
 
-        // 1. Trường hợp tìm bằng link trực tiếp hoặc dãy số ID
+        // 1. Trường hợp tìm bằng đường link trực tiếp hoặc dãy số ID
         val idRegex = Regex("""(?:ok\.ru/(?:video|videoembed)/|^)(\d{8,})""")
         val matchedId = idRegex.find(q)?.groupValues?.get(1)
         if (matchedId != null) {
-            val videoUrl = "$mainUrl/video/$matchedId"
-            val loaded = runCatching {
-                val embedUrl = "$mainUrl/videoembed/$matchedId"
-                val embedHtml = app.get(embedUrl, headers = mapOf("User-Agent" to uaDesktop)).text
-                val optMatch = Regex("""data-options="([^"]+)"""").find(embedHtml)?.groupValues?.get(1)
-                if (optMatch != null) {
-                    val optJson = JSONObject(unescapeHtml(optMatch))
-                    val meta = optJson.optJSONObject("flashvars")?.optString("metadata")?.let { JSONObject(it) }
-                    val movie = meta?.optJSONObject("movie")
-                    val title = movie?.optString("title") ?: "OK.ru Video $matchedId"
-                    val poster = movie?.optString("poster")?.let { fixUrl(it) }
-                    newMovieSearchResponse(title, videoUrl, TvType.Movie) {
-                        this.posterUrl = poster
-                    }
-                } else null
-            }.getOrNull()
-
+            val (realTitle, realPoster) = fetchVideoMetadata(matchedId)
             return listOf(
-                loaded ?: newMovieSearchResponse("Video $matchedId", videoUrl, TvType.Movie)
+                newMovieSearchResponse(realTitle, "$mainUrl/video/$matchedId", TvType.Movie) {
+                    this.posterUrl = realPoster
+                }
             )
         }
 
-        // 2. Tìm kiếm theo từ khóa
+        // 2. Tìm kiếm theo tên từ khóa
         val encodedQuery = URLEncoder.encode(q, "UTF-8")
-        val searchUrls = listOf(
-            "$mainUrl/video/search?st.query=$encodedQuery",
-            "$mainUrl/video/search?cmd=Search&st.cmd=videoSearch&st.query=$encodedQuery",
-            "$mainUrl/search/content?st.query=$encodedQuery"
-        )
 
-        for (targetUrl in searchUrls) {
-            val list = fetchVideoList(targetUrl)
-            for (item in list) {
+        // Ưu tiên 1: Tìm qua bản Desktop (chứa đầy đủ thẻ Card HTML có Tên và Ảnh)
+        val desktopSearchUrl = "https://ok.ru/video/search?st.query=$encodedQuery"
+        val desktopItems = fetchVideoList(desktopSearchUrl, isMobile = false)
+        for (item in desktopItems) {
+            if (seenIds.add(item.url)) {
+                results.add(item)
+            }
+        }
+
+        // Ưu tiên 2: Nếu desktop chưa có, thử tiếp qua Mobile endpoint
+        if (results.isEmpty()) {
+            val mobileSearchUrl = "$mainUrl/video/search?st.query=$encodedQuery"
+            val mobileItems = fetchVideoList(mobileSearchUrl, isMobile = true)
+            for (item in mobileItems) {
                 if (seenIds.add(item.url)) {
                     results.add(item)
                 }
             }
-            if (results.isNotEmpty()) break
         }
 
         return results
@@ -224,12 +286,16 @@ class OkRuProvider : MainAPI() {
             val optMatch = Regex("""data-options="([^"]+)"""").find(embedHtml)?.groupValues?.get(1)
             if (optMatch != null) {
                 val optJson = JSONObject(unescapeHtml(optMatch))
-                val meta = optJson.optJSONObject("flashvars")?.optString("metadata")?.let { JSONObject(it) }
-                val movie = meta?.optJSONObject("movie")
-                title = movie?.optString("title") ?: title
-                poster = movie?.optString("poster")?.let { fixUrl(it) }
-                description = movie?.optString("description")
-                duration = movie?.optInt("duration", 0)?.takeIf { it > 0 }
+                val flashvars = optJson.optJSONObject("flashvars")
+                val metaStr = flashvars?.optString("metadata")
+                if (!metaStr.isNullOrBlank()) {
+                    val meta = JSONObject(metaStr)
+                    val movie = meta.optJSONObject("movie")
+                    title = movie?.optString("title") ?: title
+                    poster = movie?.optString("poster")?.let { fixUrl(it) }
+                    description = movie?.optString("description")
+                    duration = movie?.optInt("duration", 0)?.takeIf { it > 0 }
+                }
             }
         }
 
@@ -283,7 +349,7 @@ class OkRuProvider : MainAPI() {
             }
         }
 
-        // 2. Nguồn phát trực tiếp MP4 (thêm &ext=.mp4 để ExoPlayer nhận diện)
+        // 2. Nguồn phát trực tiếp MP4 (thêm &ext=.mp4 để ExoPlayer nhận diện định dạng)
         val videosArr = meta.optJSONArray("videos") ?: JSONArray()
         for (i in 0 until videosArr.length()) {
             val v = videosArr.optJSONObject(i) ?: continue
@@ -321,7 +387,7 @@ class OkRuProvider : MainAPI() {
             )
         }
 
-        // 3. Phụ đề (Subtitles) - Chuẩn hóa link https:
+        // 3. Phụ đề (Subtitles)
         runCatching {
             val subsArr = meta.optJSONObject("movie")?.optJSONArray("subtitles") ?: JSONArray()
             for (i in 0 until subsArr.length()) {
