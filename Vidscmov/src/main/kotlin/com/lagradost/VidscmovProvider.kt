@@ -387,29 +387,32 @@ class VidscmovProvider : MainAPI() {
             val seen = mutableListOf<String>()
             var hit: String? = null
             // Trang player yêu cầu bấm Play (có thể bấm 2 lần: lần đầu mở quảng cáo, lần sau mới phát) -> bấm lặp lại mỗi giây
+            // Giả lập cửa sổ quảng cáo: trang mở popup rồi mới cho phát lần bấm sau
+            val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
             val playScript = "(function(){var n=0;function fire(el){if(!el)return;try{['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){el.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));});}catch(e){}try{el.click();}catch(e){}}" +
                 "var t=setInterval(function(){n++;try{fire(document.getElementById('bigPlay'));" +
                 "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}" +
                 "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
                 "fire(document.elementFromPoint(window.innerWidth/2,window.innerHeight/2));}catch(e){}" +
                 "if(n>35)clearInterval(t);},1000);})();"
-            // interceptUrl="." để callback nhận MỌI request (thư viện chỉ gọi callback với url khớp interceptUrl)
+            // interceptUrl chỉ khớp link stream (thư viện dừng ngay ở request khớp đầu tiên); additionalUrls="." để thu mọi request phục vụ log
             val resolver = WebViewResolver(
-                interceptUrl = Regex("."),
-                script = playScript,
+                interceptUrl = Regex("""\.m3u8|\.mpd|master\.txt""", RegexOption.IGNORE_CASE),
+                additionalUrls = listOf(Regex(".")),
+                script = fakePopup + playScript,
                 timeout = 40_000L
             )
-            val streamRegex = Regex("""\.(m3u8|mpd)(\?|$|#)|\.mp4(\?|$)|/hls/|master\.txt""", RegexOption.IGNORE_CASE)
             val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
             val result = resolver.resolveUsingWebView(target, refererForWv) { req ->
-                val u = req.url.toString()
-                if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
-                if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
-                    hit = u
-                    true
-                } else false
+                hit = req.url.toString()
+                true
             }
-            val finalUrl = hit
+            result.second.forEach { r ->
+                val u = r.url.toString()
+                if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
+            }
+            if (hit == null) hit = result.first?.url?.toString()
+            val finalUrl: String? = hit
             ClipboardLogger.logAndCopy("Step4 requests (${seen.size})", seen.joinToString("\n"))
             ClipboardLogger.logAndCopy("Step4 kết quả", "url=$finalUrl")
 
