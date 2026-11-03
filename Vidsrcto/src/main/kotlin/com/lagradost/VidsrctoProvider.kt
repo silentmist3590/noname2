@@ -283,7 +283,6 @@ class VidsrctoProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("LoadLinks", "Data: $data")
         val ref = parseRef(data) ?: return false
         val type = ref.type; val tmdbId = ref.id
