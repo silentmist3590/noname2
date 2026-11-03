@@ -455,7 +455,6 @@ class VidsrctoProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
 
         val ref = parseRef(data)
