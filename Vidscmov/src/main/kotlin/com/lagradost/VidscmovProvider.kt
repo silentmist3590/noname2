@@ -386,14 +386,18 @@ class VidscmovProvider : MainAPI() {
             ClipboardLogger.logAndCopy("Step4 WebView", "Mở: $target\nReferer: $refererForWv")
             val seen = mutableListOf<String>()
             var hit: String? = null
-            val playScript = "(function(){var n=0;var t=setInterval(function(){n++;try{var b=document.getElementById('bigPlay');if(b)b.click();" +
+            // Trang player yêu cầu bấm Play (có thể bấm 2 lần: lần đầu mở quảng cáo, lần sau mới phát) -> bấm lặp lại mỗi giây
+            val playScript = "(function(){var n=0;function fire(el){if(!el)return;try{['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){el.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));});}catch(e){}try{el.click();}catch(e){}}" +
+                "var t=setInterval(function(){n++;try{fire(document.getElementById('bigPlay'));" +
                 "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}" +
-                "var c=document.querySelector('.jw-icon-display,.jw-display-icon-container,[aria-label=Play]');if(c)c.click();}catch(e){}" +
-                "if(n>25)clearInterval(t);},1000);})();"
+                "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
+                "fire(document.elementFromPoint(window.innerWidth/2,window.innerHeight/2));}catch(e){}" +
+                "if(n>35)clearInterval(t);},1000);})();"
+            // interceptUrl="." để callback nhận MỌI request (thư viện chỉ gọi callback với url khớp interceptUrl)
             val resolver = WebViewResolver(
-                interceptUrl = Regex("""\.m3u8"""),
+                interceptUrl = Regex("."),
                 script = playScript,
-                timeout = 30_000L
+                timeout = 40_000L
             )
             val streamRegex = Regex("""\.(m3u8|mpd)(\?|$|#)|\.mp4(\?|$)|/hls/|master\.txt""", RegexOption.IGNORE_CASE)
             val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
@@ -405,7 +409,7 @@ class VidscmovProvider : MainAPI() {
                     true
                 } else false
             }
-            val finalUrl = hit ?: result.first?.url?.toString() ?: result.second.firstOrNull()?.url?.toString()
+            val finalUrl = hit
             ClipboardLogger.logAndCopy("Step4 requests (${seen.size})", seen.joinToString("\n"))
             ClipboardLogger.logAndCopy("Step4 kết quả", "url=$finalUrl")
 
