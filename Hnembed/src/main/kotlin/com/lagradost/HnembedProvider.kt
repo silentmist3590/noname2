@@ -7,33 +7,23 @@ import android.util.Base64
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
-import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
+import java.net.HttpURLConnection
 import java.net.URI
+import java.net.URL
 import java.net.URLEncoder
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
 private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
 private const val TRAKT_ACCESS_TOKEN = ""
-
-@CloudstreamPlugin
-class HnembedPlugin : Plugin() {
-    override fun load(context: Context) {
-        HnembedProvider.pluginContext = context
-        registerMainAPI(HnembedProvider())
-    }
-}
 
 object ApiServices {
     suspend fun getOmdbData(imdbId: String): String? {
@@ -89,10 +79,34 @@ class HnembedProvider : MainAPI() {
 
     companion object {
         var pluginContext: Context? = null
+
+        fun getAppContext(): Context? {
+            return pluginContext
+                ?: runCatching {
+                    Class.forName("com.lagradost.cloudstream3.AcraApplication")
+                        .getDeclaredField("context")
+                        .apply { isAccessible = true }
+                        .get(null) as? Context
+                }.getOrNull()
+                ?: runCatching {
+                    Class.forName("android.app.ActivityThread")
+                        .getMethod("currentApplication")
+                        .invoke(null) as? Context
+                }.getOrNull()
+        }
     }
 
     private val userAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+
+    private fun fetchBytes(targetUrl: String, referer: String): ByteArray {
+        val conn = URL(targetUrl).openConnection() as HttpURLConnection
+        conn.setRequestProperty("User-Agent", userAgent)
+        conn.setRequestProperty("Referer", referer)
+        conn.connectTimeout = 12000
+        conn.readTimeout = 12000
+        return conn.inputStream.use { it.readBytes() }
+    }
 
     override val mainPage = mainPageOf(
         "$mainUrl/trending/all/day?api_key=$TMDB_API_KEY" to "Trending Today",
@@ -199,80 +213,77 @@ class HnembedProvider : MainAPI() {
     }
 
     /**
-     * Giải mã chuỗi stream_urls qua module WebAssembly (vsdec.js) bằng WebView ngầm của Android
+     * Giải mã chuỗi stream_urls qua WebAssembly bằng WebView ngầm của Android
+     * Sử dụng CountDownLatch của Java chuẩn thay cho kotlinx-coroutines để build không lỗi
      */
-    private suspend fun decryptWasmInWebView(wasmBytes: ByteArray, encB64: String): String? {
-        val ctx = pluginContext ?: runCatching {
-            Class.forName("com.lagradost.cloudstream3.AcraApplication")
-                .getDeclaredField("context")
-                .apply { isAccessible = true }
-                .get(null) as? Context
-        }.getOrNull() ?: return null
-
+    private fun decryptWasmInWebView(wasmBytes: ByteArray, encB64: String): String? {
+        val ctx = getAppContext() ?: return null
         val wasmBase64 = Base64.encodeToString(wasmBytes, Base64.NO_WRAP)
+        val latch = CountDownLatch(1)
+        var resultText: String? = null
 
-        return withTimeoutOrNull(10000L) {
-            suspendCancellableCoroutine { cont ->
-                Handler(Looper.getMainLooper()).post {
-                    try {
-                        val webView = WebView(ctx)
-                        webView.settings.javaScriptEnabled = true
-                        webView.settings.domStorageEnabled = true
+        Handler(Looper.getMainLooper()).post {
+            try {
+                val webView = WebView(ctx)
+                webView.settings.javaScriptEnabled = true
+                webView.settings.domStorageEnabled = true
 
-                        fun cleanup() {
-                            runCatching {
-                                webView.stopLoading()
-                                webView.removeJavascriptInterface("Bridge")
-                                webView.destroy()
-                            }
-                        }
-
-                        webView.addJavascriptInterface(object {
-                            @JavascriptInterface
-                            fun onSuccess(txt: String) {
-                                if (cont.isActive) cont.resume(txt)
-                                cleanup()
-                            }
-
-                            @JavascriptInterface
-                            fun onError(err: String) {
-                                if (cont.isActive) cont.resumeWithException(Exception(err))
-                                cleanup()
-                            }
-                        }, "Bridge")
-
-                        val html = """
-                            <!DOCTYPE html><html><head></head><body><script>
-                            (async function() {
-                                try {
-                                    var binW = atob("$wasmBase64");
-                                    var wBytes = new Uint8Array(binW.length);
-                                    for (var i = 0; i < binW.length; i++) wBytes[i] = binW.charCodeAt(i);
-                                    var mod = await WebAssembly.compile(wBytes);
-                                    var inst = await WebAssembly.instantiate(mod, {});
-                                    var ex = inst.exports;
-                                    var binE = atob("$encB64");
-                                    var eBytes = new Uint8Array(binE.length);
-                                    for (var i = 0; i < binE.length; i++) eBytes[i] = binE.charCodeAt(i);
-                                    var ptr = ex.alloc(eBytes.length);
-                                    new Uint8Array(ex.memory.buffer, ptr, eBytes.length).set(eBytes);
-                                    var outLen = ex.decrypt(ptr, eBytes.length);
-                                    var txt = new TextDecoder().decode(new Uint8Array(ex.memory.buffer, ptr + 12, outLen));
-                                    Bridge.onSuccess(txt);
-                                } catch(e) {
-                                    Bridge.onError(e.message || String(e));
-                                }
-                            })();
-                            </script></body></html>
-                        """.trimIndent()
-
-                        webView.loadDataWithBaseURL("https://stellarconductornexus.com/", html, "text/html", "UTF-8", null)
-                    } catch (e: Exception) {
-                        if (cont.isActive) cont.resumeWithException(e)
+                fun cleanup() {
+                    runCatching {
+                        webView.stopLoading()
+                        webView.removeJavascriptInterface("Bridge")
+                        webView.destroy()
                     }
                 }
+
+                webView.addJavascriptInterface(object {
+                    @JavascriptInterface
+                    fun onSuccess(txt: String) {
+                        resultText = txt
+                        cleanup()
+                        latch.countDown()
+                    }
+
+                    @JavascriptInterface
+                    fun onError(err: String) {
+                        cleanup()
+                        latch.countDown()
+                    }
+                }, "Bridge")
+
+                val html = """
+                    <!DOCTYPE html><html><head></head><body><script>
+                    (async function() {
+                        try {
+                            var binW = atob("$wasmBase64");
+                            var wBytes = new Uint8Array(binW.length);
+                            for (var i = 0; i < binW.length; i++) wBytes[i] = binW.charCodeAt(i);
+                            var mod = await WebAssembly.compile(wBytes);
+                            var inst = await WebAssembly.instantiate(mod, {});
+                            var ex = inst.exports;
+                            var binE = atob("$encB64");
+                            var eBytes = new Uint8Array(binE.length);
+                            for (var i = 0; i < binE.length; i++) eBytes[i] = binE.charCodeAt(i);
+                            var ptr = ex.alloc(eBytes.length);
+                            new Uint8Array(ex.memory.buffer, ptr, eBytes.length).set(eBytes);
+                            var outLen = ex.decrypt(ptr, eBytes.length);
+                            var txt = new TextDecoder().decode(new Uint8Array(ex.memory.buffer, ptr + 12, outLen));
+                            Bridge.onSuccess(txt);
+                        } catch(e) {
+                            Bridge.onError(e.message || String(e));
+                        }
+                    })();
+                    </script></body></html>
+                """.trimIndent()
+
+                webView.loadDataWithBaseURL("https://stellarconductornexus.com/", html, "text/html", "UTF-8", null)
+            } catch (e: Exception) {
+                latch.countDown()
             }
         }
+
+        latch.await(12, TimeUnit.SECONDS)
+        return resultText
     }
 
     override suspend fun loadLinks(
@@ -294,7 +305,7 @@ class HnembedProvider : MainAPI() {
         )
 
         try {
-            // Bước 1: Gọi vs_src.php từ hnembed.cc để lấy URL Player đích
+            // Bước 1: Gọi vs_src.php từ hnembed.cc để lấy link Player
             val vsSrcUrl = if (type == "movie") {
                 "https://hnembed.cc/vs_src.php?type=movie&id=$tmdbId"
             } else {
@@ -327,7 +338,7 @@ class HnembedProvider : MainAPI() {
             val playerHost = "https://stellarconductornexus.com"
             val playerFullUrl = if (playerPath.startsWith("http")) playerPath else "$playerHost$playerPath"
 
-            // Bước 3: Tải trang Player để lấy CONFIG (chứa apiToken dùng một lần và URL stream)
+            // Bước 3: Tải trang Player để lấy CONFIG (apiToken dùng một lần)
             val playerHeaders = mapOf(
                 "User-Agent" to userAgent,
                 "Referer" to embedSrc
@@ -361,8 +372,8 @@ class HnembedProvider : MainAPI() {
                 return false
             }
 
-            // Bước 5: Tải file WebAssembly (.wasm) về
-            val wasmBytes = app.get(wasmUrl, headers = streamDataHeaders).bytes
+            // Bước 5: Tải file WebAssembly (.wasm) trực tiếp
+            val wasmBytes = fetchBytes(wasmUrl, "$playerHost/")
 
             // Bước 6: Giải mã chuỗi stream_urls qua WebAssembly
             val decryptedUrlsText = decryptWasmInWebView(wasmBytes, encStreamUrls)
@@ -377,7 +388,7 @@ class HnembedProvider : MainAPI() {
                 return false
             }
 
-            // Bước 7: Với mỗi luồng m3u8, gọi generate.php từ host đó để lấy Token JWT và đóng dấu
+            // Bước 7: Với mỗi luồng m3u8, lấy Token JWT từ generate.php và đóng dấu
             var addedLinkCount = 0
             for ((index, rawM3u8Url) in rawStreamList.withIndex()) {
                 val streamOrigin = try {
@@ -387,7 +398,6 @@ class HnembedProvider : MainAPI() {
                     "https://birchandbloom.space"
                 }
 
-                // Gọi generate.php lấy token hợp lệ cho IP hiện tại
                 val token = runCatching {
                     app.get(
                         "$streamOrigin/generate.php",
