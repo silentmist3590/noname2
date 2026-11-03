@@ -6,7 +6,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import com.lagradost.cloudstream3.CloudStreamApp // SỬA LỖI: Dùng CloudStreamApp
+import com.lagradost.cloudstream3.CloudStreamApp
 
 object ClipboardLogger {
     private const val TAG = "PluginLogger"
@@ -16,7 +16,6 @@ object ClipboardLogger {
         Log.d(TAG, logMessage)
 
         try {
-            // SỬA LỖI: Lấy context từ CloudStreamApp
             val context = CloudStreamApp.context ?: return
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
 
@@ -28,8 +27,8 @@ object ClipboardLogger {
             Log.e(TAG, "Failed to copy to clipboard", e)
         }
     }
-}
-fun reset() {
+
+    fun reset() {
         try {
             val ctx = CloudStreamApp.context ?: return
             val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
