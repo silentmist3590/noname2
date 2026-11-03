@@ -29,3 +29,14 @@ object ClipboardLogger {
         }
     }
 }
+fun reset() {
+        try {
+            val ctx = CloudStreamApp.context ?: return
+            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("", ""))
+            Log.d(TAG, "Clipboard reset")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to reset clipboard: ${e.message}")
+        }
+    }
+}
