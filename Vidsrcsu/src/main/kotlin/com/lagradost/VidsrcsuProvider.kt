@@ -1,6 +1,8 @@
 package com.lagradost
 
 import android.annotation.SuppressLint
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -206,7 +208,7 @@ class VidsrcsuProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // HÀM WEBVIEW NÂNG CAO: PERFORMANCE OBSERVER + JS HOOKS
+    // HÀM WEBVIEW NÂNG CAO: HOOK MEDIA ELEMENT SRC
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun extractWithWebView(url: String, referer: String): String? = withContext(Dispatchers.Main) {
@@ -222,6 +224,18 @@ class VidsrcsuProvider : MainAPI() {
         webView.settings.allowContentAccess = true
         webView.settings.loadWithOverviewMode = true
         webView.settings.useWideViewPort = true
+        // Thêm cài đặt để tương thích với React App
+        webView.settings.javaScriptCanOpenWindowsAutomatically = true
+        webView.settings.setSupportMultipleWindows(true)
+
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                consoleMessage?.let {
+                    ClipboardLogger.logAndCopy("WebView Console", "${it.message()} (${it.sourceId()}:${it.lineNumber()})")
+                }
+                return true
+            }
+        }
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
@@ -266,18 +280,21 @@ class VidsrcsuProvider : MainAPI() {
                             return xhr;
                         };
 
-                        // 3. Hook WebSocket
-                        const originalWebSocket = window.WebSocket;
-                        window.WebSocket = function(...args) {
-                            const ws = new originalWebSocket(...args);
-                            ws.addEventListener('message', function(event) {
-                                if (typeof event.data === 'string' && (event.data.includes('.m3u8') || event.data.includes('.mp4'))) {
-                                    const match = event.data.match(/(https?:\/\/[^\s"']+\.(?:m3u8|mp4)[^\s"']*)/);
-                                    if (match) window.__captured_m3u8 = match[1];
-                                }
-                            });
-                            return ws;
-                        };
+                        // 3. Hook HTMLMediaElement.src (Rất hiệu quả)
+                        try {
+                            const srcDescriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+                            if (srcDescriptor && srcDescriptor.set) {
+                                Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                                    set: function(val) {
+                                        if (val && (val.includes('.m3u8') || val.includes('.mp4'))) {
+                                            window.__captured_m3u8 = val;
+                                        }
+                                        return srcDescriptor.set.call(this, val);
+                                    },
+                                    get: srcDescriptor.get
+                                });
+                            }
+                        } catch (e) { console.error('Error hooking src', e); }
 
                         // 4. PerformanceObserver (Bắt request từ WASM)
                         if (window.PerformanceObserver) {
@@ -291,24 +308,20 @@ class VidsrcsuProvider : MainAPI() {
                             observer.observe({ entryTypes: ['resource'] });
                         }
 
-                        // 5. Tự động phát / click play
+                        // 5. Poll for video elements (Fallback)
                         setInterval(function() {
+                            document.querySelectorAll('video').forEach(v => {
+                                if (v.src && (v.src.includes('.m3u8') || v.src.includes('.mp4'))) window.__captured_m3u8 = v.src;
+                                if (v.currentSrc && (v.currentSrc.includes('.m3u8') || v.currentSrc.includes('.mp4'))) window.__captured_m3u8 = v.currentSrc;
+                            });
+                            
+                            // Auto play
                             var videoEl = document.querySelector('video');
                             if (videoEl && videoEl.paused) {
                                 videoEl.play().catch(function(){});
-                                if (videoEl.paused) {
-                                    videoEl.muted = true;
-                                    videoEl.play().catch(function(){});
-                                }
                             }
                             var playBtn = document.querySelector('.jw-display-icon-display, .jw-icon-playback, .vjs-big-play-button, button[aria-label="Play"], .play-button, .vjs-play-control');
                             if (playBtn) { playBtn.click(); }
-                            var buttons = document.querySelectorAll('button');
-                            for (var i=0; i<buttons.length; i++) {
-                                if (buttons[i].textContent.includes('Play') || buttons[i].textContent.includes('play')) {
-                                    buttons[i].click();
-                                }
-                            }
                         }, 2000);
                     })();
                 """.trimIndent()
@@ -332,7 +345,6 @@ class VidsrcsuProvider : MainAPI() {
                 }
                 val value = jsResult.await()
                 if (value != null && value != "null" && value.length > 2) {
-                    // Bỏ dấu ngoặc kép ở đầu và cuối
                     foundUrl = value.substring(1, value.length - 1)
                 }
 
@@ -340,7 +352,6 @@ class VidsrcsuProvider : MainAPI() {
                     return@withTimeoutOrNull foundUrl
                 }
                 
-                // Fallback: Kiểm tra xem có request nào bị chặn không
                 if (deferredUrl.isCompleted) {
                     return@withTimeoutOrNull deferredUrl.await()
                 }
