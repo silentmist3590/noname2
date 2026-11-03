@@ -380,23 +380,37 @@ class VidscmovProvider : MainAPI() {
             }
             val if1: String? = shEmbed
 
-            // Bước 4: mở trang player trong WebView và bắt link m3u8 (WASM giải mã chạy trong WebView)
+            // Bước 4: mở trang player trong WebView, tự bấm Play, ghi lại mọi request và bắt link m3u8/mpd/mp4
             val target = playerPage ?: if2 ?: if1 ?: embedUrl
             val refererForWv = if2 ?: if1 ?: "https://vidsrc.mov/"
             ClipboardLogger.logAndCopy("Step4 WebView", "Mở: $target\nReferer: $refererForWv")
-            val captured = app.get(
-                target,
-                referer = refererForWv,
-                interceptor = WebViewResolver(
-                    interceptUrl = Regex("""\.m3u8"""),
-                    timeout = 30_000L
-                )
+            val seen = mutableListOf<String>()
+            var hit: String? = null
+            val playScript = "(function(){var n=0;var t=setInterval(function(){n++;try{var b=document.getElementById('bigPlay');if(b)b.click();" +
+                "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}" +
+                "var c=document.querySelector('.jw-icon-display,.jw-display-icon-container,[aria-label=Play]');if(c)c.click();}catch(e){}" +
+                "if(n>25)clearInterval(t);},1000);})();"
+            val resolver = WebViewResolver(
+                interceptUrl = Regex("""\.m3u8"""),
+                script = playScript,
+                timeout = 30_000L
             )
-            val finalUrl = captured.url
-            ClipboardLogger.logAndCopy("Step4 kết quả", "url=$finalUrl\nHTTP ${captured.code}")
+            val streamRegex = Regex("""\.(m3u8|mpd)(\?|$|#)|\.mp4(\?|$)|/hls/|master\.txt""", RegexOption.IGNORE_CASE)
+            val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
+            val result = resolver.resolveUsingWebView(target, refererForWv) { req ->
+                val u = req.url.toString()
+                if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
+                if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
+                    hit = u
+                    true
+                } else false
+            }
+            val finalUrl = hit ?: result.first?.url?.toString() ?: result.second.firstOrNull()?.url?.toString()
+            ClipboardLogger.logAndCopy("Step4 requests (${seen.size})", seen.joinToString("\n"))
+            ClipboardLogger.logAndCopy("Step4 kết quả", "url=$finalUrl")
 
-            if (!finalUrl.contains(".m3u8")) {
-                ClipboardLogger.logAndCopy("Error", "WebView không bắt được .m3u8 (có thể bị Turnstile/captcha chặn hoặc cần bấm Play).\nTrang cuối: ${captured.text.take(600)}")
+            if (finalUrl.isNullOrEmpty()) {
+                ClipboardLogger.logAndCopy("Error", "WebView không bắt được link stream (xem danh sách request ở trên).")
                 return false
             }
 
