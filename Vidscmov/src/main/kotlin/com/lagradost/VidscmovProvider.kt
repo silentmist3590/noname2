@@ -1,11 +1,26 @@
 package com.lagradost
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
+import android.annotation.SuppressLint
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 import org.json.JSONObject
 import java.util.Base64
 
@@ -314,6 +329,115 @@ class VidscmovProvider : MainAPI() {
         return e
     }
 
+
+    // =====================================================================================
+    // WebView riêng: tải trang player, chặn mọi popup, gửi chạm THẬT (MotionEvent) vào giữa màn hình để bấm Play
+    // và bắt URL .m3u8/.mpd đầu tiên mà trang gọi.
+    // =====================================================================================
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): String? {
+        return suspendCoroutine { cont ->
+            val handler = Handler(Looper.getMainLooper())
+            handler.post {
+                val appCtx: Context? = CloudStreamApp.context
+                val act = CommonActivity.activity
+                val ctx: Context? = act ?: appCtx
+                if (ctx == null) {
+                    ClipboardLogger.logAndCopy("Sniff", "Không có Context để tạo WebView")
+                    cont.resume(null)
+                } else try {
+                    val w = 1080
+                    val h = 1920
+                    val wv = WebView(ctx)
+                    var finished = false
+                    fun finish(res: String?) {
+                        if (finished) return
+                        finished = true
+                        handler.removeCallbacksAndMessages(null)
+                        try {
+                            wv.stopLoading()
+                            (wv.parent as? ViewGroup)?.removeView(wv)
+                            wv.destroy()
+                        } catch (_: Exception) {
+                        }
+                        cont.resume(res)
+                    }
+                    val streamRegex = Regex("""\.m3u8|\.mpd|master\.txt""", RegexOption.IGNORE_CASE)
+                    val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        mediaPlaybackRequiresUserGesture = false
+                        javaScriptCanOpenWindowsAutomatically = false
+                        setSupportMultipleWindows(false)
+                        userAgentString = ua
+                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    }
+                    // Popup quảng cáo: không mở cửa sổ mới
+                    wv.webChromeClient = object : WebChromeClient() {
+                        override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
+                    }
+                    val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
+                    val clickJs = "(function(){function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
+                        "fire(document.getElementById('bigPlay'));" +
+                        "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
+                        "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();"
+                    var taps = 0
+                    fun tap() {
+                        if (finished) return
+                        taps++
+                        try {
+                            wv.evaluateJavascript(fakePopup + clickJs, null)
+                            val t = SystemClock.uptimeMillis()
+                            val d = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, w / 2f, h / 2f, 0)
+                            val u = MotionEvent.obtain(t, t + 60, MotionEvent.ACTION_UP, w / 2f, h / 2f, 0)
+                            wv.dispatchTouchEvent(d)
+                            wv.dispatchTouchEvent(u)
+                            d.recycle(); u.recycle()
+                        } catch (_: Exception) {
+                        }
+                        if (taps < 25) handler.postDelayed({ tap() }, 1500)
+                    }
+                    wv.webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                            val u = request?.url?.toString() ?: return null
+                            if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
+                            if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
+                                handler.post { finish(u) }
+                            }
+                            return null
+                        }
+
+                        // chặn mọi chuyển hướng sang trang quảng cáo
+                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                            val u = request?.url?.toString() ?: return false
+                            val ok = u.startsWith(pageUrl.substringBefore("?")) || u.contains("stellarconductornexus.com")
+                            if (!ok) seen.add("BLOCKED NAV: " + u.take(160))
+                            return !ok
+                        }
+
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            handler.postDelayed({ tap() }, 800)
+                        }
+                    }
+                    // Gắn vào cửa sổ (ngoài màn hình) để WebView nhận chạm và chạy như bình thường
+                    wv.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
+                    wv.layout(0, 0, w, h)
+                    wv.translationX = -4000f
+                    try {
+                        act?.addContentView(wv, ViewGroup.LayoutParams(w, h))
+                    } catch (_: Exception) {
+                    }
+                    handler.postDelayed({ finish(null) }, 45_000L)
+                    wv.loadUrl(pageUrl, mapOf("Referer" to referer))
+                } catch (e: Exception) {
+                    ClipboardLogger.logAndCopy("Sniff Exception", e.stackTraceToString().take(800))
+                    cont.resume(null)
+                }
+            }
+        }
+    }
+
     // =====================================================================================
     // HÀM CHÍNH: LOAD LINKS
     // vidsrc.mov hiện chạy theo chuỗi: vidsrc.mov -> vidsrc.sh -> stellarconductornexus.com (embed) -> player.
@@ -385,33 +509,7 @@ class VidscmovProvider : MainAPI() {
             val refererForWv = if2 ?: if1 ?: "https://vidsrc.mov/"
             ClipboardLogger.logAndCopy("Step4 WebView", "Mở: $target\nReferer: $refererForWv")
             val seen = mutableListOf<String>()
-            var hit: String? = null
-            // Trang player yêu cầu bấm Play (có thể bấm 2 lần: lần đầu mở quảng cáo, lần sau mới phát) -> bấm lặp lại mỗi giây
-            // Giả lập cửa sổ quảng cáo: trang mở popup rồi mới cho phát lần bấm sau
-            val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
-            val playScript = "(function(){var n=0;function fire(el){if(!el)return;try{['pointerdown','mousedown','pointerup','mouseup','click'].forEach(function(t){el.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}));});}catch(e){}try{el.click();}catch(e){}}" +
-                "var t=setInterval(function(){n++;try{fire(document.getElementById('bigPlay'));" +
-                "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}" +
-                "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
-                "fire(document.elementFromPoint(window.innerWidth/2,window.innerHeight/2));}catch(e){}" +
-                "if(n>35)clearInterval(t);},1000);})();"
-            // interceptUrl chỉ khớp link stream (thư viện dừng ngay ở request khớp đầu tiên); additionalUrls="." để thu mọi request phục vụ log
-            val resolver = WebViewResolver(
-                interceptUrl = Regex("""\.m3u8|\.mpd|master\.txt""", RegexOption.IGNORE_CASE),
-                additionalUrls = listOf(Regex(".")),
-                script = fakePopup + playScript,
-                timeout = 40_000L
-            )
-            val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
-            val result = resolver.resolveUsingWebView(target, refererForWv) { req ->
-                hit = req.url.toString()
-                true
-            }
-            result.second.forEach { r ->
-                val u = r.url.toString()
-                if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
-            }
-            if (hit == null) hit = result.first?.url?.toString()
+            val hit: String? = sniffStream(target, refererForWv, ua, seen)
             val finalUrl: String? = hit
             ClipboardLogger.logAndCopy("Step4 requests (${seen.size})", seen.joinToString("\n"))
             ClipboardLogger.logAndCopy("Step4 kết quả", "url=$finalUrl")
