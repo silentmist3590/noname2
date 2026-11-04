@@ -27,7 +27,7 @@ import org.jsoup.nodes.Element
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
-class KRX18 : MainAPI() {
+class KRX18Provider : MainAPI() {
     override var mainUrl = "https://krx18.com"
     override var name = "KRX 18"
     override val hasMainPage = true
