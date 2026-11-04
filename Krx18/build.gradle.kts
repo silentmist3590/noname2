@@ -11,5 +11,5 @@ cloudstream {
 }
 
 android {
-    namespace = "com.krx18"
+    namespace = "com.lagradost"
 }
