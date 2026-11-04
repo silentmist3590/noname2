@@ -1,4 +1,4 @@
-package com.krx18
+package com.lagradost
 
 import android.content.Context
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
