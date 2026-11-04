@@ -5,23 +5,31 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import org.json.JSONObject
+import java.net.URLEncoder
 
 // =====================================================================================
-// 1. CẤU HÌNH API KEY VÀ PROXY
+// 1. CẤU HÌNH API KEY VÀ ĐỊNH DANH
 // =====================================================================================
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
-private const val TMDB_API_KEY = "b9e1ff7ff423790bf7df202e661377ca"
+private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
 private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
-private const val TRAKT_ACCESS_TOKEN = "" // Để trống nếu không dùng Trakt
+private const val TRAKT_ACCESS_TOKEN = ""
 
+private val ID_REGEX = Regex("""(movie|tv):(\d+)(?::(\d+):(\d+))?""")
+
+private class MediaRef(val type: String, val id: Int, val season: Int?, val episode: Int?)
+
+private fun parseRef(s: String): MediaRef? {
+    val m = ID_REGEX.find(s) ?: return null
+    val id = m.groupValues[2].toIntOrNull() ?: return null
+    return MediaRef(m.groupValues[1], id, m.groupValues[3].toIntOrNull(), m.groupValues[4].toIntOrNull())
+}
 
 // =====================================================================================
-// 2. CÁC HÀM GỌI API HỖ TRỢ (Đã bỏ Gson)
+// 2. CÁC HÀM GỌI API HỖ TRỢ (OMDb, Trakt)
 // =====================================================================================
-object ApiServices {
-
-    // --- OMDb ---
+object TwoEmbedApiServices {
     suspend fun getOmdbData(imdbId: String): String? {
         return try {
             val res = app.get("https://www.omdbapi.com/?apikey=$OMDB_API_KEY&i=$imdbId").text
@@ -34,19 +42,13 @@ object ApiServices {
         }
     }
 
-    // --- Trakt ---
-    suspend fun sendTraktScrobble(
-        action: String, type: String, tmdbId: Int, progress: Float, season: Int? = null, episode: Int? = null
-    ) {
+    suspend fun sendTraktScrobble(action: String, type: String, tmdbId: Int, progress: Float, season: Int? = null, episode: Int? = null) {
         if (TRAKT_ACCESS_TOKEN.isEmpty()) return
         val url = "https://api.trakt.tv/scrobble/$action"
         val headers = mapOf(
-            "Content-Type" to "application/json",
-            "trakt-api-version" to "2",
-            "trakt-api-key" to TRAKT_CLIENT_ID,
-            "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
+            "Content-Type" to "application/json", "trakt-api-version" to "2",
+            "trakt-api-key" to TRAKT_CLIENT_ID, "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
         )
-        
         val body = JSONObject()
         body.put("progress", progress)
         if (type == "movie") {
@@ -61,7 +63,6 @@ object ApiServices {
             episodeObj.put("number", episode ?: 1)
             body.put("episode", episodeObj)
         }
-        
         try {
             app.post(url, headers = headers, json = body).text
         } catch (e: Exception) {
@@ -70,219 +71,300 @@ object ApiServices {
     }
 }
 
-
 // =====================================================================================
 // 3. LỚP PROVIDER CHÍNH
 // =====================================================================================
-class TwoNembedProvider : MainAPI() {
-    override var mainUrl = TMDB_BASE_URL
-    override var name = "2nembed"
+class TwoEmbedProvider : MainAPI() {
+    override var mainUrl = "https://www.2embed.cc"
+    override var name = "2embed"
     override var lang = "en"
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     override val mainPage = mainPageOf(
-        "$mainUrl/trending/all/day?api_key=$TMDB_API_KEY" to "Trending Today",
-        "$mainUrl/movie/popular?api_key=$TMDB_API_KEY" to "Popular Movies",
-        "$mainUrl/tv/popular?api_key=$TMDB_API_KEY" to "Popular TV Shows"
+        "/trending/all/day" to "Trending Today",
+        "/movie/popular" to "Popular Movies",
+        "/tv/popular" to "Popular TV Shows"
     )
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val response = app.get("${request.data}&page=$page").text
-        val json = JSONObject(response)
-        val results = json.getJSONArray("results")
-        val home = mutableListOf<SearchResponse>()
+    private fun img(path: String?, size: String = "w500") =
+        path?.takeIf { it.isNotEmpty() && it != "null" }?.let { "https://wsrv.nl/?url=image.tmdb.org/t/p/$size$it" }
 
-        for (i in 0 until results.length()) {
-            val item = results.getJSONObject(i)
-            val mediaType = item.optString("media_type", if (request.name.contains("TV")) "tv" else "movie")
-            val id = item.getInt("id").toString()
-            val title = item.optString("title", item.optString("name"))
-            val poster = item.optString("poster_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w500$it" else null }
-            home.add(newMovieSearchResponse(title, "2nembed:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
-                this.posterUrl = poster
-            })
+    private fun poster(path: String?) = img(path, "w500")
+
+    private val tmdbHosts = listOf(TMDB_BASE_URL, "https://api.tmdb.org/3", "https://api.themoviedb.org/3")
+
+    private suspend fun tmdbGet(path: String): String {
+        var last: Exception? = null
+        val sep = if (path.contains("?")) "&" else "?"
+        for (host in tmdbHosts) {
+            try {
+                val r = app.get("$host$path${sep}api_key=$TMDB_API_KEY")
+                if (r.code == 200 && r.text.trimStart().startsWith("{")) return r.text
+                last = Exception("HTTP ${r.code} @ $host")
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                last = e
+            }
+            ClipboardLogger.logAndCopy("TMDB fallback", "${last?.message} (path=$path)")
         }
-        return newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
+        throw last ?: Exception("TMDB failed")
+    }
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        return try {
+            val response = tmdbGet("${request.data}?page=$page")
+            val json = JSONObject(response)
+            val results = json.optJSONArray("results") ?: throw Exception(json.optString("status_message", "TMDB không trả results"))
+            val home = mutableListOf<SearchResponse>()
+            for (i in 0 until results.length()) {
+                val item = results.getJSONObject(i)
+                val mediaType = item.optString("media_type", if (request.name.contains("TV")) "tv" else "movie")
+                if (mediaType != "movie" && mediaType != "tv") continue
+                val id = item.optInt("id", 0)
+                if (id == 0) continue
+                val title = item.optString("title", item.optString("name"))
+                home.add(newMovieSearchResponse(title, "2embed:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
+                    this.posterUrl = poster(item.optString("poster_path"))
+                })
+            }
+            newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("getMainPage Error", e.message ?: "Unknown")
+            newHomePageResponse(request.name, emptyList(), hasNext = false)
+        }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val response = app.get("$mainUrl/search/multi?api_key=$TMDB_API_KEY&query=$query").text
-        val json = JSONObject(response)
-        val results = json.getJSONArray("results")
-        val searchResults = mutableListOf<SearchResponse>()
-
-        for (i in 0 until results.length()) {
-            val item = results.getJSONObject(i)
-            val mediaType = item.optString("media_type")
-            if (mediaType != "movie" && mediaType != "tv") continue
-            val id = item.getInt("id").toString()
-            val title = item.optString("title", item.optString("name"))
-            val poster = item.optString("poster_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w500$it" else null }
-            searchResults.add(newMovieSearchResponse(title, "2nembed:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
-                this.posterUrl = poster
-            })
+        return try {
+            val q = URLEncoder.encode(query, "UTF-8")
+            val json = JSONObject(tmdbGet("/search/multi?query=$q"))
+            val results = json.optJSONArray("results") ?: return emptyList()
+            val out = mutableListOf<SearchResponse>()
+            for (i in 0 until results.length()) {
+                val item = results.getJSONObject(i)
+                val mediaType = item.optString("media_type")
+                if (mediaType != "movie" && mediaType != "tv") continue
+                val id = item.optInt("id", 0)
+                if (id == 0) continue
+                val title = item.optString("title", item.optString("name"))
+                out.add(newMovieSearchResponse(title, "2embed:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
+                    this.posterUrl = poster(item.optString("poster_path"))
+                })
+            }
+            out
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("Search Error", e.message ?: "Unknown")
+            emptyList()
         }
-        return searchResults
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val parts = url.split(":")
-        if (parts.size < 3) return null
-        val mediaType = parts[1]
-        val tmdbId = parts[2]
-
-        val response = app.get("$mainUrl/$mediaType/$tmdbId?api_key=$TMDB_API_KEY").text
-        val json = JSONObject(response)
-        val title = json.optString("title", json.optString("name"))
-        val description = json.optString("overview")
-        val poster = json.optString("poster_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w500$it" else null }
-        val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
-        val imdbId = json.optString("imdb_id")
-
-        var imdbScore: Score? = null
-        if (imdbId.isNotEmpty()) {
-            ApiServices.getOmdbData(imdbId)?.let { ratingStr ->
-                imdbScore = Score.from10(ratingStr.toDouble())
-            }
+        val ref = parseRef(url)
+        if (ref == null) {
+            ClipboardLogger.logAndCopy("load Error", "Không đọc được id từ url: $url")
+            return null
         }
+        val mediaType = ref.type
+        val tmdbIdInt = ref.id
+        try {
+            val response = tmdbGet(if (mediaType == "tv") "/tv/$tmdbIdInt?append_to_response=external_ids" else "/movie/$tmdbIdInt")
+            val json = JSONObject(response)
+            if (json.has("status_code")) throw Exception("TMDB: ${json.optString("status_message")}")
+            val title = json.optString("title", json.optString("name"))
+            val description = json.optString("overview")
+            val poster = poster(json.optString("poster_path"))
+            val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
+            val imdbId = json.optString("imdb_id").ifEmpty { json.optJSONObject("external_ids")?.optString("imdb_id") ?: "" }
 
-        val episodes = mutableListOf<Episode>()
-        if (mediaType == "tv") {
-            val seasonsCount = json.optInt("number_of_seasons", 1)
-            for (s in 1..seasonsCount) {
-                try {
-                    val seasonRes = app.get("$mainUrl/tv/$tmdbId/season/$s?api_key=$TMDB_API_KEY").text
-                    val seasonJson = JSONObject(seasonRes)
-                    val eps = seasonJson.getJSONArray("episodes")
-                    for (e in 0 until eps.length()) {
-                        val ep = eps.getJSONObject(e)
-                        episodes.add(newEpisode("2nembed:tv:$tmdbId:${ep.getInt("season_number")}:${ep.getInt("episode_number")}") {
-                            this.name = ep.optString("name")
-                            this.episode = ep.getInt("episode_number")
-                            this.season = ep.getInt("season_number")
-                            this.description = ep.optString("overview")
-                            this.posterUrl = ep.optString("still_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w300$it" else null }
-                        })
-                    }
-                } catch (e: Exception) {
-                    ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
+            var imdbScore: Score? = null
+            if (imdbId.isNotEmpty()) {
+                TwoEmbedApiServices.getOmdbData(imdbId)?.let { ratingStr ->
+                    ratingStr.toDoubleOrNull()?.let { imdbScore = Score.from10(it) }
                 }
             }
-            return newTvSeriesLoadResponse(title, "2nembed:tv:$tmdbId", TvType.TvSeries, episodes) {
-                this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
+
+            val canonical = "2embed:$mediaType:$tmdbIdInt"
+            if (mediaType == "tv") {
+                val episodes = mutableListOf<Episode>()
+                val seasonsCount = json.optInt("number_of_seasons", 1)
+                for (s in 1..seasonsCount) {
+                    try {
+                        val seasonJson = JSONObject(tmdbGet("/tv/$tmdbIdInt/season/$s"))
+                        val eps = seasonJson.optJSONArray("episodes") ?: continue
+                        for (e in 0 until eps.length()) {
+                            val ep = eps.getJSONObject(e)
+                            val sn = ep.optInt("season_number", s)
+                            val en = ep.optInt("episode_number", e + 1)
+                            episodes.add(newEpisode("2embed:tv:$tmdbIdInt:$sn:$en") {
+                                this.name = ep.optString("name")
+                                this.episode = en
+                                this.season = sn
+                                this.description = ep.optString("overview")
+                                this.posterUrl = img(ep.optString("still_path"), "w300")
+                            })
+                        }
+                    } catch (e: Exception) {
+                        ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
+                    }
+                }
+                return newTvSeriesLoadResponse(title, canonical, TvType.TvSeries, episodes) {
+                    this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
+                }
+            } else {
+                return newMovieLoadResponse(title, canonical, TvType.Movie, canonical) {
+                    this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
+                }
             }
-        } else {
-            return newMovieLoadResponse(title, url, TvType.Movie, "2nembed:movie:$tmdbId") {
-                this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
-            }
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("load Error", "$url -> ${e.message}")
+            return null
         }
     }
 
-    override suspend fun loadLinks(
-        data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit
-    ): Boolean {
+    // =====================================================================================
+    // 4. LOAD LINKS: BẮT LINK TRỰC TIẾP TỪ 2EMBED & VIDSRC.BUZZ
+    // =====================================================================================
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
-        val parts = data.split(":")
-        if (parts.size < 3) return false
-        val type = parts[1]
-        val tmdbId = parts[2]
+        val ref = parseRef(data)
+        if (ref == null) {
+            ClipboardLogger.logAndCopy("Error", "Invalid data format: $data")
+            return false
+        }
+        val type = ref.type
+        val tmdbId = ref.id
+        val season = ref.season
+        val episode = ref.episode
 
-        ApiServices.sendTraktScrobble("start", type, tmdbId.toIntOrNull() ?: 0, 0f,
-            if (type == "tv" && parts.size >= 5) parts[3].toIntOrNull() else null,
-            if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
-        )
+        TwoEmbedApiServices.sendTraktScrobble("start", type, tmdbId, 0f, season, episode)
 
+        val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+
+        // 1. Tạo URL embed 2embed
         val embedUrl = if (type == "movie") {
             "https://www.2embed.cc/embed/$tmdbId"
         } else {
-            if (parts.size < 5) return false
-            "https://www.2embed.cc/embedtv/$tmdbId&s=${parts[3]}&e=${parts[4]}"
+            "https://www.2embed.cc/embedtv/$tmdbId&s=${season ?: 1}&e=${episode ?: 1}"
         }
 
-        val headers = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-            "Referer" to "https://www.2embed.cc/",
-            "Origin" to "https://www.2embed.cc"
-        )
+        var foundLink = false
 
         try {
-            ClipboardLogger.logAndCopy("API Request", "Embed URL: $embedUrl")
-            var currentHtml = app.get(embedUrl, headers = headers).text
-            ClipboardLogger.logAndCopy("Embed Response", currentHtml)
+            // 2. Tải trang 2embed để lấy danh sách server player
+            val embedHtml = app.get(embedUrl, headers = mapOf("User-Agent" to ua, "Referer" to "https://www.2embed.cc/")).text
 
-            fun findIframe(html: String): String? {
-                val idRegex = Regex("""<iframe[^>]*id=["'](iframesrc|framesrc)["'][^>]*src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-                idRegex.find(html)?.let { return it.groupValues[2] }
-                val generalRegex = Regex("""<iframe[^>]*src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-                return generalRegex.find(html)?.groupValues?.get(1)
+            val playerUrls = mutableListOf<String>()
+            val dataSrc = Regex("""data-src=["']([^"']+)["']""").find(embedHtml)?.groupValues?.get(1)
+            if (dataSrc != null) playerUrls.add(dataSrc)
+
+            val goRegex = Regex("""onclick=["']go\(['"]([^'"]+)['"]\)["']""")
+            goRegex.findAll(embedHtml).forEach {
+                val u = it.groupValues[1]
+                if (!playerUrls.contains(u)) playerUrls.add(u)
             }
 
-            var m3u8Url: String? = null
-            var depth = 0
-            val maxDepth = 5
-
-            while (depth < maxDepth) {
-                val m3u8Regex = Regex("""file:\s*["'](.*?m3u8.*?)["']""", RegexOption.IGNORE_CASE)
-                m3u8Url = m3u8Regex.find(currentHtml)?.groupValues?.get(1)
-                    ?: Regex("""(https?://[^"']*\.m3u8[^"']*)""", RegexOption.IGNORE_CASE).find(currentHtml)?.groupValues?.get(1)
-
-                if (m3u8Url != null) {
-                    ClipboardLogger.logAndCopy("Success", "M3U8 URL found at depth $depth: $m3u8Url")
-                    break
-                }
-
-                val nextIframe = findIframe(currentHtml)
-                if (nextIframe == null) {
-                    ClipboardLogger.logAndCopy("Info", "Không tìm thấy iframe ở depth $depth.")
-                    break
-                }
-
-                val absoluteIframeUrl = if (nextIframe.startsWith("http")) {
-                    nextIframe
+            // Mặc định dự phòng nếu trang không quét được trực tiếp
+            if (playerUrls.isEmpty()) {
+                if (type == "movie") {
+                    playerUrls.add("https://vidsrc.buzz/embed/movie/$tmdbId")
+                    playerUrls.add("https://videm.buzz/embed/movie/$tmdbId")
                 } else {
-                    val baseUrl = when {
-                        currentHtml.contains("2embed.skin") -> "https://www.2embed.skin"
-                        currentHtml.contains("movieuniverse.skin") -> "https://movieuniverse.skin"
-                        else -> "https://www.2embed.cc"
+                    playerUrls.add("https://vidsrc.buzz/embed/tv/$tmdbId/${season ?: 1}/${episode ?: 1}")
+                    playerUrls.add("https://videm.buzz/embed/tv/$tmdbId/${season ?: 1}/${episode ?: 1}")
+                }
+            }
+
+            // 3. Quét từng player URL và trích xuất luồng phát
+            for (playerUrl in playerUrls) {
+                try {
+                    val pDomain = Regex("""^(https?://[^/]+)""").find(playerUrl)?.groupValues?.get(1) ?: "https://vidsrc.buzz"
+                    val pHtml = app.get(playerUrl, headers = mapOf("User-Agent" to ua, "Referer" to embedUrl)).text
+
+                    val qMatch = Regex("""var Q\s*=\s*(\{.*?\});""").find(pHtml) ?: continue
+                    val qJson = JSONObject(qMatch.groupValues[1])
+                    val token = qJson.optString("t")
+                    val qType = qJson.optString("type", type)
+                    val qId = qJson.optString("id")
+                    val qS = qJson.optInt("s", season ?: 0)
+                    val qE = qJson.optInt("e", episode ?: 0)
+
+                    val servers = qJson.optJSONObject("ssr")?.optJSONArray("servers") ?: continue
+
+                    // Tải danh sách phụ đề
+                    try {
+                        val subsUrl = "$pDomain/pl/api.php?a=subs&type=$qType&id=$qId&s=$qS&e=$qE&t=${URLEncoder.encode(token, "UTF-8")}"
+                        val subsRes = app.get(subsUrl, headers = mapOf("User-Agent" to ua, "Referer" to playerUrl, "Origin" to pDomain)).text
+                        val subsJson = JSONObject(subsRes)
+                        val subsArray = subsJson.optJSONArray("subtitles") ?: subsJson.optJSONArray("subs")
+                        if (subsArray != null) {
+                            for (i in 0 until subsArray.length()) {
+                                val sub = subsArray.getJSONObject(i)
+                                val label = sub.optString("label", sub.optString("lang", "Subtitle"))
+                                val subRef = sub.optString("ref")
+                                val subDirect = sub.optString("url")
+                                val finalSubUrl = if (subDirect.isNotEmpty()) subDirect else "$pDomain/pl/api.php?a=sub&ref=${URLEncoder.encode(subRef, "UTF-8")}"
+                                subtitleCallback.invoke(SubtitleFile(label, finalSubUrl))
+                            }
+                        }
+                    } catch (e: Exception) {
+                        ClipboardLogger.logAndCopy("Subs Error", e.message ?: "")
                     }
-                    if (nextIframe.startsWith("/")) "$baseUrl$nextIframe" else "$baseUrl/$nextIframe"
+
+                    // Tải luồng phát từ các server
+                    for (i in 0 until servers.length()) {
+                        try {
+                            val serverObj = servers.getJSONObject(i)
+                            val sName = serverObj.optString("name", "Server ${i + 1}")
+                            val sRef = serverObj.optString("ref")
+
+                            val playApiUrl = "$pDomain/pl/api.php?a=play&ref=${URLEncoder.encode(sRef, "UTF-8")}&t=${URLEncoder.encode(token, "UTF-8")}"
+                            val playRes = app.get(playApiUrl, headers = mapOf(
+                                "User-Agent" to ua,
+                                "Referer" to playerUrl,
+                                "Origin" to pDomain,
+                                "Accept" to "application/json"
+                            )).text
+
+                            val playJson = JSONObject(playRes)
+                            var streamUrl = playJson.optString("url")
+                            if (streamUrl.isEmpty()) continue
+
+                            // Xử lý đường dẫn tương đối
+                            if (streamUrl.startsWith("/")) {
+                                streamUrl = if (streamUrl.startsWith("/pl/")) "$pDomain$streamUrl" else "$pDomain/pl$streamUrl"
+                            }
+
+                            callback.invoke(
+                                ExtractorLink(
+                                    source = this.name,
+                                    name = "2embed - $sName",
+                                    url = streamUrl,
+                                    referer = "$pDomain/",
+                                    quality = Qualities.P1080.value,
+                                    type = ExtractorLinkType.M3U8,
+                                    headers = mapOf("Origin" to pDomain, "Referer" to "$pDomain/", "User-Agent" to ua)
+                                )
+                            )
+                            foundLink = true
+                        } catch (e: Exception) {
+                            ClipboardLogger.logAndCopy("Server Play Error", e.message ?: "")
+                        }
+                    }
+                } catch (e: Exception) {
+                    ClipboardLogger.logAndCopy("Player Scraping Error", e.message ?: "")
                 }
-
-                ClipboardLogger.logAndCopy("Iframe Found (depth $depth)", absoluteIframeUrl)
-                currentHtml = app.get(absoluteIframeUrl, headers = headers).text
-                ClipboardLogger.logAndCopy("Iframe Response (depth $depth)", currentHtml)
-                depth++
             }
-
-            if (m3u8Url.isNullOrEmpty()) {
-                ClipboardLogger.logAndCopy("Error", "Không thể tìm thấy link m3u8 sau $depth lớp iframe.")
-                return false
-            }
-
-            ApiServices.sendTraktScrobble("stop", type, tmdbId.toIntOrNull() ?: 0, 100f,
-                if (type == "tv" && parts.size >= 5) parts[3].toIntOrNull() else null,
-                if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
-            )
-
-            val subtitleRegex = Regex("""(https?://[^"']*\.(?:vtt|srt))""", RegexOption.IGNORE_CASE)
-            subtitleRegex.findAll(currentHtml).forEach { match ->
-                val subUrl = match.groupValues[1]
-                if (subUrl.isNotEmpty()) {
-                    subtitleCallback.invoke(SubtitleFile("Unknown", subUrl))
-                }
-            }
-
-            callback.invoke(
-                ExtractorLink(
-                    source = this.name, name = "2nembed", url = m3u8Url, referer = "https://www.2embed.cc/",
-                    quality = Qualities.P1080.value, type = ExtractorLinkType.M3U8, headers = headers
-                )
-            )
-            return true
         } catch (e: Exception) {
-            ClipboardLogger.logAndCopy("Exception", "Error: ${e.message}\nStackTrace: ${e.stackTraceToString()}")
-            return false
+            ClipboardLogger.logAndCopy("LoadLinks Error", e.message ?: "")
         }
+
+        if (foundLink) {
+            TwoEmbedApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
+        }
+        return foundLink
     }
 }
