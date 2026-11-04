@@ -6,4 +6,5 @@ include(":Vidsrcto")
 include(":Hnembed")
 include(":2embed")
 include(":Okru")
+include(":Krx18")
 rootProject.name = "CloudstreamPlugins"
