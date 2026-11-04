@@ -1,4 +1,4 @@
-package com.krx18
+package com.lagradost
 
 import android.content.ClipData
 import android.content.ClipboardManager
