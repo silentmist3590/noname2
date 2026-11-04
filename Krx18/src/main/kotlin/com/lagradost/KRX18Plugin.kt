@@ -5,7 +5,7 @@ import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
 
 @CloudstreamPlugin
-class KRX18ProviderPlugin : Plugin() {
+class KRX18Plugin : Plugin() {
     override fun load(context: Context) {
         registerMainAPI(KRX18Provider())
     }
