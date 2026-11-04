@@ -8,6 +8,7 @@ import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -24,6 +25,7 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
 import org.jsoup.nodes.Element
+import java.net.URI
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -105,7 +107,7 @@ class KRX18Provider : MainAPI() {
     }
 
     // =====================================================================================
-    // WebView Sniffer: Bắt URL stream (.m3u8 hoặc .mp4) ngầm từ WebView
+    // WebView Sniffer: Hook trực tiếp hàm player_9stream và bắt link chuẩn xác
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun sniffStream(
@@ -142,13 +144,10 @@ class KRX18Provider : MainAPI() {
                         cont.resume(res)
                     }
 
-                    // Tự động kết thúc sau 20 giây nếu không có kết quả
+                    // Tự động kết thúc sau 20 giây nếu không bắt được
                     handler.postDelayed({
                         if (!finished) finish(null)
                     }, 20000)
-
-                    val streamRegex = Regex("""\.m3u8|\.mp4""", RegexOption.IGNORE_CASE)
-                    val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
 
                     wv.settings.apply {
                         javaScriptEnabled = true
@@ -161,8 +160,73 @@ class KRX18Provider : MainAPI() {
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
 
+                    // Hook trực tiếp các hàm player để lấy đúng URL stream gốc
+                    val hookScript = """
+                        (function() {
+                            try {
+                                Object.defineProperty(window, 'top', { get: function() { return null; } });
+                            } catch(e) {}
+
+                            if (!window.__krx_hooked) {
+                                window.__krx_hooked = true;
+
+                                // Hook player_9stream
+                                var checkPlayer9 = setInterval(function() {
+                                    if (typeof window.player_9stream === 'function') {
+                                        clearInterval(checkPlayer9);
+                                        var orig9 = window.player_9stream;
+                                        window.player_9stream = function(playlist, ver) {
+                                            if (playlist && typeof playlist === 'string' && playlist.indexOf('http') === 0) {
+                                                console.log('REAL_KRX_STREAM:' + playlist);
+                                            }
+                                            return orig9.apply(this, arguments);
+                                        };
+                                    }
+                                }, 50);
+
+                                // Hook JWPlayer
+                                var checkJw = setInterval(function() {
+                                    if (typeof window.jwplayer === 'function') {
+                                        try {
+                                            var p = window.jwplayer("mediaplayer");
+                                            if (p && typeof p.on === 'function') {
+                                                clearInterval(checkJw);
+                                                p.on('ready', function() {
+                                                    try {
+                                                        var pl = p.getPlaylist();
+                                                        if (pl && pl[0] && pl[0].sources) {
+                                                            for (var i = 0; i < pl[0].sources.length; i++) {
+                                                                var f = pl[0].sources[i].file;
+                                                                if (f && f.indexOf('http') === 0) {
+                                                                    console.log('REAL_KRX_STREAM:' + f);
+                                                                }
+                                                            }
+                                                        }
+                                                    } catch(e) {}
+                                                    try { p.play(); } catch(e) {}
+                                                });
+                                            }
+                                        } catch(e) {}
+                                    }
+                                }, 100);
+                            }
+                        })();
+                    """.trimIndent()
+
                     wv.webChromeClient = object : WebChromeClient() {
                         override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
+
+                        override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                            val msg = consoleMessage?.message() ?: return super.onConsoleMessage(consoleMessage)
+                            if (msg.startsWith("REAL_KRX_STREAM:")) {
+                                val stream = msg.removePrefix("REAL_KRX_STREAM:").trim()
+                                if (stream.startsWith("http")) {
+                                    handler.post { finish(stream) }
+                                    return true
+                                }
+                            }
+                            return super.onConsoleMessage(consoleMessage)
+                        }
                     }
 
                     val clickJs = """
@@ -190,6 +254,7 @@ class KRX18Provider : MainAPI() {
                         if (finished) return
                         taps++
                         try {
+                            wv.evaluateJavascript(hookScript, null)
                             wv.evaluateJavascript(clickJs, null)
                             val t = SystemClock.uptimeMillis()
                             val d = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, w / 2f, h / 2f, 0)
@@ -207,7 +272,15 @@ class KRX18Provider : MainAPI() {
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                             val u = request?.url?.toString() ?: return null
-                            if (!junkRegex.containsMatchIn(u) && streamRegex.containsMatchIn(u)) {
+                            // Loại trừ tuyệt đối các request rác, beacon, tracking, scripts
+                            if (u.contains("beacon") || u.contains("/view/") || u.contains("cdn-cgi") ||
+                                u.contains("cloudflare") || u.contains("analytics") || u.contains(".js") ||
+                                u.contains(".css") || u.contains(".svg") || u.contains(".ico")) {
+                                return null
+                            }
+
+                            // Chỉ bắt nếu URL thực sự kết thúc bằng .m3u8 hoặc .mp4 thực thụ
+                            if ((u.contains(".m3u8") || u.contains(".mp4")) && u.startsWith("http")) {
                                 handler.post {
                                     finish(u)
                                 }
@@ -221,7 +294,12 @@ class KRX18Provider : MainAPI() {
                             return !ok
                         }
 
+                        override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                            wv.evaluateJavascript(hookScript, null)
+                        }
+
                         override fun onPageFinished(view: WebView?, url: String?) {
+                            wv.evaluateJavascript(hookScript, null)
                             handler.postDelayed({ tap() }, 600)
                         }
                     }
@@ -296,13 +374,42 @@ class KRX18Provider : MainAPI() {
                     if (!loaded || fixedUrl.contains("playkrx18") || fixedUrl.contains("mov18plus")) {
                         val streamUrl = sniffStream(fixedUrl, data)
                         if (!streamUrl.isNullOrBlank()) {
+                            val uri = try { URI(fixedUrl) } catch (_: Exception) { null }
+                            val origin = if (uri != null) "${uri.scheme}://${uri.host}" else "https://play.playkrx18.site"
+                            val reqHeaders = mapOf(
+                                "Referer" to fixedUrl,
+                                "Origin" to origin
+                            )
+
                             if (streamUrl.contains(".m3u8")) {
-                                M3u8Helper.generateM3u8(
-                                    source = serverTitle,
-                                    streamUrl = streamUrl,
-                                    referer = fixedUrl,
-                                    headers = mapOf("Referer" to fixedUrl, "Origin" to fixedUrl.substringBeforeLast("/"))
-                                ).forEach(callback)
+                                var generated = false
+                                try {
+                                    val links = M3u8Helper.generateM3u8(
+                                        source = serverTitle,
+                                        streamUrl = streamUrl,
+                                        referer = fixedUrl,
+                                        headers = reqHeaders
+                                    )
+                                    if (links.isNotEmpty()) {
+                                        links.forEach(callback)
+                                        generated = true
+                                    }
+                                } catch (_: Exception) {}
+
+                                // Fallback đẩy trực tiếp M3U8 link nếu generateM3u8 không phân giải được
+                                if (!generated) {
+                                    callback.invoke(
+                                        newExtractorLink(
+                                            name = "$serverTitle HLS",
+                                            source = serverTitle,
+                                            url = streamUrl,
+                                            type = ExtractorLinkType.M3U8
+                                        ) {
+                                            this.referer = fixedUrl
+                                            this.headers = reqHeaders
+                                        }
+                                    )
+                                }
                             } else {
                                 callback.invoke(
                                     newExtractorLink(
@@ -312,6 +419,7 @@ class KRX18Provider : MainAPI() {
                                         type = ExtractorLinkType.VIDEO
                                     ) {
                                         this.referer = fixedUrl
+                                        this.headers = reqHeaders
                                         this.quality = Qualities.Unknown.value
                                     }
                                 )
