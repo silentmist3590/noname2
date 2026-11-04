@@ -29,7 +29,7 @@ private fun parseRef(s: String): MediaRef? {
 // =====================================================================================
 // 2. CÁC HÀM GỌI API HỖ TRỢ (OMDb, Trakt)
 // =====================================================================================
-object TwoEmbedApiServices {
+object TwoNembedApiServices {
     suspend fun getOmdbData(imdbId: String): String? {
         return try {
             val res = app.get("https://www.omdbapi.com/?apikey=$OMDB_API_KEY&i=$imdbId").text
@@ -72,9 +72,9 @@ object TwoEmbedApiServices {
 }
 
 // =====================================================================================
-// 3. LỚP PROVIDER CHÍNH
+// 3. LỚP PROVIDER CHÍNH (TwoNembedProvider)
 // =====================================================================================
-class TwoEmbedProvider : MainAPI() {
+class TwoNembedProvider : MainAPI() {
     override var mainUrl = "https://www.2embed.cc"
     override var name = "2embed"
     override var lang = "en"
@@ -181,7 +181,7 @@ class TwoEmbedProvider : MainAPI() {
 
             var imdbScore: Score? = null
             if (imdbId.isNotEmpty()) {
-                TwoEmbedApiServices.getOmdbData(imdbId)?.let { ratingStr ->
+                TwoNembedApiServices.getOmdbData(imdbId)?.let { ratingStr ->
                     ratingStr.toDoubleOrNull()?.let { imdbScore = Score.from10(it) }
                 }
             }
@@ -240,11 +240,10 @@ class TwoEmbedProvider : MainAPI() {
         val season = ref.season
         val episode = ref.episode
 
-        TwoEmbedApiServices.sendTraktScrobble("start", type, tmdbId, 0f, season, episode)
+        TwoNembedApiServices.sendTraktScrobble("start", type, tmdbId, 0f, season, episode)
 
         val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
 
-        // 1. Tạo URL embed 2embed
         val embedUrl = if (type == "movie") {
             "https://www.2embed.cc/embed/$tmdbId"
         } else {
@@ -254,7 +253,6 @@ class TwoEmbedProvider : MainAPI() {
         var foundLink = false
 
         try {
-            // 2. Tải trang 2embed để lấy danh sách server player
             val embedHtml = app.get(embedUrl, headers = mapOf("User-Agent" to ua, "Referer" to "https://www.2embed.cc/")).text
 
             val playerUrls = mutableListOf<String>()
@@ -267,7 +265,6 @@ class TwoEmbedProvider : MainAPI() {
                 if (!playerUrls.contains(u)) playerUrls.add(u)
             }
 
-            // Mặc định dự phòng nếu trang không quét được trực tiếp
             if (playerUrls.isEmpty()) {
                 if (type == "movie") {
                     playerUrls.add("https://vidsrc.buzz/embed/movie/$tmdbId")
@@ -278,7 +275,6 @@ class TwoEmbedProvider : MainAPI() {
                 }
             }
 
-            // 3. Quét từng player URL và trích xuất luồng phát
             for (playerUrl in playerUrls) {
                 try {
                     val pDomain = Regex("""^(https?://[^/]+)""").find(playerUrl)?.groupValues?.get(1) ?: "https://vidsrc.buzz"
@@ -333,7 +329,6 @@ class TwoEmbedProvider : MainAPI() {
                             var streamUrl = playJson.optString("url")
                             if (streamUrl.isEmpty()) continue
 
-                            // Xử lý đường dẫn tương đối
                             if (streamUrl.startsWith("/")) {
                                 streamUrl = if (streamUrl.startsWith("/pl/")) "$pDomain$streamUrl" else "$pDomain/pl$streamUrl"
                             }
@@ -363,8 +358,11 @@ class TwoEmbedProvider : MainAPI() {
         }
 
         if (foundLink) {
-            TwoEmbedApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
+            TwoNembedApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
         }
         return foundLink
     }
 }
+
+// Typealias để tương thích cả 2 cách gọi
+typealias TwoEmbedProvider = TwoNembedProvider
