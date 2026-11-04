@@ -1,4 +1,4 @@
-package com.KRX18
+package com.lagradost
 
 import android.annotation.SuppressLint
 import android.content.Context
