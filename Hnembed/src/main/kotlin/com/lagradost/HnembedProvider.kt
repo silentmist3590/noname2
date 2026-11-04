@@ -395,7 +395,6 @@ class HnembedProvider : MainAPI() {
     // 5. LOAD LINKS: KẾT HỢP DỰ PHÒNG CÁC HOST (hnembed.cc -> vidsrc.sh -> vidsrc.io)
     // =====================================================================================
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
-        ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         val ref = parseRef(data)
         if (ref == null) {
