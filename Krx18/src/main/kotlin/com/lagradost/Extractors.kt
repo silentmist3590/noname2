@@ -1,4 +1,4 @@
-package com.KRX18
+package com.lagradost
 
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorApi
