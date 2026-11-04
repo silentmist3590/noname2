@@ -1,30 +1,50 @@
 package com.lagradost
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
-import android.util.Base64
-import android.webkit.JavascriptInterface
+import android.os.SystemClock
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URI
-import java.net.URL
-import java.net.URLEncoder
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 
+// =====================================================================================
+// 1. CẤU HÌNH API KEY VÀ ĐỊNH DANH
+// =====================================================================================
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
 private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
 private const val TRAKT_ACCESS_TOKEN = ""
 
+// Định danh an toàn bằng Regex để tránh lỗi CloudStream fixUrl nối mainUrl vào trước
+private val ID_REGEX = Regex("""(movie|tv):(\d+)(?::(\d+):(\d+))?""")
+
+private class MediaRef(val type: String, val id: Int, val season: Int?, val episode: Int?)
+
+private fun parseRef(s: String): MediaRef? {
+    val m = ID_REGEX.find(s) ?: return null
+    val id = m.groupValues[2].toIntOrNull() ?: return null
+    return MediaRef(m.groupValues[1], id, m.groupValues[3].toIntOrNull(), m.groupValues[4].toIntOrNull())
+}
+
+// =====================================================================================
+// 2. CÁC HÀM GỌI API HỖ TRỢ (OMDb, Trakt)
+// =====================================================================================
 object ApiServices {
     suspend fun getOmdbData(imdbId: String): String? {
         return try {
@@ -42,25 +62,22 @@ object ApiServices {
         if (TRAKT_ACCESS_TOKEN.isEmpty()) return
         val url = "https://api.trakt.tv/scrobble/$action"
         val headers = mapOf(
-            "Content-Type" to "application/json",
-            "trakt-api-version" to "2",
-            "trakt-api-key" to TRAKT_CLIENT_ID,
-            "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
+            "Content-Type" to "application/json", "trakt-api-version" to "2",
+            "trakt-api-key" to TRAKT_CLIENT_ID, "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
         )
-        val body = JSONObject().apply {
-            put("progress", progress)
-            if (type == "movie") {
-                val movie = JSONObject()
-                val ids = JSONObject()
-                ids.put("tmdb", tmdbId)
-                movie.put("ids", ids)
-                put("movie", movie)
-            } else {
-                val episodeObj = JSONObject()
-                episodeObj.put("season", season ?: 1)
-                episodeObj.put("number", episode ?: 1)
-                put("episode", episodeObj)
-            }
+        val body = JSONObject()
+        body.put("progress", progress)
+        if (type == "movie") {
+            val movie = JSONObject()
+            val ids = JSONObject()
+            ids.put("tmdb", tmdbId)
+            movie.put("ids", ids)
+            body.put("movie", movie)
+        } else {
+            val episodeObj = JSONObject()
+            episodeObj.put("season", season ?: 1)
+            episodeObj.put("number", episode ?: 1)
+            body.put("episode", episodeObj)
         }
         try {
             app.post(url, headers = headers, json = body).text
@@ -70,380 +87,395 @@ object ApiServices {
     }
 }
 
+// =====================================================================================
+// 3. LỚP PROVIDER CHÍNH
+// =====================================================================================
 class HnembedProvider : MainAPI() {
-    override var mainUrl = TMDB_BASE_URL
+    override var mainUrl = "https://hnembed.cc"
     override var name = "Hnembed"
     override var lang = "en"
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    companion object {
-        var pluginContext: Context? = null
-
-        fun getAppContext(): Context? {
-            return pluginContext
-                ?: runCatching {
-                    Class.forName("com.lagradost.cloudstream3.AcraApplication")
-                        .getDeclaredField("context")
-                        .apply { isAccessible = true }
-                        .get(null) as? Context
-                }.getOrNull()
-                ?: runCatching {
-                    Class.forName("android.app.ActivityThread")
-                        .getMethod("currentApplication")
-                        .invoke(null) as? Context
-                }.getOrNull()
-        }
-    }
-
-    private val userAgent =
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-
-    private fun fetchBytes(targetUrl: String, referer: String): ByteArray {
-        val conn = URL(targetUrl).openConnection() as HttpURLConnection
-        conn.setRequestProperty("User-Agent", userAgent)
-        conn.setRequestProperty("Referer", referer)
-        conn.connectTimeout = 12000
-        conn.readTimeout = 12000
-        return conn.inputStream.use { it.readBytes() }
-    }
-
     override val mainPage = mainPageOf(
-        "$mainUrl/trending/all/day?api_key=$TMDB_API_KEY" to "Trending Today",
-        "$mainUrl/movie/popular?api_key=$TMDB_API_KEY" to "Popular Movies",
-        "$mainUrl/tv/popular?api_key=$TMDB_API_KEY" to "Popular TV Shows"
+        "/trending/all/day" to "Trending Today",
+        "/movie/popular" to "Popular Movies",
+        "/tv/popular" to "Popular TV Shows"
     )
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val response = app.get("${request.data}&page=$page").text
-        val json = JSONObject(response)
-        val results = json.getJSONArray("results")
-        val home = mutableListOf<SearchResponse>()
+    // Ảnh TMDB qua CDN wsrv.nl để không bị nhà mạng chặn tại VN
+    private fun img(path: String?, size: String = "w500") =
+        path?.takeIf { it.isNotEmpty() && it != "null" }?.let { "https://wsrv.nl/?url=image.tmdb.org/t/p/$size$it" }
 
-        for (i in 0 until results.length()) {
-            val item = results.getJSONObject(i)
-            val mediaType = item.optString("media_type", if (request.name.contains("TV")) "tv" else "movie")
-            val id = item.getInt("id").toString()
-            val title = item.optString("title", item.optString("name"))
-            val poster = item.optString("poster_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w500$it" else null }
-            home.add(newMovieSearchResponse(title, "hnembed:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
-                this.posterUrl = poster
-            })
+    private fun poster(path: String?) = img(path, "w500")
+
+    // Danh sách host TMDB fallback
+    private val tmdbHosts = listOf(TMDB_BASE_URL, "https://api.tmdb.org/3", "https://api.themoviedb.org/3")
+
+    private suspend fun tmdbGet(path: String): String {
+        var last: Exception? = null
+        val sep = if (path.contains("?")) "&" else "?"
+        for (host in tmdbHosts) {
+            try {
+                val r = app.get("$host$path${sep}api_key=$TMDB_API_KEY")
+                if (r.code == 200 && r.text.trimStart().startsWith("{")) return r.text
+                last = Exception("HTTP ${r.code} @ $host")
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                last = e
+            }
+            ClipboardLogger.logAndCopy("TMDB fallback", "${last?.message} (path=$path)")
         }
-        return newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
+        throw last ?: Exception("TMDB failed")
+    }
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        return try {
+            val response = tmdbGet("${request.data}?page=$page")
+            val json = JSONObject(response)
+            val results = json.optJSONArray("results") ?: throw Exception(json.optString("status_message", "TMDB không trả results"))
+            val home = mutableListOf<SearchResponse>()
+            for (i in 0 until results.length()) {
+                val item = results.getJSONObject(i)
+                val mediaType = item.optString("media_type", if (request.name.contains("TV")) "tv" else "movie")
+                if (mediaType != "movie" && mediaType != "tv") continue
+                val id = item.optInt("id", 0)
+                if (id == 0) continue
+                val title = item.optString("title", item.optString("name"))
+                home.add(newMovieSearchResponse(title, "hnembed:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
+                    this.posterUrl = poster(item.optString("poster_path"))
+                })
+            }
+            newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("getMainPage Error", e.message ?: "Unknown")
+            newHomePageResponse(request.name, emptyList(), hasNext = false)
+        }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val response = app.get("$mainUrl/search/multi?api_key=$TMDB_API_KEY&query=$query").text
-        val json = JSONObject(response)
-        val results = json.getJSONArray("results")
-        val searchResults = mutableListOf<SearchResponse>()
-
-        for (i in 0 until results.length()) {
-            val item = results.getJSONObject(i)
-            val mediaType = item.optString("media_type")
-            if (mediaType != "movie" && mediaType != "tv") continue
-            val id = item.getInt("id").toString()
-            val title = item.optString("title", item.optString("name"))
-            val poster = item.optString("poster_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w500$it" else null }
-            searchResults.add(newMovieSearchResponse(title, "hnembed:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
-                this.posterUrl = poster
-            })
+        return try {
+            val q = java.net.URLEncoder.encode(query, "UTF-8")
+            val json = JSONObject(tmdbGet("/search/multi?query=$q"))
+            val results = json.optJSONArray("results") ?: return emptyList()
+            val out = mutableListOf<SearchResponse>()
+            for (i in 0 until results.length()) {
+                val item = results.getJSONObject(i)
+                val mediaType = item.optString("media_type")
+                if (mediaType != "movie" && mediaType != "tv") continue
+                val id = item.optInt("id", 0)
+                if (id == 0) continue
+                val title = item.optString("title", item.optString("name"))
+                out.add(newMovieSearchResponse(title, "hnembed:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
+                    this.posterUrl = poster(item.optString("poster_path"))
+                })
+            }
+            out
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("Search Error", e.message ?: "Unknown")
+            emptyList()
         }
-        return searchResults
     }
 
     override suspend fun load(url: String): LoadResponse? {
-        val parts = url.split(":")
-        if (parts.size < 3) return null
-        val mediaType = parts[1]
-        val tmdbId = parts[2]
-
-        val response = app.get("$mainUrl/$mediaType/$tmdbId?api_key=$TMDB_API_KEY").text
-        val json = JSONObject(response)
-        val title = json.optString("title", json.optString("name"))
-        val description = json.optString("overview")
-        val poster = json.optString("poster_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w500$it" else null }
-        val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
-        val imdbId = json.optString("imdb_id")
-
-        var imdbScore: Score? = null
-        if (imdbId.isNotEmpty()) {
-            ApiServices.getOmdbData(imdbId)?.let { ratingStr ->
-                imdbScore = Score.from10(ratingStr.toDouble())
-            }
+        val ref = parseRef(url)
+        if (ref == null) {
+            ClipboardLogger.logAndCopy("load Error", "Không đọc được id từ url: $url")
+            return null
         }
-
-        val episodes = mutableListOf<Episode>()
-        if (mediaType == "tv") {
-            val seasonsCount = json.optInt("number_of_seasons", 1)
-            for (s in 1..seasonsCount) {
-                try {
-                    val seasonRes = app.get("$mainUrl/tv/$tmdbId/season/$s?api_key=$TMDB_API_KEY").text
-                    val seasonJson = JSONObject(seasonRes)
-                    val eps = seasonJson.getJSONArray("episodes")
-                    for (e in 0 until eps.length()) {
-                        val ep = eps.getJSONObject(e)
-                        episodes.add(newEpisode("hnembed:tv:$tmdbId:${ep.getInt("season_number")}:${ep.getInt("episode_number")}") {
-                            this.name = ep.optString("name")
-                            this.episode = ep.getInt("episode_number")
-                            this.season = ep.getInt("season_number")
-                            this.description = ep.optString("overview")
-                            this.posterUrl = ep.optString("still_path").let { if (it.isNotEmpty()) "https://image.tmdb.org/t/p/w300$it" else null }
-                        })
-                    }
-                } catch (e: Exception) {
-                    ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
-                }
-            }
-            return newTvSeriesLoadResponse(title, "hnembed:tv:$tmdbId", TvType.TvSeries, episodes) {
-                this.posterUrl = poster
-                this.plot = description
-                this.year = year
-                this.score = imdbScore
-            }
-        } else {
-            return newMovieLoadResponse(title, url, TvType.Movie, "hnembed:movie:$tmdbId") {
-                this.posterUrl = poster
-                this.plot = description
-                this.year = year
-                this.score = imdbScore
-            }
-        }
-    }
-
-    /**
-     * Giải mã chuỗi stream_urls qua WebAssembly bằng WebView ngầm của Android
-     * Sử dụng CountDownLatch của Java chuẩn thay cho kotlinx-coroutines để build không lỗi
-     */
-    private fun decryptWasmInWebView(wasmBytes: ByteArray, encB64: String): String? {
-        val ctx = getAppContext() ?: return null
-        val wasmBase64 = Base64.encodeToString(wasmBytes, Base64.NO_WRAP)
-        val latch = CountDownLatch(1)
-        var resultText: String? = null
-
-        Handler(Looper.getMainLooper()).post {
-            try {
-                val webView = WebView(ctx)
-                webView.settings.javaScriptEnabled = true
-                webView.settings.domStorageEnabled = true
-
-                fun cleanup() {
-                    runCatching {
-                        webView.stopLoading()
-                        webView.removeJavascriptInterface("Bridge")
-                        webView.destroy()
-                    }
-                }
-
-                webView.addJavascriptInterface(object {
-                    @JavascriptInterface
-                    fun onSuccess(txt: String) {
-                        resultText = txt
-                        cleanup()
-                        latch.countDown()
-                    }
-
-                    @JavascriptInterface
-                    fun onError(err: String) {
-                        cleanup()
-                        latch.countDown()
-                    }
-                }, "Bridge")
-
-                val html = """
-                    <!DOCTYPE html><html><head></head><body><script>
-                    (async function() {
-                        try {
-                            var binW = atob("$wasmBase64");
-                            var wBytes = new Uint8Array(binW.length);
-                            for (var i = 0; i < binW.length; i++) wBytes[i] = binW.charCodeAt(i);
-                            var mod = await WebAssembly.compile(wBytes);
-                            var inst = await WebAssembly.instantiate(mod, {});
-                            var ex = inst.exports;
-                            var binE = atob("$encB64");
-                            var eBytes = new Uint8Array(binE.length);
-                            for (var i = 0; i < binE.length; i++) eBytes[i] = binE.charCodeAt(i);
-                            var ptr = ex.alloc(eBytes.length);
-                            new Uint8Array(ex.memory.buffer, ptr, eBytes.length).set(eBytes);
-                            var outLen = ex.decrypt(ptr, eBytes.length);
-                            var txt = new TextDecoder().decode(new Uint8Array(ex.memory.buffer, ptr + 12, outLen));
-                            Bridge.onSuccess(txt);
-                        } catch(e) {
-                            Bridge.onError(e.message || String(e));
-                        }
-                    })();
-                    </script></body></html>
-                """.trimIndent()
-
-                webView.loadDataWithBaseURL("https://stellarconductornexus.com/", html, "text/html", "UTF-8", null)
-            } catch (e: Exception) {
-                latch.countDown()
-            }
-        }
-
-        latch.await(12, TimeUnit.SECONDS)
-        return resultText
-    }
-
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
-        val parts = data.split(":")
-        if (parts.size < 3) return false
-        val type = parts[1]
-        val tmdbId = parts[2]
-
-        ApiServices.sendTraktScrobble(
-            "start", type, tmdbId.toIntOrNull() ?: 0, 0f,
-            if (type == "tv" && parts.size >= 5) parts[3].toIntOrNull() else null,
-            if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
-        )
-
+        val mediaType = ref.type
+        val tmdbIdInt = ref.id
         try {
-            // Bước 1: Gọi vs_src.php từ hnembed.cc để lấy link Player
-            val vsSrcUrl = if (type == "movie") {
-                "https://hnembed.cc/vs_src.php?type=movie&id=$tmdbId"
-            } else {
-                if (parts.size < 5) return false
-                "https://hnembed.cc/vs_src.php?type=tv&id=$tmdbId&season=${parts[3]}&episode=${parts[4]}"
-            }
+            val response = tmdbGet(if (mediaType == "tv") "/tv/$tmdbIdInt?append_to_response=external_ids" else "/movie/$tmdbIdInt")
+            val json = JSONObject(response)
+            if (json.has("status_code")) throw Exception("TMDB: ${json.optString("status_message")}")
+            val title = json.optString("title", json.optString("name"))
+            val description = json.optString("overview")
+            val poster = poster(json.optString("poster_path"))
+            val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
+            val imdbId = json.optString("imdb_id").ifEmpty { json.optJSONObject("external_ids")?.optString("imdb_id") ?: "" }
 
-            val hnHeaders = mapOf(
-                "User-Agent" to userAgent,
-                "Referer" to "https://hnembed.cc/"
-            )
-
-            ClipboardLogger.logAndCopy("API Request", "Calling vs_src: $vsSrcUrl")
-            val vsSrcResp = app.get(vsSrcUrl, headers = hnHeaders).text
-            val embedSrc = JSONObject(vsSrcResp).optString("src")
-            if (embedSrc.isBlank()) {
-                ClipboardLogger.logAndCopy("Error", "Không nhận được embed src từ vs_src.php")
-                return false
-            }
-
-            // Bước 2: Tải trang embed để lấy playerUrl
-            val embedHtml = app.get(embedSrc, headers = hnHeaders).text
-            val playerPathMatch = Regex("""["']playerUrl["']\s*:\s*["']([^"']+)["']""").find(embedHtml)
-            val playerPath = playerPathMatch?.groupValues?.get(1)?.replace("\\u0026", "&")
-            if (playerPath.isNullOrBlank()) {
-                ClipboardLogger.logAndCopy("Error", "Không tìm thấy playerUrl trong trang embed")
-                return false
-            }
-
-            val playerHost = "https://stellarconductornexus.com"
-            val playerFullUrl = if (playerPath.startsWith("http")) playerPath else "$playerHost$playerPath"
-
-            // Bước 3: Tải trang Player để lấy CONFIG (apiToken dùng một lần)
-            val playerHeaders = mapOf(
-                "User-Agent" to userAgent,
-                "Referer" to embedSrc
-            )
-            val playerHtml = app.get(playerFullUrl, headers = playerHeaders).text
-            val configMatch = Regex("""window\.CONFIG\s*=\s*(\{.*?\});""").find(playerHtml)
-            if (configMatch == null) {
-                ClipboardLogger.logAndCopy("Error", "Không tìm thấy window.CONFIG trong Player HTML")
-                return false
-            }
-
-            val configJson = JSONObject(configMatch.groupValues[1].replace("\\u0026", "&"))
-            val streamBaseApi = configJson.getString("api")
-            val apiToken = configJson.optString("apiToken")
-
-            // Bước 4: Gọi API stream_urls có gắn api_token
-            val streamApiUrl = "$streamBaseApi&api_token=" + URLEncoder.encode(apiToken, "UTF-8")
-            val streamDataHeaders = mapOf(
-                "User-Agent" to userAgent,
-                "Referer" to "$playerHost/"
-            )
-            val streamDataResp = app.get(streamApiUrl, headers = streamDataHeaders).text
-            val streamJson = JSONObject(streamDataResp)
-
-            val dataObj = streamJson.optJSONObject("data")
-            val encStreamUrls = dataObj?.optString("stream_urls")
-            val wasmUrl = streamJson.optJSONObject("vs")?.optString("wasm_url")
-
-            if (encStreamUrls.isNullOrBlank() || wasmUrl.isNullOrBlank()) {
-                ClipboardLogger.logAndCopy("Error", "Không nhận được stream_urls mã hóa hoặc wasm_url")
-                return false
-            }
-
-            // Bước 5: Tải file WebAssembly (.wasm) trực tiếp
-            val wasmBytes = fetchBytes(wasmUrl, "$playerHost/")
-
-            // Bước 6: Giải mã chuỗi stream_urls qua WebAssembly
-            val decryptedUrlsText = decryptWasmInWebView(wasmBytes, encStreamUrls)
-            if (decryptedUrlsText.isNullOrBlank()) {
-                ClipboardLogger.logAndCopy("Error", "Giải mã WebAssembly thất bại hoặc trả về rỗng")
-                return false
-            }
-
-            val rawStreamList = decryptedUrlsText.split("\n").map { it.trim() }.filter { it.isNotBlank() }
-            if (rawStreamList.isEmpty()) {
-                ClipboardLogger.logAndCopy("Error", "Danh sách URL sau khi giải mã rỗng")
-                return false
-            }
-
-            // Bước 7: Với mỗi luồng m3u8, lấy Token JWT từ generate.php và đóng dấu
-            var addedLinkCount = 0
-            for ((index, rawM3u8Url) in rawStreamList.withIndex()) {
-                val streamOrigin = try {
-                    val u = URI(rawM3u8Url)
-                    "${u.scheme}://${u.host}"
-                } catch (e: Exception) {
-                    "https://birchandbloom.space"
+            var imdbScore: Score? = null
+            if (imdbId.isNotEmpty()) {
+                ApiServices.getOmdbData(imdbId)?.let { ratingStr ->
+                    ratingStr.toDoubleOrNull()?.let { imdbScore = Score.from10(it) }
                 }
+            }
 
-                val token = runCatching {
-                    app.get(
-                        "$streamOrigin/generate.php",
-                        headers = mapOf(
-                            "Referer" to "$playerHost/",
-                            "Origin" to playerHost
-                        )
-                    ).text.trim()
-                }.getOrNull() ?: ""
-
-                val playableM3u8 = if (token.isNotBlank()) {
-                    if (rawM3u8Url.contains("?")) "$rawM3u8Url&token=$token" else "$rawM3u8Url?token=$token"
-                } else {
-                    rawM3u8Url
-                }
-
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = "Hnembed - Server ${index + 1}",
-                        url = playableM3u8,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.headers = mapOf(
-                            "Referer" to "$playerHost/",
-                            "Origin" to playerHost,
-                            "User-Agent" to userAgent
-                        )
-                        this.quality = Qualities.P1080.value
+            val canonical = "hnembed:$mediaType:$tmdbIdInt"
+            if (mediaType == "tv") {
+                val episodes = mutableListOf<Episode>()
+                val seasonsCount = json.optInt("number_of_seasons", 1)
+                for (s in 1..seasonsCount) {
+                    try {
+                        val seasonJson = JSONObject(tmdbGet("/tv/$tmdbIdInt/season/$s"))
+                        val eps = seasonJson.optJSONArray("episodes") ?: continue
+                        for (e in 0 until eps.length()) {
+                            val ep = eps.getJSONObject(e)
+                            val sn = ep.optInt("season_number", s)
+                            val en = ep.optInt("episode_number", e + 1)
+                            episodes.add(newEpisode("hnembed:tv:$tmdbIdInt:$sn:$en") {
+                                this.name = ep.optString("name")
+                                this.episode = en
+                                this.season = sn
+                                this.description = ep.optString("overview")
+                                this.posterUrl = img(ep.optString("still_path"), "w300")
+                            })
+                        }
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
                     }
-                )
-                addedLinkCount++
+                }
+                return newTvSeriesLoadResponse(title, canonical, TvType.TvSeries, episodes) {
+                    this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
+                }
+            } else {
+                return newMovieLoadResponse(title, canonical, TvType.Movie, canonical) {
+                    this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
+                }
             }
-
-            ApiServices.sendTraktScrobble(
-                "stop", type, tmdbId.toIntOrNull() ?: 0, 100f,
-                if (type == "tv" && parts.size >= 5) parts[3].toIntOrNull() else null,
-                if (type == "tv" && parts.size >= 5) parts[4].toIntOrNull() else null
-            )
-
-            ClipboardLogger.logAndCopy("Success", "Đã nạp thành công $addedLinkCount nguồn phát HLS.")
-            return addedLinkCount > 0
-
         } catch (e: Exception) {
-            ClipboardLogger.logAndCopy("Exception", "Error: ${e.message}\nStackTrace: ${e.stackTraceToString()}")
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("load Error", "$url -> ${e.message}")
+            return null
+        }
+    }
+
+    // =====================================================================================
+    // 4. BẮT LINK BẰNG WEBVIEW ẨN (SNIFF STREAM)
+    // Chạy ngầm player, tự click play, bắt link .m3u8 và phụ đề tự động
+    // =====================================================================================
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun sniffStream(
+        pageUrl: String,
+        referer: String,
+        ua: String,
+        seen: MutableList<String>,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ): String? {
+        return suspendCoroutine { cont ->
+            val handler = Handler(Looper.getMainLooper())
+            handler.post {
+                val appCtx: Context? = try {
+                    CloudStreamApp.context
+                } catch (_: Throwable) {
+                    try {
+                        val activityThread = Class.forName("android.app.ActivityThread")
+                        val method = activityThread.getMethod("currentApplication")
+                        method.invoke(null) as? Context
+                    } catch (_: Throwable) {
+                        null
+                    }
+                }
+                val act = try { CommonActivity.activity } catch (_: Throwable) { null }
+                val ctx: Context? = act ?: appCtx
+                if (ctx == null) {
+                    ClipboardLogger.logAndCopy("Sniff", "Không có Context để khởi tạo WebView")
+                    cont.resume(null)
+                    return@post
+                }
+
+                try {
+                    val w = 1080
+                    val h = 1920
+                    val wv = WebView(ctx)
+                    var finished = false
+
+                    fun finish(res: String?) {
+                        if (finished) return
+                        finished = true
+                        handler.removeCallbacksAndMessages(null)
+                        try {
+                            wv.stopLoading()
+                            (wv.parent as? ViewGroup)?.removeView(wv)
+                            wv.destroy()
+                        } catch (_: Exception) {}
+                        cont.resume(res)
+                    }
+
+                    val streamRegex = Regex("""\.m3u8|\.mpd|master\.txt""", RegexOption.IGNORE_CASE)
+                    val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
+
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        mediaPlaybackRequiresUserGesture = false
+                        javaScriptCanOpenWindowsAutomatically = false
+                        setSupportMultipleWindows(false)
+                        userAgentString = ua
+                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    }
+
+                    wv.webChromeClient = object : WebChromeClient() {
+                        override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
+                    }
+
+                    val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
+                    val clickJs = "(function(){function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
+                            "fire(document.getElementById('bigPlay'));" +
+                            "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
+                            "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();"
+
+                    var taps = 0
+                    fun tap() {
+                        if (finished) return
+                        taps++
+                        try {
+                            wv.evaluateJavascript(fakePopup + clickJs, null)
+                            val t = SystemClock.uptimeMillis()
+                            val d = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, w / 2f, h / 2f, 0)
+                            val u = MotionEvent.obtain(t, t + 60, MotionEvent.ACTION_UP, w / 2f, h / 2f, 0)
+                            wv.dispatchTouchEvent(d)
+                            wv.dispatchTouchEvent(u)
+                            d.recycle()
+                            u.recycle()
+                        } catch (_: Exception) {}
+                        if (taps < 25) handler.postDelayed({ tap() }, 1500)
+                    }
+
+                    wv.webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                            val u = request?.url?.toString() ?: return null
+                            if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
+
+                            // Bắt link stream video
+                            if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
+                                handler.post { finish(u) }
+                            }
+
+                            // Bắt link phụ đề
+                            if ((u.contains(".vtt", ignoreCase = true) || u.contains(".srt", ignoreCase = true)) && !u.contains("blank.vtt")) {
+                                val lang = Regex("""[?&]lang=([^&]+)""").find(u)?.groupValues?.get(1) ?: "Sub"
+                                try { subtitleCallback.invoke(SubtitleFile(lang, u)) } catch (_: Exception) {}
+                            }
+
+                            return null
+                        }
+
+                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                            val u = request?.url?.toString() ?: return false
+                            val ok = u.startsWith(pageUrl.substringBefore("?")) || u.contains("stellarconductornexus.com")
+                            if (!ok) seen.add("BLOCKED: " + u.take(150))
+                            return !ok
+                        }
+
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            handler.postDelayed({ tap() }, 800)
+                        }
+                    }
+
+                    wv.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
+                    wv.layout(0, 0, w, h)
+                    wv.translationX = -4000f
+                    try { act?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
+
+                    handler.postDelayed({ finish(null) }, 35_000L)
+                    wv.loadUrl(pageUrl, mapOf("Referer" to referer))
+                } catch (e: Exception) {
+                    ClipboardLogger.logAndCopy("Sniff Exception", e.stackTraceToString().take(800))
+                    cont.resume(null)
+                }
+            }
+        }
+    }
+
+    private fun cleanJsUrl(s: String) = s.replace("\\u0026", "&").replace("\\/", "/").replace("&amp;", "&")
+
+    private fun absUrl(base: String, u: String): String {
+        if (u.startsWith("http")) return u
+        if (u.startsWith("//")) return "https:$u"
+        val host = Regex("""^(https?://[^/]+)""").find(base)?.groupValues?.get(1) ?: return u
+        return if (u.startsWith("/")) host + u else "$host/$u"
+    }
+
+    // =====================================================================================
+    // 5. LOAD LINKS: KẾT HỢP DỰ PHÒNG CÁC HOST (hnembed.cc -> vidsrc.sh -> vidsrc.io)
+    // =====================================================================================
+    override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        ClipboardLogger.reset()
+        ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
+        val ref = parseRef(data)
+        if (ref == null) {
+            ClipboardLogger.logAndCopy("Error", "Invalid data format: $data")
             return false
         }
+        val type = ref.type
+        val tmdbId = ref.id
+        val season = ref.season
+        val episode = ref.episode
+        if (type == "tv" && (season == null || episode == null)) {
+            ClipboardLogger.logAndCopy("Error", "Thiếu season/episode: $data")
+            return false
+        }
+
+        ApiServices.sendTraktScrobble("start", type, tmdbId, 0f, season, episode)
+
+        val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+        
+        // Danh sách các mirror cung cấp vs_src.php
+        val mirrors = listOf("https://hnembed.cc", "https://vidsrc.sh", "https://vidsrc.io")
+        var finalUrl: String? = null
+        var refererForWv = "https://stellarconductornexus.com/"
+
+        for (mirror in mirrors) {
+            val embedUrl = if (type == "movie") "$mirror/embed/movie/$tmdbId/" else "$mirror/embed/tv/$tmdbId/$season/$episode/"
+            val srcApi = if (type == "movie") "$mirror/vs_src.php?type=movie&id=$tmdbId"
+            else "$mirror/vs_src.php?type=tv&id=$tmdbId&season=$season&episode=$episode"
+
+            for (attempt in 1..2) {
+                try {
+                    val r2 = app.get(srcApi, headers = mapOf(
+                        "User-Agent" to ua,
+                        "Accept" to "application/json",
+                        "Referer" to embedUrl,
+                        "Origin" to mirror
+                    ))
+                    val if2 = Regex("\"src\"\\s*:\\s*\"([^\"]+)\"").find(r2.text)?.groupValues?.get(1)?.let { cleanJsUrl(it) }
+                    if (if2 == null) {
+                        ClipboardLogger.logAndCopy("Notice", "Mirror $mirror lần $attempt: HTTP ${r2.code}: ${r2.text.take(150)}")
+                        continue
+                    }
+
+                    val r3 = app.get(if2, headers = mapOf("User-Agent" to ua, "Referer" to "$mirror/"))
+                    val pu = Regex("\"playerUrl\"\\s*:\\s*\"([^\"]+)\"").find(r3.text)?.groupValues?.get(1)
+                    val target = pu?.let { absUrl(if2, cleanJsUrl(it)) } ?: if2
+                    refererForWv = if2
+
+                    ClipboardLogger.logAndCopy("Target", "Sniffing $target")
+                    val seen = mutableListOf<String>()
+                    finalUrl = sniffStream(target, refererForWv, ua, seen, subtitleCallback)
+                    if (finalUrl != null) break
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    ClipboardLogger.logAndCopy("Exception", "Mirror $mirror lần $attempt: ${e.message}")
+                }
+            }
+            if (finalUrl != null) break
+        }
+
+        val url = finalUrl
+        if (url.isNullOrEmpty()) {
+            ClipboardLogger.logAndCopy("Error", "Không lấy được link stream sau khi thử các mirror.")
+            return false
+        }
+
+        ApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
+        val origin = Regex("""^(https?://[^/]+)""").find(refererForWv)?.groupValues?.get(1) ?: "https://stellarconductornexus.com"
+
+        callback.invoke(
+            ExtractorLink(
+                source = this.name,
+                name = "Hnembed",
+                url = url,
+                referer = "$origin/",
+                quality = Qualities.Unknown.value,
+                type = ExtractorLinkType.M3U8,
+                headers = mapOf("Origin" to origin, "Referer" to "$origin/", "User-Agent" to ua)
+            )
+        )
+        return true
     }
 }
