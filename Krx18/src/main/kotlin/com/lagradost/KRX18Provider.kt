@@ -105,15 +105,13 @@ class KRX18Provider : MainAPI() {
     }
 
     // =====================================================================================
-    // WebView Sniffer: Giải mã và bắt stream HLS/MP4 ngầm từ playkrx18 và mov18plus
+    // WebView Sniffer: Bắt URL stream (.m3u8 hoặc .mp4) ngầm từ WebView
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun sniffStream(
         pageUrl: String,
-        referer: String,
-        serverName: String,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
+        referer: String
+    ): String? {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
@@ -122,7 +120,7 @@ class KRX18Provider : MainAPI() {
                 val ctx: Context? = act ?: appCtx
                 if (ctx == null) {
                     ClipboardLogger.logAndCopy("KRX18", "Không tìm thấy Context để khởi tạo WebView")
-                    cont.resume(false)
+                    cont.resume(null)
                     return@post
                 }
 
@@ -132,7 +130,7 @@ class KRX18Provider : MainAPI() {
                     val wv = WebView(ctx)
                     var finished = false
 
-                    fun finish(found: Boolean) {
+                    fun finish(res: String?) {
                         if (finished) return
                         finished = true
                         handler.removeCallbacksAndMessages(null)
@@ -141,12 +139,12 @@ class KRX18Provider : MainAPI() {
                             (wv.parent as? ViewGroup)?.removeView(wv)
                             wv.destroy()
                         } catch (_: Exception) {}
-                        cont.resume(found)
+                        cont.resume(res)
                     }
 
-                    // Tự động timeout sau 20 giây
+                    // Tự động kết thúc sau 20 giây nếu không có kết quả
                     handler.postDelayed({
-                        if (!finished) finish(false)
+                        if (!finished) finish(null)
                     }, 20000)
 
                     val streamRegex = Regex("""\.m3u8|\.mp4""", RegexOption.IGNORE_CASE)
@@ -211,27 +209,7 @@ class KRX18Provider : MainAPI() {
                             val u = request?.url?.toString() ?: return null
                             if (!junkRegex.containsMatchIn(u) && streamRegex.containsMatchIn(u)) {
                                 handler.post {
-                                    if (u.contains(".m3u8")) {
-                                        M3u8Helper.generateM3u8(
-                                            source = serverName,
-                                            streamUrl = u,
-                                            referer = pageUrl,
-                                            headers = mapOf("Referer" to pageUrl, "Origin" to pageUrl.substringBeforeLast("/"))
-                                        ).forEach(callback)
-                                    } else {
-                                        callback.invoke(
-                                            newExtractorLink(
-                                                name = "$serverName MP4",
-                                                source = serverName,
-                                                url = u,
-                                                type = ExtractorLinkType.VIDEO
-                                            ) {
-                                                this.referer = pageUrl
-                                                this.quality = Qualities.Unknown.value
-                                            }
-                                        )
-                                    }
-                                    finish(true)
+                                    finish(u)
                                 }
                             }
                             return null
@@ -239,7 +217,6 @@ class KRX18Provider : MainAPI() {
 
                         override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                             val u = request?.url?.toString() ?: return false
-                            // Chặn chuyển hướng sang các trang popup ngoài luồng như abyss.to
                             val ok = u.contains("playkrx18") || u.contains("mov18plus") || u.contains("str0611")
                             return !ok
                         }
@@ -257,7 +234,7 @@ class KRX18Provider : MainAPI() {
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                 } catch (e: Exception) {
                     ClipboardLogger.logAndCopy("KRX18 Sniff Error", e.message ?: "Unknown")
-                    cont.resume(false)
+                    cont.resume(null)
                 }
             }
         }
@@ -317,8 +294,30 @@ class KRX18Provider : MainAPI() {
 
                     // 2. Nếu là player riêng của KRX18 (playkrx18 / mov18plus) hoặc extractor chưa bắt được
                     if (!loaded || fixedUrl.contains("playkrx18") || fixedUrl.contains("mov18plus")) {
-                        val sniffed = sniffStream(fixedUrl, data, serverTitle, callback)
-                        if (sniffed) anyFound = true
+                        val streamUrl = sniffStream(fixedUrl, data)
+                        if (!streamUrl.isNullOrBlank()) {
+                            if (streamUrl.contains(".m3u8")) {
+                                M3u8Helper.generateM3u8(
+                                    source = serverTitle,
+                                    streamUrl = streamUrl,
+                                    referer = fixedUrl,
+                                    headers = mapOf("Referer" to fixedUrl, "Origin" to fixedUrl.substringBeforeLast("/"))
+                                ).forEach(callback)
+                            } else {
+                                callback.invoke(
+                                    newExtractorLink(
+                                        name = "$serverTitle MP4",
+                                        source = serverTitle,
+                                        url = streamUrl,
+                                        type = ExtractorLinkType.VIDEO
+                                    ) {
+                                        this.referer = fixedUrl
+                                        this.quality = Qualities.Unknown.value
+                                    }
+                                )
+                            }
+                            anyFound = true
+                        }
                     } else {
                         anyFound = true
                     }
@@ -331,3 +330,5 @@ class KRX18Provider : MainAPI() {
         return anyFound
     }
 }
+
+typealias KRX18 = KRX18Provider
