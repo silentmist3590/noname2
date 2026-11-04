@@ -14,7 +14,7 @@ cloudstream {
      **/
     status = 1
 
-    tvTypes = listOf("NSFW")
+    tvTypes = listOf("Movie","NSFW")
 
     requiresResources = false
 }
