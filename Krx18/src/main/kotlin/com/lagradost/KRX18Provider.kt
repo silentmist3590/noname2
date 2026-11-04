@@ -1,288 +1,333 @@
-package com.lagradost
+package com.KRX18
 
-import android.util.Base64
+import android.annotation.SuppressLint
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.nodes.Element
-import java.net.URLEncoder
-import javax.crypto.Cipher
-import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
-class KRX18Provider : MainAPI() {
+class KRX18 : MainAPI() {
     override var mainUrl = "https://krx18.com"
-    override var name = "KRX18"
-    override var lang = "en"
+    override var name = "KRX 18"
     override val hasMainPage = true
-    override val hasQuickSearch = false
+    override val hasDownloadSupport = true
+    override val vpnStatus = VPNStatus.MightBeNeeded
     override val supportedTypes = setOf(TvType.NSFW)
 
-    private val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-    private fun hdr(ref: String? = null) = mapOf("User-Agent" to ua, "Referer" to (ref ?: "$mainUrl/"))
-
     override val mainPage = mainPageOf(
-        "$mainUrl/movies" to "Latest 18+",
-        "$mainUrl/genre/xxx" to "X Clip",
-        "$mainUrl/genre/eng-sub" to "Eng Sub",
-        "$mainUrl/genre/japan" to "Japan",
-        "$mainUrl/genre/korea" to "Korea",
-        "$mainUrl/genre/thailand" to "Thailand",
-        "$mainUrl/genre/philippines" to "Philippines",
-        "$mainUrl/genre/china" to "China",
-        "$mainUrl/genre/usa" to "USA",
-        "$mainUrl/genre/uk" to "UK",
-        "$mainUrl/genre/france" to "France",
-        "$mainUrl/genre/italy" to "Italy"
+        "movies" to "Recently added",
+        "genre/eng-sub" to "English SUB",
+        "genre/korea" to "Korea",
+        "genre/china" to "China",
+        "genre/japan" to "Japan",
+        "genre/thailand" to "Thailand",
+        "genre/philippines" to "Philippines",
     )
 
-    // ---------------------------------------------------------------- danh sách / tìm kiếm
-    private fun Element.toCard(): SearchResponse? {
-        val a = selectFirst(".data h3 a") ?: selectFirst(".poster a[href]") ?: selectFirst("a[href]") ?: return null
-        val href = fixUrlNull(a.attr("href")) ?: return null
-        if (!href.contains("/movies/")) return null
-        val title = selectFirst(".data h3")?.text()?.trim()?.takeIf { it.isNotEmpty() }
-            ?: selectFirst("img")?.attr("alt")?.trim()?.takeIf { it.isNotEmpty() }
-            ?: return null
-        val img = selectFirst("img")
-        val poster = img?.attr("data-src")?.takeIf { it.isNotEmpty() } ?: img?.attr("src")
-        val year = selectFirst(".data span")?.text()?.let { Regex("""(19|20)\d{2}""").find(it)?.value?.toIntOrNull() }
-        return newMovieSearchResponse(title, href, TvType.NSFW) {
-            this.posterUrl = fixUrlNull(poster)
-            this.year = year
+    override suspend fun getMainPage(
+        page: Int,
+        request: MainPageRequest
+    ): HomePageResponse {
+        val document = app.get("$mainUrl/${request.data}/?page/$page").document
+        val home = document.select("#archive-content article, div.items.normal article")
+            .mapNotNull {
+                try { it.toSearchResult() } catch (_: Exception) { null }
+            }
+        return newHomePageResponse(
+            list = HomePageList(
+                name = request.name,
+                list = home,
+                isHorizontalImages = false
+            ),
+            hasNext = true
+        )
+    }
+
+    private fun Element.toSearchResult(): SearchResponse {
+        val title = this.select("h3").text().ifBlank {
+            this.select("a").attr("title").ifBlank {
+                this.select("img").attr("alt")
+            }
         }
-    }
-
-    private fun parseGrid(doc: org.jsoup.nodes.Document): List<SearchResponse> {
-        // article.item = lưới chính (bỏ qua widget sidebar "w_item_b")
-        val seen = HashSet<String>()
-        return doc.select("article.item").mapNotNull { it.toCard() }.filter { seen.add(it.url) }
-    }
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val url = if (page <= 1) "${request.data}/" else "${request.data}/page/$page/"
-        return try {
-            val res = app.get(url, headers = hdr())
-            val items = parseGrid(res.document)
-            ClipboardLogger.logAndCopy("MainPage ${request.name} p$page", "HTTP ${res.code}, items=${items.size}\nposter0=${items.firstOrNull()?.posterUrl}")
-            newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            ClipboardLogger.logAndCopy("MainPage Error", "$url -> ${e.message}")
-            newHomePageResponse(request.name, emptyList(), hasNext = false)
+        val href = fixUrl(this.select("a").attr("href"))
+        val posterUrl = fixUrlNull(this.select("img").attr("src"))
+        return newMovieSearchResponse(title, href, TvType.Movie) {
+            this.posterUrl = posterUrl
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        return try {
-            val q = URLEncoder.encode(query, "UTF-8")
-            val res = app.get("$mainUrl/?s=$q", headers = hdr())
-            val items = parseGrid(res.document).ifEmpty {
-                // trang kết quả tìm kiếm cũng có thể dùng widget w_item_b
-                res.document.select("article.w_item_b").mapNotNull { it.toCard() }
+        val document = app.get("$mainUrl/?s=$query").document
+        return document.select("#archive-content article, div.items.normal article, div.result-item article, article")
+            .mapNotNull {
+                try { it.toSearchResult() } catch (_: Exception) { null }
             }
-            ClipboardLogger.logAndCopy("Search", "q=$query HTTP ${res.code}, items=${items.size}")
-            items
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            ClipboardLogger.logAndCopy("Search Error", "$query -> ${e.message}")
-            emptyList()
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        val document = app.get(url).document
+        val title = document.selectFirst("div.data h1")?.text() ?: "Unknown"
+        val poster = document.selectFirst("meta[property=og:image]")?.attr("content")?.trim() ?: "Unknown"
+        val tags = document.select("div:nth-child(2) > div.video-details__item_links a, div.sgeneros a").map { it.text() }
+        val description = document.selectFirst("div.wp-content p")?.text()?.trim() ?: "Unknown"
+        val recommendations = document.select("#single_relacionados article, div.items.normal article, article")
+            .mapNotNull {
+                try { it.toSearchResult() } catch (_: Exception) { null }
+            }
+
+        return newMovieLoadResponse(title, url, TvType.NSFW, url) {
+            this.posterUrl = poster
+            this.plot = description
+            this.recommendations = recommendations
+            this.tags = tags
         }
     }
 
-    // ---------------------------------------------------------------- chi tiết
-    override suspend fun load(url: String): LoadResponse? {
-        ClipboardLogger.reset()
-        ClipboardLogger.logAndCopy("Load", url)
-        return try {
-            val res = app.get(url, headers = hdr())
-            val doc = res.document
-            val title = doc.selectFirst("div.sheader h1")?.text()?.trim()
-                ?: doc.selectFirst("h1")?.text()?.trim()
-                ?: doc.selectFirst("meta[property=og:title]")?.attr("content") ?: return null
-            val poster = doc.selectFirst("div.sheader div.poster img")?.attr("src")
-                ?: doc.selectFirst("meta[property=og:image]")?.attr("content")
-            val plot = doc.selectFirst("div.sheader .wp-content")?.text()?.trim()
-                ?: doc.selectFirst("div#info .wp-content")?.text()?.trim()
-            val year = doc.selectFirst("div.sheader span.date")?.text()?.let { Regex("""(19|20)\d{2}""").find(it)?.value?.toIntOrNull() }
-            val duration = doc.selectFirst("div.sheader span.runtime")?.text()?.let { Regex("""\d+""").find(it)?.value?.toIntOrNull() }
-            val tags = doc.select("div.sgeneros a").map { it.text().trim() }.filter { it.isNotEmpty() }
-            val rating = doc.selectFirst("#repimdb strong")?.text()?.toDoubleOrNull()
+    // =====================================================================================
+    // WebView Sniffer: Giải mã và bắt stream HLS/MP4 ngầm từ playkrx18 và mov18plus
+    // =====================================================================================
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun sniffStream(
+        pageUrl: String,
+        referer: String,
+        serverName: String,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        return suspendCoroutine { cont ->
+            val handler = Handler(Looper.getMainLooper())
+            handler.post {
+                val appCtx: Context? = CloudStreamApp.context
+                val act = CommonActivity.activity
+                val ctx: Context? = act ?: appCtx
+                if (ctx == null) {
+                    ClipboardLogger.logAndCopy("KRX18", "Không tìm thấy Context để khởi tạo WebView")
+                    cont.resume(false)
+                    return@post
+                }
 
-            // Các server phát (DooPlay): li.dooplay_player_option data-post/data-nume/data-type
-            val opts = doc.select("li.dooplay_player_option")
-            val post = opts.firstOrNull()?.attr("data-post")?.takeIf { it.isNotEmpty() }
-                ?: doc.selectFirst("meta#dooplay-ajax-counter")?.attr("data-postid") ?: ""
-            val type = opts.firstOrNull()?.attr("data-type")?.takeIf { it.isNotEmpty() } ?: "movie"
-            val nums = opts.map { it.attr("data-nume") }.filter { it.isNotEmpty() }.ifEmpty { listOf("1") }
-            val data = "$post|${nums.joinToString(",")}|$type"
-            ClipboardLogger.logAndCopy("Load info", "title=$title\npost=$post nums=$nums type=$type\nposter=$poster")
+                try {
+                    val w = 1080
+                    val h = 1920
+                    val wv = WebView(ctx)
+                    var finished = false
 
-            val recs = doc.select("div.srelacionados article").mapNotNull { art ->
-                val a = art.selectFirst("a[href]") ?: return@mapNotNull null
-                val href = fixUrlNull(a.attr("href")) ?: return@mapNotNull null
-                val img = art.selectFirst("img")
-                val t = img?.attr("alt")?.trim().orEmpty().ifEmpty { return@mapNotNull null }
-                newMovieSearchResponse(t, href, TvType.NSFW) { this.posterUrl = fixUrlNull(img?.attr("src")) }
+                    fun finish(found: Boolean) {
+                        if (finished) return
+                        finished = true
+                        handler.removeCallbacksAndMessages(null)
+                        try {
+                            wv.stopLoading()
+                            (wv.parent as? ViewGroup)?.removeView(wv)
+                            wv.destroy()
+                        } catch (_: Exception) {}
+                        cont.resume(found)
+                    }
+
+                    // Tự động timeout sau 20 giây
+                    handler.postDelayed({
+                        if (!finished) finish(false)
+                    }, 20000)
+
+                    val streamRegex = Regex("""\.m3u8|\.mp4""", RegexOption.IGNORE_CASE)
+                    val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
+
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        mediaPlaybackRequiresUserGesture = false
+                        javaScriptCanOpenWindowsAutomatically = false
+                        setSupportMultipleWindows(false)
+                        userAgentString = "Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    }
+
+                    wv.webChromeClient = object : WebChromeClient() {
+                        override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
+                    }
+
+                    val clickJs = """
+                        (function() {
+                            function fire(sel) {
+                                var els = document.querySelectorAll(sel);
+                                for (var i = 0; i < els.length; i++) {
+                                    try { els[i].click(); } catch(e) {}
+                                }
+                            }
+                            fire('#bigPlay');
+                            fire('.jw-display-icon-container, .jw-icon-display, .jw-bigplay, [aria-label=Play]');
+                            fire('#overlay, #playback, #playback svg, .play-button');
+                            var v = document.querySelector('video');
+                            if (v) {
+                                v.muted = true;
+                                var p = v.play();
+                                if (p && p.catch) p.catch(function(){});
+                            }
+                        })();
+                    """.trimIndent()
+
+                    var taps = 0
+                    fun tap() {
+                        if (finished) return
+                        taps++
+                        try {
+                            wv.evaluateJavascript(clickJs, null)
+                            val t = SystemClock.uptimeMillis()
+                            val d = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, w / 2f, h / 2f, 0)
+                            val u = MotionEvent.obtain(t, t + 50, MotionEvent.ACTION_UP, w / 2f, h / 2f, 0)
+                            wv.dispatchTouchEvent(d)
+                            wv.dispatchTouchEvent(u)
+                            d.recycle(); u.recycle()
+                        } catch (_: Exception) {}
+
+                        if (taps < 15 && !finished) {
+                            handler.postDelayed({ tap() }, 1200)
+                        }
+                    }
+
+                    wv.webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                            val u = request?.url?.toString() ?: return null
+                            if (!junkRegex.containsMatchIn(u) && streamRegex.containsMatchIn(u)) {
+                                handler.post {
+                                    if (u.contains(".m3u8")) {
+                                        M3u8Helper.generateM3u8(
+                                            source = serverName,
+                                            streamUrl = u,
+                                            referer = pageUrl,
+                                            headers = mapOf("Referer" to pageUrl, "Origin" to pageUrl.substringBeforeLast("/"))
+                                        ).forEach(callback)
+                                    } else {
+                                        callback.invoke(
+                                            newExtractorLink(
+                                                name = "$serverName MP4",
+                                                source = serverName,
+                                                url = u,
+                                                type = ExtractorLinkType.VIDEO
+                                            ) {
+                                                this.referer = pageUrl
+                                                this.quality = Qualities.Unknown.value
+                                            }
+                                        )
+                                    }
+                                    finish(true)
+                                }
+                            }
+                            return null
+                        }
+
+                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                            val u = request?.url?.toString() ?: return false
+                            // Chặn chuyển hướng sang các trang popup ngoài luồng như abyss.to
+                            val ok = u.contains("playkrx18") || u.contains("mov18plus") || u.contains("str0611")
+                            return !ok
+                        }
+
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            handler.postDelayed({ tap() }, 600)
+                        }
+                    }
+
+                    wv.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
+                    wv.layout(0, 0, w, h)
+                    wv.translationX = -4000f
+                    act?.addContentView(wv, ViewGroup.LayoutParams(w, h))
+
+                    wv.loadUrl(pageUrl, mapOf("Referer" to referer))
+                } catch (e: Exception) {
+                    ClipboardLogger.logAndCopy("KRX18 Sniff Error", e.message ?: "Unknown")
+                    cont.resume(false)
+                }
             }
-
-            newMovieLoadResponse(title, url, TvType.NSFW, data) {
-                this.posterUrl = fixUrlNull(poster)
-                this.plot = plot
-                this.year = year
-                this.duration = duration
-                this.tags = tags
-                rating?.let { this.score = Score.from10(it) }
-                this.recommendations = recs
-            }
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            ClipboardLogger.logAndCopy("Load Error", "$url -> ${e.message}\n${e.stackTraceToString().take(800)}")
-            null
         }
     }
 
-    // ---------------------------------------------------------------- phát
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        ClipboardLogger.reset()
-        ClipboardLogger.logAndCopy("LoadLinks Start", data)
-        val parts = data.split("|")
-        val post = parts.getOrNull(0).orEmpty()
-        val nums = parts.getOrNull(1).orEmpty().split(",").filter { it.isNotEmpty() }
-        val type = parts.getOrNull(2)?.ifEmpty { null } ?: "movie"
-        if (post.isEmpty() || nums.isEmpty()) {
-            ClipboardLogger.logAndCopy("Error", "Thiếu post/nume: $data")
-            return false
+        val document = app.get(data).document
+        val options = document.select("ul#playeroptionsul li").mapNotNull { li ->
+            val postId = li.attr("data-post").ifEmpty { null }
+            val nume = li.attr("data-nume").ifEmpty { null }
+            val type = li.attr("data-type").ifEmpty { null }
+            if (postId != null && nume != null && type != null && !nume.contains("trailer", ignoreCase = true)) {
+                Triple(postId, nume, type)
+            } else null
         }
-        var found = false
-        for (n in nums) {
+
+        var anyFound = false
+
+        options.amap { (postId, nume, type) ->
             try {
-                val apiUrl = "$mainUrl/wp-json/dooplayer/v2/$post/$type/$n"
-                val r = app.get(apiUrl, headers = hdr() + mapOf("Accept" to "application/json"))
-                val embed = JSONObject(r.text).optString("embed_url")
-                ClipboardLogger.logAndCopy("Server $n", "API HTTP ${r.code}\nembed=$embed")
-                if (embed.isEmpty()) continue
-                val ok = if (embed.contains("playkrx18.site")) {
-                    stream9(embed, "KRX18 S$n", subtitleCallback, callback)
-                } else {
-                    try {
-                        loadExtractor(embed, "$mainUrl/", subtitleCallback, callback)
-                    } catch (e: Exception) {
-                        if (e is java.util.concurrent.CancellationException) throw e
-                        ClipboardLogger.logAndCopy("Server $n Error", "loadExtractor: ${e.message}")
-                        false
+                val postRes = app.post(
+                    url = "$mainUrl/wp-admin/admin-ajax.php",
+                    data = mapOf(
+                        "action" to "doo_player_ajax",
+                        "post" to postId,
+                        "nume" to nume,
+                        "type" to type
+                    ),
+                    referer = data,
+                    headers = mapOf(
+                        "X-Requested-With" to "XMLHttpRequest",
+                        "Content-Type" to "application/x-www-form-urlencoded; charset=UTF-8"
+                    )
+                ).text
+
+                val rawUrl = try {
+                    JSONObject(postRes).optString("embed_url")
+                } catch (_: Exception) {
+                    Regex("""embed_url["']?\s*:\s*["']([^"']+)["']""").find(postRes)?.groupValues?.get(1) ?: ""
+                }
+
+                val embedUrl = if (rawUrl.contains("<iframe")) {
+                    Regex("""src=["']([^"']+)["']""").find(rawUrl)?.groupValues?.get(1) ?: rawUrl
+                } else rawUrl
+
+                if (embedUrl.isNotBlank()) {
+                    val fixedUrl = fixUrl(embedUrl)
+                    val serverTitle = "KRX18 (Server $nume)"
+
+                    // 1. Thử load extractor có sẵn nếu là host thông dụng
+                    val loaded = loadExtractor(fixedUrl, subtitleCallback, callback)
+
+                    // 2. Nếu là player riêng của KRX18 (playkrx18 / mov18plus) hoặc extractor chưa bắt được
+                    if (!loaded || fixedUrl.contains("playkrx18") || fixedUrl.contains("mov18plus")) {
+                        val sniffed = sniffStream(fixedUrl, data, serverTitle, callback)
+                        if (sniffed) anyFound = true
+                    } else {
+                        anyFound = true
                     }
                 }
-                if (ok) found = true
             } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-                ClipboardLogger.logAndCopy("Server $n Exception", "${e.message}\n${e.stackTraceToString().take(600)}")
-            }
-        }
-        if (!found) ClipboardLogger.logAndCopy("Error", "Không có server nào phát được.")
-        return found
-    }
-
-    // ---------------------------------------------------------------- player 9stream (playkrx18.site)
-    private val keyBase = "7bd30d612d2bb1bda34743f8608e68c"
-    private val ivBase = "v3M9zQ2pX7k"
-
-    private fun gcm(mode: Int, step: Int, input: ByteArray): ByteArray {
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(
-            mode,
-            SecretKeySpec((keyBase + step).toByteArray(Charsets.UTF_8), "AES"),
-            GCMParameterSpec(128, (ivBase + step).toByteArray(Charsets.UTF_8))
-        )
-        return cipher.doFinal(input)
-    }
-
-    private fun dec(b64: String, step: Int): String =
-        String(gcm(Cipher.DECRYPT_MODE, step, Base64.decode(b64, Base64.DEFAULT)), Charsets.UTF_8)
-
-    private fun enc(text: String, step: Int): String =
-        Base64.encodeToString(gcm(Cipher.ENCRYPT_MODE, step, text.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)
-
-    private suspend fun stream9(
-        embed: String,
-        label: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val origin = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return false
-        val page = app.get(embed, headers = hdr("$mainUrl/")).text
-        val idEnc = Regex("""idfile_enc\s*=\s*["']([^"']+)["']""").find(page)?.groupValues?.get(1)
-        val userEnc = Regex("""idUser_enc\s*=\s*["']([^"']+)["']""").find(page)?.groupValues?.get(1)
-        val api = Regex("""DOMAIN_API\s*=\s*["']([^"']+)["']""").find(page)?.groupValues?.get(1)
-        val subsRaw = Regex("""data_subs\s*=\s*'([^']*)'""").find(page)?.groupValues?.get(1).orEmpty()
-        ClipboardLogger.logAndCopy("9stream page", "idfile_enc=${idEnc?.take(20)} idUser_enc=${userEnc?.take(20)}\napi=$api\nsubs=${subsRaw.take(200)}")
-        if (idEnc == null || userEnc == null || api == null) {
-            ClipboardLogger.logAndCopy("Error", "Không đọc được thông tin player 9stream (trang embed đổi cấu trúc?)\n" + page.take(500))
-            return false
-        }
-        val idFile = dec(idEnc, 1)
-        val idUser = dec(userEnc, 2)
-        val payload = "{\"idfile\":\"$idFile\",\"iduser\":\"$idUser\",\"domain_play\":\"$mainUrl\",\"unixTimestamp\":${System.currentTimeMillis() / 1000}}"
-        val body = enc(payload, 3)
-        val r = app.post(
-            api,
-            data = mapOf("data" to body),
-            headers = mapOf("User-Agent" to ua, "Referer" to "$origin/", "Origin" to origin)
-        )
-        ClipboardLogger.logAndCopy("9stream getplay", "HTTP ${r.code}\n${r.text.take(600)}")
-        val json = JSONObject(r.text)
-        if (json.optString("status") != "success") {
-            ClipboardLogger.logAndCopy("Error", "getplay không thành công: ${r.text.take(300)}")
-            return false
-        }
-        var playlist = json.optString("data")
-        if (!playlist.startsWith("http")) {
-            // dự phòng: dữ liệu trả về có thể được mã hóa
-            playlist = try { dec(playlist, 4) } catch (e: Exception) { playlist }
-        }
-        if (!playlist.startsWith("http")) {
-            ClipboardLogger.logAndCopy("Error", "Playlist không hợp lệ: ${playlist.take(120)}")
-            return false
-        }
-
-        // Phụ đề (JWPlayer tracks): [{"file": "...", "label": "English", "kind": "captions"}, ...]
-        if (subsRaw.isNotBlank()) {
-            try {
-                val arr = JSONArray(subsRaw)
-                for (i in 0 until arr.length()) {
-                    val t = arr.getJSONObject(i)
-                    val file = t.optString("file").ifEmpty { t.optString("src") }
-                    if (file.isEmpty()) continue
-                    val kind = t.optString("kind", "captions")
-                    if (kind == "thumbnails") continue
-                    val lbl = t.optString("label").ifEmpty { "Subtitle ${i + 1}" }
-                    subtitleCallback.invoke(SubtitleFile(lbl, fixUrl(file)))
-                    ClipboardLogger.logAndCopy("Subtitle", "$lbl -> $file")
-                }
-            } catch (e: Exception) {
-                ClipboardLogger.logAndCopy("Subtitle Error", "${e.message}\n${subsRaw.take(200)}")
+                ClipboardLogger.logAndCopy("KRX18 Ajax Error", e.message ?: "Unknown")
             }
         }
 
-        val q = Regex("""/hls/(\d{3,4})/""").find(playlist)?.groupValues?.get(1)?.toIntOrNull()
-        ClipboardLogger.logAndCopy("9stream OK", "playlist=$playlist\nquality=$q")
-        callback.invoke(
-            newExtractorLink(this.name, if (q != null) "$label ${q}p" else label, playlist, ExtractorLinkType.M3U8) {
-                this.referer = "$origin/"
-                this.quality = q ?: Qualities.Unknown.value
-                this.headers = mapOf("User-Agent" to ua, "Origin" to origin, "Referer" to "$origin/")
-            }
-        )
-        return true
+        return anyFound
     }
 }
