@@ -1,4 +1,4 @@
-package com.krx18
+package com.lagradost
 
 import android.util.Base64
 import com.lagradost.cloudstream3.*
