@@ -6,6 +6,7 @@ cloudstream {
     authors = listOf("silentmist3590")
     status = 1
     version = 1
+    language = "en"
     tvTypes = listOf("Movie")
     requiresResources = false
 }
