@@ -11,29 +11,8 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.fasterxml.jackson.annotation.JsonProperty
-import com.lagradost.cloudstream3.HomePageList
-import com.lagradost.cloudstream3.HomePageResponse
-import com.lagradost.cloudstream3.LoadResponse
-import com.lagradost.cloudstream3.MainAPI
-import com.lagradost.cloudstream3.MainPageRequest
-import com.lagradost.cloudstream3.SearchResponse
-import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.TvType
-import com.lagradost.cloudstream3.VPNStatus
-import com.lagradost.cloudstream3.amap
-import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.fixUrlNull
-import com.lagradost.cloudstream3.mainPageOf
-import com.lagradost.cloudstream3.newHomePageResponse
-import com.lagradost.cloudstream3.newMovieLoadResponse
-import com.lagradost.cloudstream3.newMovieSearchResponse
-import com.lagradost.cloudstream3.utils.ExtractorApi
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.INFER_TYPE
-import com.lagradost.cloudstream3.utils.M3u8Helper
-import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.loadExtractor
-import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.* // Gộp toàn bộ import để tránh thiếu sót
+import com.lagradost.cloudstream3.utils.*
 import org.jsoup.nodes.Element
 import java.net.URLDecoder
 import java.util.concurrent.CountDownLatch
@@ -263,19 +242,12 @@ open class KRX18Provider : MainAPI() {
             var capturedUrl: String? = null
             var webView: WebView? = null
 
-            // Kịch bản JS: Chặn redirect Abyss + Hook hàm phát video ngay tức thì
             val injectionScript = """
                 (function() {
-                    // 1. Chống chuyển hướng chống-iframe của Abyss (mov18plus) về abyss.to
                     try {
                         Object.defineProperty(window, 'top', {
                             get: function() {
-                                return {
-                                    location: {
-                                        href: 'https://krx18.com/',
-                                        hostname: 'krx18.com'
-                                    }
-                                };
+                                return { location: { href: 'https://krx18.com/', hostname: 'krx18.com' } };
                             },
                             configurable: true
                         });
@@ -292,7 +264,6 @@ open class KRX18Provider : MainAPI() {
                         }
                     }
 
-                    // 2. Hook trực tiếp player_9stream của PlayKrx18 Server 1
                     try {
                         var orig9 = window.player_9stream;
                         window.player_9stream = function(playlist, verfile) {
@@ -301,7 +272,6 @@ open class KRX18Provider : MainAPI() {
                         };
                     } catch(e) {}
 
-                    // 3. Hook HTMLMediaElement.prototype.src cho video tag
                     try {
                         var desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
                         if (desc && desc.set) {
@@ -316,7 +286,6 @@ open class KRX18Provider : MainAPI() {
                         }
                     } catch(e) {}
 
-                    // 4. Hook JWPlayer setup của cả 2 server
                     try {
                         var origJw = window.jwplayer;
                         window.jwplayer = function() {
@@ -340,7 +309,6 @@ open class KRX18Provider : MainAPI() {
                         if (origJw && origJw.key) window.jwplayer.key = origJw.key;
                     } catch(e) {}
 
-                    // 5. Polling tự kích hoạt LoadPlay() nếu sự kiện DOMContentLoaded bị lỡ
                     var interval = setInterval(function() {
                         if (typeof window.LoadPlay === 'function' && !window._csLoadPlayCalled) {
                             window._csLoadPlayCalled = true;
@@ -371,8 +339,8 @@ open class KRX18Provider : MainAPI() {
 
             handler.post {
                 try {
-                    // SỬA LỖI TẠI ĐÂY: Lấy Context từ App thay vì app.context
-                    val ctx = com.lagradost.cloudstream3.App.getAppContext()
+                    // SỬ DỤNG LỆNH CHUẨN ĐỂ LẤY CONTEXT
+                    val ctx = App.getAppContext()
                     if (ctx == null) {
                         latch.countDown()
                         return@post
@@ -490,9 +458,6 @@ open class KRX18Provider : MainAPI() {
             return capturedUrl
         }
 
-        /**
-         * Kiểm tra cực kỳ nghiêm ngặt để loại bỏ 100% URL rác, quảng cáo, beacon gây lỗi 3003
-         */
         fun isValidStreamUrl(rawUrl: String): Boolean {
             var url = rawUrl.trim()
             if (url.startsWith("//")) url = "https:$url"
