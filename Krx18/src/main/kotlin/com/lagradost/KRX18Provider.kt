@@ -371,7 +371,14 @@ open class KRX18Provider : MainAPI() {
 
             handler.post {
                 try {
-                    val wv = WebView(app.context)
+                    // SỬA LỖI TẠI ĐÂY: Lấy Context từ App thay vì app.context
+                    val ctx = com.lagradost.cloudstream3.App.getAppContext()
+                    if (ctx == null) {
+                        latch.countDown()
+                        return@post
+                    }
+
+                    val wv = WebView(ctx)
                     webView = wv
                     val settings = wv.settings
                     settings.javaScriptEnabled = true
