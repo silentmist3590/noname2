@@ -103,7 +103,7 @@ class Moviecat3Provider : MainAPI() {
             this.plot = plot.ifBlank { null }
             this.year = year
             this.tags = tags
-            addActors(actors)
+            this.actors = actors.map { ActorData(Actor(it)) }
             this.recommendations = recs
         }
     }
