@@ -26,6 +26,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.coroutines.resume
+import com.lagradost.cloudstream3.App
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.invokeOnCancellation // (thường không cần import trực tiếp vì là extension)
 
 // ============================================================================
 // HỆ THỐNG LOG & CLIPBOARD
