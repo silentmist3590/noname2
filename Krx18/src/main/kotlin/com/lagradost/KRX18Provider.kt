@@ -2,46 +2,91 @@ package com.lagradost
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
-import android.os.Handler
-import android.os.Looper
+import android.os.Build
+import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.Toast
 import com.fasterxml.jackson.annotation.JsonProperty
-import com.lagradost.cloudstream3.HomePageList
-import com.lagradost.cloudstream3.HomePageResponse
-import com.lagradost.cloudstream3.LoadResponse
-import com.lagradost.cloudstream3.MainAPI
-import com.lagradost.cloudstream3.MainPageRequest
-import com.lagradost.cloudstream3.SearchResponse
-import com.lagradost.cloudstream3.SubtitleFile
-import com.lagradost.cloudstream3.TvType
-import com.lagradost.cloudstream3.VPNStatus
-import com.lagradost.cloudstream3.amap
-import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.fixUrlNull
-import com.lagradost.cloudstream3.mainPageOf
-import com.lagradost.cloudstream3.newHomePageResponse
-import com.lagradost.cloudstream3.newMovieLoadResponse
-import com.lagradost.cloudstream3.newMovieSearchResponse
-import com.lagradost.cloudstream3.utils.ExtractorApi
-import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.INFER_TYPE
-import com.lagradost.cloudstream3.utils.M3u8Helper
-import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.loadExtractor
-import com.lagradost.cloudstream3.utils.newExtractorLink
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.suspendCancellableCoroutine
 import org.jsoup.nodes.Element
 import java.lang.ref.WeakReference
 import java.net.URLDecoder
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlin.coroutines.resume
 
+// ============================================================================
+// HỆ THỐNG LOG & CLIPBOARD
+// ============================================================================
+object KrxLog {
+    private const val TAG = "KRX18"
+    private val buffer = mutableListOf<String>()
+    private val fmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    @Volatile private var lastCopyAt = 0L
+
+    @Synchronized
+    fun log(step: String, msg: String) {
+        val line = "${fmt.format(Date())} [$step] $msg"
+        buffer.add(line)
+        if (buffer.size > 200) buffer.removeAt(0)
+        Log.d(TAG, msg)
+    }
+
+    @Synchronized
+    fun logError(step: String, msg: String, e: Throwable? = null) {
+        val detail = if (e != null) "$msg | ${e.javaClass.simpleName}: ${e.message}" else msg
+        val line = "${fmt.format(Date())} [$step][ERR] $detail"
+        buffer.add(line)
+        if (buffer.size > 200) buffer.removeAt(0)
+        Log.e(TAG, detail)
+    }
+
+    @Synchronized
+    fun clear() {
+        buffer.clear()
+    }
+
+    @Synchronized
+    fun copyToClipboard(context: Context?, reason: String, force: Boolean = false) {
+        if (context == null) return
+        val now = System.currentTimeMillis()
+        if (!force && now - lastCopyAt < 2000L) return
+        lastCopyAt = now
+
+        try {
+            val header = buildString {
+                appendLine("=== KRX18 Debug Log ===")
+                appendLine("Reason: $reason")
+                appendLine("Time:   ${Date()}")
+                appendLine("Device: ${Build.MANUFACTURER} ${Build.MODEL} / Android ${Build.VERSION.RELEASE}")
+                appendLine("--- log ---")
+            }
+            val fullText = header + buffer.joinToString("\n")
+            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("KRX18 log", fullText))
+            Toast.makeText(context, "⚠ KRX18 log copied (${buffer.size} lines)", Toast.LENGTH_LONG).show()
+            Log.d(TAG, "Clipboard copied: $reason")
+        } catch (e: Throwable) {
+            Log.e(TAG, "Clipboard failed: ${e.message}")
+        }
+    }
+}
+
+// ============================================================================
+// PROVIDER CHÍNH
+// ============================================================================
 open class KRX18Provider : MainAPI() {
     override var mainUrl = "https://krx18.com"
     override var name = "KRX 18"
@@ -60,23 +105,13 @@ open class KRX18Provider : MainAPI() {
         "genre/philippines" to "Philippines",
     )
 
-    override suspend fun getMainPage(
-        page: Int,
-        request: MainPageRequest
-    ): HomePageResponse {
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = if (page <= 1) "$mainUrl/${request.data}/" else "$mainUrl/${request.data}/page/$page/"
         val document = app.get(url).document
         val home = document.select("#archive-content article, div.items.normal article, div.card.border-0, article.item")
             .mapNotNull { it.toSearchResult() }
             .distinctBy { it.url }
-        return newHomePageResponse(
-            list = HomePageList(
-                name = request.name,
-                list = home,
-                isHorizontalImages = false
-            ),
-            hasNext = home.isNotEmpty()
-        )
+        return newHomePageResponse(request.name, home, hasNext = home.isNotEmpty())
     }
 
     private fun Element.toSearchResult(): SearchResponse? {
@@ -91,6 +126,12 @@ open class KRX18Provider : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
+        // Lệnh kích hoạt copy log thủ công
+        if (query.trim().equals("!log", ignoreCase = true)) {
+            KrxLog.copyToClipboard(App.getAppContext(), "Manual Trigger", force = true)
+            return emptyList()
+        }
+
         val document = app.get("$mainUrl/?s=$query").document
         return document.select("#archive-content article, div.items.normal article, div.result-item article, article.item, div.card.border-0")
             .mapNotNull { it.toSearchResult() }
@@ -126,129 +167,121 @@ open class KRX18Provider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data).document
+        KrxLog.clear()
+        KrxLog.log("loadLinks", "Start data=$data")
+        val ctx = KRX18Provider.getSafeContext()
+        
         var hasFoundLinks = false
+        try {
+            val document = app.get(data).document
 
-        // 1. Quét các tùy chọn player của Dooplay
-        val playerOptions = document.select("li.dooplay_player_option, ul#playeroptionsul li, .player_options li")
-            .mapNotNull { li ->
-                val post = li.attr("data-post").trim().ifEmpty { null }
-                val nume = li.attr("data-nume").trim().ifEmpty { null }
-                val type = li.attr("data-type").trim().ifEmpty { "movie" }
-                if (post != null && nume != null && !nume.contains("trailer", ignoreCase = true)) {
-                    Triple(post, nume, type)
-                } else null
-            }.distinct()
+            // 1. Quét các tùy chọn player của Dooplay
+            val playerOptions = document.select("li.dooplay_player_option, ul#playeroptionsul li, .player_options li")
+                .mapNotNull { li ->
+                    val post = li.attr("data-post").trim().ifEmpty { null }
+                    val nume = li.attr("data-nume").trim().ifEmpty { null }
+                    val type = li.attr("data-type").trim().ifEmpty { "movie" }
+                    if (post != null && nume != null && !nume.contains("trailer", ignoreCase = true)) {
+                        Triple(post, nume, type)
+                    } else null
+                }.distinct()
 
-        playerOptions.amap { (post, nume, type) ->
-            try {
-                val response = app.post(
-                    url = "$mainUrl/wp-admin/admin-ajax.php",
-                    data = mapOf(
-                        "action" to "doo_player_ajax",
-                        "post" to post,
-                        "nume" to nume,
-                        "type" to type
-                    ),
-                    referer = data,
-                    headers = mapOf("X-Requested-With" to "XMLHttpRequest")
-                ).parsedSafe<ResponseHash>()
+            KrxLog.log("loadLinks", "Found ${playerOptions.size} player options")
 
-                var embedUrl = response?.embed_url?.trim()
-                if (!embedUrl.isNullOrEmpty()) {
-                    if (embedUrl.startsWith("//")) embedUrl = "https:$embedUrl"
-                    if (embedUrl.contains("<iframe", ignoreCase = true)) {
-                        embedUrl = Regex("""src=["'](.*?)["']""", RegexOption.IGNORE_CASE)
-                            .find(embedUrl)?.groupValues?.get(1) ?: embedUrl
-                    }
+            playerOptions.amap { (post, nume, type) ->
+                try {
+                    val response = app.post(
+                        url = "$mainUrl/wp-admin/admin-ajax.php",
+                        data = mapOf("action" to "doo_player_ajax", "post" to post, "nume" to nume, "type" to type),
+                        referer = data,
+                        headers = mapOf("X-Requested-With" to "XMLHttpRequest")
+                    ).parsedSafe<ResponseHash>()
 
-                    // Thử với extractor mặc định trước nếu có
-                    val loaded = loadExtractor(embedUrl, subtitleCallback, callback)
-                    if (!loaded) {
-                        val serverLabel = if (nume == "1") "Server 1" else "Server 2"
-                        val streamUrl = sniffStream(embedUrl, mainUrl)
-                        if (!streamUrl.isNullOrEmpty()) {
-                            hasFoundLinks = true
-                            emitStreamLink(streamUrl, serverLabel, embedUrl, callback)
+                    var embedUrl = response?.embed_url?.trim()
+                    if (!embedUrl.isNullOrEmpty()) {
+                        if (embedUrl.startsWith("//")) embedUrl = "https:$embedUrl"
+                        if (embedUrl.contains("<iframe", ignoreCase = true)) {
+                            embedUrl = Regex("""src=["'](.*?)["']""", RegexOption.IGNORE_CASE).find(embedUrl)?.groupValues?.get(1) ?: embedUrl
                         }
-                    } else {
-                        hasFoundLinks = true
+                        KrxLog.log("loadLinks", "Embed URL ($nume): $embedUrl")
+
+                        val loaded = loadExtractor(embedUrl, subtitleCallback, callback)
+                        if (!loaded) {
+                            val serverLabel = if (nume == "1") "Server 1" else "Server 2"
+                            val streamUrl = sniffStream(embedUrl, mainUrl)
+                            if (!streamUrl.isNullOrEmpty()) {
+                                KrxLog.log("loadLinks", "Sniffed URL: $streamUrl")
+                                hasFoundLinks = true
+                                emitStreamLink(streamUrl, serverLabel, embedUrl, callback)
+                            } else {
+                                KrxLog.logError("loadLinks", "Sniff failed for $embedUrl")
+                            }
+                        } else {
+                            hasFoundLinks = true
+                        }
                     }
+                } catch (e: Exception) {
+                    KrxLog.logError("loadLinks", "Player option error", e)
                 }
-            } catch (_: Exception) {}
-        }
+            }
 
-        // 2. Dự phòng: Quét các thẻ iframe trực tiếp nếu player_ajax rỗng
-        if (!hasFoundLinks) {
-            document.select("div.play iframe, div.source-box iframe, div.movieplay iframe").forEach { iframe ->
-                val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
-                if (src.isNotEmpty()) {
-                    val fixedSrc = if (src.startsWith("//")) "https:$src" else src
-                    val loaded = loadExtractor(fixedSrc, subtitleCallback, callback)
-                    if (!loaded) {
-                        val streamUrl = sniffStream(fixedSrc, mainUrl)
-                        if (!streamUrl.isNullOrEmpty()) {
+            // 2. Dự phòng
+            if (!hasFoundLinks) {
+                val iframes = document.select("div.play iframe, div.source-box iframe, div.movieplay iframe")
+                KrxLog.log("loadLinks", "Fallback: Found ${iframes.size} iframes")
+                iframes.forEach { iframe ->
+                    val src = iframe.attr("src").ifEmpty { iframe.attr("data-src") }
+                    if (src.isNotEmpty()) {
+                        val fixedSrc = if (src.startsWith("//")) "https:$src" else src
+                        val loaded = loadExtractor(fixedSrc, subtitleCallback, callback)
+                        if (!loaded) {
+                            val streamUrl = sniffStream(fixedSrc, mainUrl)
+                            if (!streamUrl.isNullOrEmpty()) {
+                                hasFoundLinks = true
+                                emitStreamLink(streamUrl, "Direct", fixedSrc, callback)
+                            }
+                        } else {
                             hasFoundLinks = true
-                            emitStreamLink(streamUrl, "Direct", fixedSrc, callback)
                         }
-                    } else {
-                        hasFoundLinks = true
                     }
                 }
             }
+        } catch (e: Exception) {
+            KrxLog.logError("loadLinks", "Outer error", e)
         }
 
+        if (!hasFoundLinks) {
+            KrxLog.logError("loadLinks", "No links found at all!")
+            KrxLog.copyToClipboard(ctx, "loadLinks returned false", force = true)
+        } else {
+            KrxLog.log("loadLinks", "Success!")
+        }
+        
         return hasFoundLinks
     }
 
-    private suspend fun emitStreamLink(
-        streamUrl: String,
-        serverLabel: String,
-        referer: String,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    private suspend fun emitStreamLink(streamUrl: String, serverLabel: String, referer: String, callback: (ExtractorLink) -> Unit) {
         var finalUrl = streamUrl.trim()
         if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
 
         if (finalUrl.contains(".m3u8", ignoreCase = true)) {
             val m3u8List = try {
-                M3u8Helper.generateM3u8(
-                    source = "$name ($serverLabel)",
-                    streamUrl = finalUrl,
-                    referer = referer,
-                    headers = mapOf("Referer" to referer, "Origin" to referer)
-                )
-            } catch (_: Exception) {
-                emptyList()
-            }
+                M3u8Helper.generateM3u8("$name ($serverLabel)", finalUrl, referer, headers = mapOf("Referer" to referer, "Origin" to referer))
+            } catch (_: Exception) { emptyList() }
 
             if (m3u8List.isNotEmpty()) {
                 m3u8List.forEach(callback)
             } else {
-                callback.invoke(
-                    newExtractorLink(
-                        source = "$name ($serverLabel)",
-                        name = "$name ($serverLabel) HLS",
-                        url = finalUrl,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = referer
-                        this.quality = Qualities.P1080.value
-                    }
-                )
-            }
-        } else {
-            callback.invoke(
-                newExtractorLink(
-                    source = "$name ($serverLabel)",
-                    name = "$name ($serverLabel) MP4",
-                    url = finalUrl,
-                    type = INFER_TYPE
-                ) {
+                callback.invoke(newExtractorLink("$name ($serverLabel)", "$name ($serverLabel) HLS", finalUrl, INFER_TYPE) {
                     this.referer = referer
                     this.quality = Qualities.P1080.value
-                }
-            )
+                })
+            }
+        } else {
+            callback.invoke(newExtractorLink("$name ($serverLabel)", "$name ($serverLabel) MP4", finalUrl, INFER_TYPE) {
+                this.referer = referer
+                this.quality = Qualities.P1080.value
+            })
         }
     }
 
@@ -259,24 +292,14 @@ open class KRX18Provider : MainAPI() {
     )
 
     companion object {
-        
-        /**
-         * Hàm lấy Context an toàn 100%, tự động dò tìm qua Reflection
-         * để tương thích với mọi phiên bản CloudStream (3.x, 4.x).
-         */
         fun getSafeContext(): Context? {
-            // Cách 1: Dùng CommonActivity (Chuẩn nhất cho hầu hết các bản)
             try {
                 val clazz = Class.forName("com.lagradost.cloudstream3.CommonActivity")
-                
-                // Thử hàm getActivity() (Bản mới)
                 try {
                     val method = clazz.getMethod("getActivity")
                     val activity = method.invoke(null) as? Activity
                     if (activity != null) return activity.applicationContext
                 } catch (_: Exception) {}
-                
-                // Thử biến static activity (Bản cũ)
                 try {
                     val field = clazz.getDeclaredField("activity")
                     field.isAccessible = true
@@ -284,37 +307,29 @@ open class KRX18Provider : MainAPI() {
                     if (obj is WeakReference<*>) {
                         val activity = obj.get() as? Activity
                         if (activity != null) return activity.applicationContext
-                    } else if (obj is Activity) {
-                        return obj.applicationContext
-                    }
+                    } else if (obj is Activity) return obj.applicationContext
                 } catch (_: Exception) {}
             } catch (_: Exception) {}
             
-            // Cách 2: Dùng App.getAppContext() (Bản mới)
             try {
                 val clazz = Class.forName("com.lagradost.cloudstream3.App")
                 val method = clazz.getMethod("getAppContext")
                 val ctx = method.invoke(null) as? Context
                 if (ctx != null) return ctx
             } catch (_: Exception) {}
-
             return null
         }
 
         @SuppressLint("SetJavaScriptEnabled")
-        fun sniffStream(url: String, referer: String): String? {
-            val handler = Handler(Looper.getMainLooper())
-            val latch = CountDownLatch(1)
-            var capturedUrl: String? = null
+        suspend fun sniffStream(url: String, referer: String): String? = suspendCancellableCoroutine { continuation ->
+            val handler = android.os.Handler(android.os.Looper.getMainLooper())
             var webView: WebView? = null
 
             val injectionScript = """
                 (function() {
                     try {
                         Object.defineProperty(window, 'top', {
-                            get: function() {
-                                return { location: { href: 'https://krx18.com/', hostname: 'krx18.com' } };
-                            },
+                            get: function() { return { location: { href: 'https://krx18.com/', hostname: 'krx18.com' } }; },
                             configurable: true
                         });
                     } catch(e) {}
@@ -342,12 +357,8 @@ open class KRX18Provider : MainAPI() {
                         var desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
                         if (desc && desc.set) {
                             Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-                                set: function(val) {
-                                    notifyUrl(val);
-                                    return desc.set.apply(this, arguments);
-                                },
-                                get: desc.get,
-                                configurable: true
+                                set: function(val) { notifyUrl(val); return desc.set.apply(this, arguments); },
+                                get: desc.get, configurable: true
                             });
                         }
                     } catch(e) {}
@@ -403,12 +414,19 @@ open class KRX18Provider : MainAPI() {
                 })();
             """.trimIndent()
 
+            // Hủy WebView nếu Coroutine bị hủy (VD: user back ra ngoài)
+            continuation.invokeOnCancellation {
+                handler.post {
+                    webView?.stopLoading()
+                    webView?.destroy()
+                }
+            }
+
             handler.post {
                 try {
-                    // SỬ DỤNG HÀM SAFE CONTEXT ĐỂ TRÁNH LỖI IMPORT
                     val ctx = getSafeContext()
                     if (ctx == null) {
-                        latch.countDown()
+                        if (continuation.isActive) continuation.resume(null)
                         return@post
                     }
 
@@ -423,15 +441,12 @@ open class KRX18Provider : MainAPI() {
 
                     val cookieManager = CookieManager.getInstance()
                     cookieManager.setAcceptCookie(true)
-                    try {
-                        cookieManager.setAcceptThirdPartyCookies(wv, true)
-                    } catch (_: Exception) {}
+                    try { cookieManager.setAcceptThirdPartyCookies(wv, true) } catch (_: Exception) {}
 
                     fun checkUrl(targetUrl: String?): Boolean {
                         if (targetUrl.isNullOrEmpty()) return false
                         if (isValidStreamUrl(targetUrl)) {
-                            capturedUrl = targetUrl
-                            latch.countDown()
+                            if (continuation.isActive) continuation.resume(targetUrl)
                             return true
                         }
                         return false
@@ -440,9 +455,7 @@ open class KRX18Provider : MainAPI() {
                     wv.webChromeClient = object : WebChromeClient() {
                         override fun onProgressChanged(view: WebView?, newProgress: Int) {
                             super.onProgressChanged(view, newProgress)
-                            if (newProgress >= 30) {
-                                view?.evaluateJavascript(injectionScript, null)
-                            }
+                            if (newProgress >= 30) view?.evaluateJavascript(injectionScript, null)
                         }
                     }
 
@@ -460,11 +473,7 @@ open class KRX18Provider : MainAPI() {
                         override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                             val reqUrl = request?.url?.toString() ?: return false
                             if (reqUrl.startsWith("cloudstream://stream?url=")) {
-                                val stream = try {
-                                    URLDecoder.decode(reqUrl.substringAfter("cloudstream://stream?url="), "UTF-8")
-                                } catch (_: Exception) {
-                                    reqUrl.substringAfter("cloudstream://stream?url=")
-                                }
+                                val stream = try { URLDecoder.decode(reqUrl.substringAfter("cloudstream://stream?url="), "UTF-8") } catch (_: Exception) { reqUrl.substringAfter("cloudstream://stream?url=") }
                                 return checkUrl(stream)
                             }
                             return false
@@ -474,22 +483,14 @@ open class KRX18Provider : MainAPI() {
                         override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
                             val s = url ?: return false
                             if (s.startsWith("cloudstream://stream?url=")) {
-                                val stream = try {
-                                    URLDecoder.decode(s.substringAfter("cloudstream://stream?url="), "UTF-8")
-                                } catch (_: Exception) {
-                                    s.substringAfter("cloudstream://stream?url=")
-                                }
+                                val stream = try { URLDecoder.decode(s.substringAfter("cloudstream://stream?url="), "UTF-8") } catch (_: Exception) { s.substringAfter("cloudstream://stream?url=") }
                                 return checkUrl(stream)
                             }
                             return false
                         }
 
-                        override fun shouldInterceptRequest(
-                            view: WebView?,
-                            request: WebResourceRequest?
-                        ): WebResourceResponse? {
-                            val reqUrl = request?.url?.toString()
-                            checkUrl(reqUrl)
+                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                            checkUrl(request?.url?.toString())
                             return super.shouldInterceptRequest(view, request)
                         }
 
@@ -499,37 +500,27 @@ open class KRX18Provider : MainAPI() {
                         }
                     }
 
-                    val headers = mapOf(
-                        "Referer" to referer,
-                        "User-Agent" to "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
-                    )
-                    wv.loadUrl(url, headers)
-                } catch (_: Exception) {
-                    latch.countDown()
+                    wv.loadUrl(url, mapOf("Referer" to referer, "User-Agent" to settings.userAgentString))
+                    
+                    // Đặt Timeout 15 giây
+                    handler.postDelayed({
+                        if (continuation.isActive) {
+                            KrxLog.logError("sniff", "WebView Timeout (15s) for $url")
+                            continuation.resume(null)
+                        }
+                    }, 15000)
+
+                } catch (e: Exception) {
+                    KrxLog.logError("sniff", "Exception initializing WebView", e)
+                    if (continuation.isActive) continuation.resume(null)
                 }
             }
-
-            try {
-                latch.await(15, TimeUnit.SECONDS)
-            } catch (_: Exception) {}
-
-            handler.post {
-                try {
-                    webView?.stopLoading()
-                    webView?.loadUrl("about:blank")
-                    webView?.destroy()
-                } catch (_: Exception) {}
-            }
-
-            return capturedUrl
         }
 
         fun isValidStreamUrl(rawUrl: String): Boolean {
             var url = rawUrl.trim()
             if (url.startsWith("//")) url = "https:$url"
-            if (!url.startsWith("http://", ignoreCase = true) && !url.startsWith("https://", ignoreCase = true)) {
-                return false
-            }
+            if (!url.startsWith("http://", ignoreCase = true) && !url.startsWith("https://", ignoreCase = true)) return false
 
             val clean = url.substringBefore("?").substringBefore("#").lowercase()
             val full = url.lowercase()
@@ -543,9 +534,7 @@ open class KRX18Provider : MainAPI() {
                 ".html", ".htm", ".php", "abyss.to/?"
             )
 
-            if (blacklisted.any { clean.contains(it) || full.contains(it) }) {
-                return false
-            }
+            if (blacklisted.any { clean.contains(it) || full.contains(it) }) return false
 
             val isM3u8 = clean.endsWith(".m3u8") || clean.contains("/master.m3u8") || clean.contains("/playlist.m3u8")
             val isMp4 = clean.endsWith(".mp4") || clean.endsWith(".m4v")
@@ -562,54 +551,17 @@ class PlayKrx18 : ExtractorApi() {
     override val mainUrl = "https://play.playkrx18.site"
     override val requiresReferer = true
 
-    override suspend fun getUrl(
-        url: String,
-        referer: String?,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ) {
+    override suspend fun getUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         val stream = KRX18Provider.sniffStream(url, referer ?: "$mainUrl/")
         if (!stream.isNullOrEmpty()) {
             var finalUrl = stream.trim()
             if (finalUrl.startsWith("//")) finalUrl = "https:$finalUrl"
             if (finalUrl.contains(".m3u8", ignoreCase = true)) {
-                val m3u8 = try {
-                    M3u8Helper.generateM3u8(
-                        name,
-                        finalUrl,
-                        referer ?: "$mainUrl/",
-                        headers = mapOf("Referer" to (referer ?: "$mainUrl/"))
-                    )
-                } catch (_: Exception) {
-                    emptyList()
-                }
-                if (m3u8.isNotEmpty()) {
-                    m3u8.forEach(callback)
-                } else {
-                    callback.invoke(
-                        newExtractorLink(
-                            source = name,
-                            name = "$name HLS",
-                            url = finalUrl,
-                            type = INFER_TYPE
-                        ) {
-                            this.referer = referer ?: "$mainUrl/"
-                            this.quality = Qualities.P1080.value
-                        }
-                    )
-                }
+                val m3u8 = try { M3u8Helper.generateM3u8(name, finalUrl, referer ?: "$mainUrl/", headers = mapOf("Referer" to (referer ?: "$mainUrl/"))) } catch (_: Exception) { emptyList() }
+                if (m3u8.isNotEmpty()) m3u8.forEach(callback)
+                else callback.invoke(newExtractorLink(name, "$name HLS", finalUrl, INFER_TYPE) { this.referer = referer ?: "$mainUrl/"; this.quality = Qualities.P1080.value })
             } else {
-                callback.invoke(
-                    newExtractorLink(
-                        source = name,
-                        name = "$name MP4",
-                        url = finalUrl,
-                        type = INFER_TYPE
-                    ) {
-                        this.referer = referer ?: "$mainUrl/"
-                        this.quality = Qualities.P1080.value
-                    }
-                )
+                callback.invoke(newExtractorLink(name, "$name MP4", finalUrl, INFER_TYPE) { this.referer = referer ?: "$mainUrl/"; this.quality = Qualities.P1080.value })
             }
         }
     }
