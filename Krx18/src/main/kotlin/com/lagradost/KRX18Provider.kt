@@ -28,7 +28,6 @@ import java.util.Locale
 import kotlin.coroutines.resume
 import com.lagradost.cloudstream3.app
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.invokeOnCancellation // (thường không cần import trực tiếp vì là extension)
 
 // ============================================================================
 // HỆ THỐNG LOG & CLIPBOARD
@@ -131,7 +130,7 @@ open class KRX18Provider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         // Lệnh kích hoạt copy log thủ công
         if (query.trim().equals("!log", ignoreCase = true)) {
-            KrxLog.copyToClipboard(app.getAppContext(), "Manual Trigger", force = true)
+            KrxLog.copyToClipboard(app.getSafeContext(), "Manual Trigger", force = true)
             return emptyList()
         }
 
