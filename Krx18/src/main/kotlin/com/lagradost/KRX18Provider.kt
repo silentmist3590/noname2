@@ -210,7 +210,7 @@ open class KRX18Provider : MainAPI() {
                         val loaded = loadExtractor(embedUrl, subtitleCallback, callback)
                         if (!loaded) {
                             val serverLabel = if (nume == "1") "Server 1" else "Server 2"
-                            val streamUrl = sniffStream(embedUrl, mainUrl)
+                            val streamUrl = sniffStream(embedUrl, data)
                             if (!streamUrl.isNullOrEmpty()) {
                                 KrxLog.log("loadLinks", "Sniffed URL: $streamUrl")
                                 hasFoundLinks = true
@@ -330,6 +330,8 @@ open class KRX18Provider : MainAPI() {
             val injectionScript = """
                 (function() {
                     try {
+                        // Log để xác nhận script đã chạy
+                        window.location.href = 'cloudstream://log?msg=' + encodeURIComponent('KRX18 injection script executed');
                         Object.defineProperty(window, 'top', {
                             get: function() { return { location: { href: 'https://krx18.com/', hostname: 'krx18.com' } }; },
                             configurable: true
@@ -464,11 +466,13 @@ open class KRX18Provider : MainAPI() {
                     wv.webViewClient = object : WebViewClient() {
                         override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                             super.onPageStarted(view, url, favicon)
+                            KrxLog.log("sniff", "Page started loading: $url") // Thêm log
                             view?.evaluateJavascript(injectionScript, null)
                         }
 
                         override fun onPageFinished(view: WebView?, url: String?) {
                             super.onPageFinished(view, url)
+                            KrxLog.log("sniff", "Page finished loading: $url") // Thêm log
                             view?.evaluateJavascript(injectionScript, null)
                         }
 
@@ -510,7 +514,7 @@ open class KRX18Provider : MainAPI() {
                             KrxLog.logError("sniff", "WebView Timeout (15s) for $url")
                             continuation.resume(null)
                         }
-                    }, 15000)
+                    }, 30000)
 
                 } catch (e: Exception) {
                     KrxLog.logError("sniff", "Exception initializing WebView", e)
