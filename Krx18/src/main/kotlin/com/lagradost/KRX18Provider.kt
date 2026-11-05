@@ -1,6 +1,8 @@
 package com.lagradost
 
 import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Context
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
@@ -11,7 +13,6 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import com.fasterxml.jackson.annotation.JsonProperty
-import com.lagradost.cloudstream3.App // <-- IMPORT TƯỜNG MINH ĐỂ SỬA LỖI
 import com.lagradost.cloudstream3.HomePageList
 import com.lagradost.cloudstream3.HomePageResponse
 import com.lagradost.cloudstream3.LoadResponse
@@ -36,6 +37,7 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.jsoup.nodes.Element
+import java.lang.ref.WeakReference
 import java.net.URLDecoder
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -257,6 +259,48 @@ open class KRX18Provider : MainAPI() {
     )
 
     companion object {
+        
+        /**
+         * Hàm lấy Context an toàn 100%, tự động dò tìm qua Reflection
+         * để tương thích với mọi phiên bản CloudStream (3.x, 4.x).
+         */
+        fun getSafeContext(): Context? {
+            // Cách 1: Dùng CommonActivity (Chuẩn nhất cho hầu hết các bản)
+            try {
+                val clazz = Class.forName("com.lagradost.cloudstream3.CommonActivity")
+                
+                // Thử hàm getActivity() (Bản mới)
+                try {
+                    val method = clazz.getMethod("getActivity")
+                    val activity = method.invoke(null) as? Activity
+                    if (activity != null) return activity.applicationContext
+                } catch (_: Exception) {}
+                
+                // Thử biến static activity (Bản cũ)
+                try {
+                    val field = clazz.getDeclaredField("activity")
+                    field.isAccessible = true
+                    val obj = field.get(null)
+                    if (obj is WeakReference<*>) {
+                        val activity = obj.get() as? Activity
+                        if (activity != null) return activity.applicationContext
+                    } else if (obj is Activity) {
+                        return obj.applicationContext
+                    }
+                } catch (_: Exception) {}
+            } catch (_: Exception) {}
+            
+            // Cách 2: Dùng App.getAppContext() (Bản mới)
+            try {
+                val clazz = Class.forName("com.lagradost.cloudstream3.App")
+                val method = clazz.getMethod("getAppContext")
+                val ctx = method.invoke(null) as? Context
+                if (ctx != null) return ctx
+            } catch (_: Exception) {}
+
+            return null
+        }
+
         @SuppressLint("SetJavaScriptEnabled")
         fun sniffStream(url: String, referer: String): String? {
             val handler = Handler(Looper.getMainLooper())
@@ -264,19 +308,12 @@ open class KRX18Provider : MainAPI() {
             var capturedUrl: String? = null
             var webView: WebView? = null
 
-            // Kịch bản JS: Chặn redirect Abyss + Hook hàm phát video ngay tức thì
             val injectionScript = """
                 (function() {
-                    // 1. Chống chuyển hướng chống-iframe của Abyss (mov18plus) về abyss.to
                     try {
                         Object.defineProperty(window, 'top', {
                             get: function() {
-                                return {
-                                    location: {
-                                        href: 'https://krx18.com/',
-                                        hostname: 'krx18.com'
-                                    }
-                                };
+                                return { location: { href: 'https://krx18.com/', hostname: 'krx18.com' } };
                             },
                             configurable: true
                         });
@@ -293,7 +330,6 @@ open class KRX18Provider : MainAPI() {
                         }
                     }
 
-                    // 2. Hook trực tiếp player_9stream của PlayKrx18 Server 1
                     try {
                         var orig9 = window.player_9stream;
                         window.player_9stream = function(playlist, verfile) {
@@ -302,7 +338,6 @@ open class KRX18Provider : MainAPI() {
                         };
                     } catch(e) {}
 
-                    // 3. Hook HTMLMediaElement.prototype.src cho video tag
                     try {
                         var desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
                         if (desc && desc.set) {
@@ -317,7 +352,6 @@ open class KRX18Provider : MainAPI() {
                         }
                     } catch(e) {}
 
-                    // 4. Hook JWPlayer setup của cả 2 server
                     try {
                         var origJw = window.jwplayer;
                         window.jwplayer = function() {
@@ -341,7 +375,6 @@ open class KRX18Provider : MainAPI() {
                         if (origJw && origJw.key) window.jwplayer.key = origJw.key;
                     } catch(e) {}
 
-                    // 5. Polling tự kích hoạt LoadPlay() nếu sự kiện DOMContentLoaded bị lỡ
                     var interval = setInterval(function() {
                         if (typeof window.LoadPlay === 'function' && !window._csLoadPlayCalled) {
                             window._csLoadPlayCalled = true;
@@ -372,8 +405,8 @@ open class KRX18Provider : MainAPI() {
 
             handler.post {
                 try {
-                    // SỬ DỤNG IMPORT TƯỜNG MINH ĐỂ FIX LỖI
-                    val ctx = App.getAppContext()
+                    // SỬ DỤNG HÀM SAFE CONTEXT ĐỂ TRÁNH LỖI IMPORT
+                    val ctx = getSafeContext()
                     if (ctx == null) {
                         latch.countDown()
                         return@post
@@ -491,9 +524,6 @@ open class KRX18Provider : MainAPI() {
             return capturedUrl
         }
 
-        /**
-         * Kiểm tra cực kỳ nghiêm ngặt để loại bỏ 100% URL rác, quảng cáo, beacon gây lỗi 3003
-         */
         fun isValidStreamUrl(rawUrl: String): Boolean {
             var url = rawUrl.trim()
             if (url.startsWith("//")) url = "https:$url"
