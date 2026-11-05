@@ -130,7 +130,7 @@ open class KRX18Provider : MainAPI() {
     override suspend fun search(query: String): List<SearchResponse> {
         // Lệnh kích hoạt copy log thủ công
         if (query.trim().equals("!log", ignoreCase = true)) {
-            KrxLog.copyToClipboard(app.getSafeContext(), "Manual Trigger", force = true)
+            KrxLog.copyToClipboard(KRX18Provider.getSafeContext(), "Manual Trigger", force = true)
             return emptyList()
         }
 
