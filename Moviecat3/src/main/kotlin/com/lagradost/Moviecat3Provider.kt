@@ -138,11 +138,50 @@ class Moviecat3Provider : MainAPI() {
             val n = i + 1
             try {
                 val html = app.get(wp, headers = hdr).text
-                var embed = iframeRegex.findAll(html).map { it.groupValues[1].replace("\\/", "/") }
-                    .firstOrNull { !it.contains("facebook") && !it.contains("ads") }
-                    ?: embedRegex.find(html)?.value?.replace("\\/", "/")
-                embed = embed?.let { if (it.startsWith("//")) "https:$it" else fixUrl(it) }
-                ClipboardLogger.logAndCopy("Server $n", "watch=$wp\nembed=$embed\nhtmlLen=${html.length}")
+                val findEmbed = { t: String ->
+                    (iframeRegex.findAll(t).map { it.groupValues[1].replace("\\/", "/") }
+                        .firstOrNull { !it.contains("facebook") && !it.contains("ads") }
+                        ?: Regex("""https?:\\?/\\?/hlsfree\.com[^"'\s<>\\]*""").find(t)?.value?.replace("\\/", "/")
+                        ?: Regex("""(?:src|data-embed|data-src)=["']([^"']*/embed/[^"']+)["']""").find(t)?.groupValues?.get(1)
+                        ?: embedRegex.find(t)?.value?.replace("\\/", "/"))
+                        ?.let { if (it.startsWith("//")) "https:$it" else fixUrl(it) }
+                }
+                var embed = findEmbed(html)
+                if (embed == null) {
+                    // Player nạp bằng AJAX (player.php) giống JS của theme HaLim
+                    fun cfg(k: String) = Regex(""""$k"\s*:\s*"?([^",}]*)"?""").find(html)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
+                    val purl = cfg("player_url").ifBlank { "$mainUrl/wp-content/themes/halimmovies/player.php" }
+                    val nonce = Regex("""data-nonce=["']([^"']+)["']""").find(html)?.groupValues?.get(1) ?: ""
+                    val r = app.get(
+                        purl,
+                        params = mapOf(
+                            "episode_slug" to cfg("episode_slug").ifBlank { "full" },
+                            "server_id" to cfg("server").ifBlank { "${n}" },
+                            "subsv_id" to "",
+                            "post_id" to cfg("post_id"),
+                            "nonce" to nonce,
+                            "custom_var" to cfg("custom_var")
+                        ),
+                        headers = hdr + mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to wp)
+                    )
+                    ClipboardLogger.logAndCopy("Server $n player.php", "url=$purl nonce=$nonce HTTP ${r.code}\n${r.text.take(700)}")
+                    embed = findEmbed(r.text)
+                    if (embed == null) {
+                        val m = m3u8Regex.find(r.text)?.groupValues?.get(1)
+                        if (m != null) { emit(callback, "Moviecat3 S$n", m, "https://hlsfree.com/", ExtractorLinkType.M3U8); found = true; return@forEachIndexed }
+                    }
+                }
+                if (embed == null) {
+                    // Cuối cùng: mở thẳng trang watch trong WebView và bắt m3u8
+                    val seen = mutableListOf<String>()
+                    val hit = sniffStream(wp, "$mainUrl/", ua, seen, Regex("""\.m3u8|\.mpd|/api/hls/serve""", RegexOption.IGNORE_CASE), 40_000L)
+                    ClipboardLogger.logAndCopy("Server $n WebView(watch)", "hit=$hit\nrequests(${seen.size}):\n" + seen.joinToString("\n"))
+                    if (hit != null) {
+                        emit(callback, "Moviecat3 S$n", hit, if (hit.contains("hlsfree.com")) "https://hlsfree.com/" else "$mainUrl/", ExtractorLinkType.M3U8)
+                        found = true
+                    }
+                    return@forEachIndexed
+                }
                 if (embed == null) return@forEachIndexed
 
                 val ep = app.get(embed, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")).text
