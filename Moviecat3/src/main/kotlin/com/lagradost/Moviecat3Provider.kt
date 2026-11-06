@@ -37,11 +37,12 @@ class Moviecat3Provider : MainAPI() {
     private val hdr get() = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")
 
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Latest",
-        "$mainUrl/horror" to "Horror",
-        "$mainUrl/tag/1980s" to "1980s",
-        "$mainUrl/tag/1990s" to "1990s",
-        "$mainUrl/tag/2000s" to "2000s"
+        "$mainUrl/asian-erotica" to "Asian Erotica",
+        "$mainUrl/sex-education" to "Sex Education",
+        "$mainUrl/classic-erotica" to "Classic Erotica",
+        "$mainUrl/classic-porn" to "Classic Porn",
+        "$mainUrl/newage-porn" to "New Age Porn",
+        "$mainUrl/asian" to "Asian"
     )
 
     private fun pageUrl(base: String, page: Int): String {
