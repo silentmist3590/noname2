@@ -114,6 +114,18 @@ class Moviecat3Provider : MainAPI() {
     private val embedRegex = Regex("""https?:\\?/\\?/[^"'\s<>\\]+\\?/embed\\?/[^"'\s<>\\]+""")
     private val subRegex = Regex("""https?:\\?/\\?/[^"'\s<>\\]+\.(?:vtt|srt)(?:\?[^"'\s<>\\]*)?""")
 
+    /** GET có thử lại khi site trả 5xx (Cloudflare 521/522...) hoặc trang lỗi. */
+    private suspend fun getRetry(url: String, headers: Map<String, String>, params: Map<String, String> = emptyMap(), tries: Int = 4): com.lagradost.nicehttp.NiceResponse {
+        var r = app.get(url, headers = headers, params = params)
+        var i = 1
+        while (r.code >= 500 && i < tries) {
+            kotlinx.coroutines.delay(1500L * i)
+            r = app.get(url, headers = headers, params = params)
+            i++
+        }
+        return r
+    }
+
     private suspend fun emit(callback: (ExtractorLink) -> Unit, label: String, url: String, ref: String, type: ExtractorLinkType) {
         val o = Regex("""^(https?://[^/]+)""").find(ref)?.groupValues?.get(1) ?: mainUrl
         callback.invoke(
@@ -138,7 +150,7 @@ class Moviecat3Provider : MainAPI() {
         pages.forEachIndexed { i, wp ->
             val n = i + 1
             try {
-                val html = app.get(wp, headers = hdr).text
+                val html = getRetry(wp, hdr).text
                 val findEmbed = { t: String ->
                     (iframeRegex.findAll(t).map { it.groupValues[1].replace("\\/", "/") }
                         .firstOrNull { !it.contains("facebook") && !it.contains("ads") }
@@ -153,8 +165,9 @@ class Moviecat3Provider : MainAPI() {
                     fun cfg(k: String) = Regex(""""$k"\s*:\s*"?([^",}]*)"?""").find(html)?.groupValues?.get(1)?.replace("\\/", "/") ?: ""
                     val purl = cfg("player_url").ifBlank { "$mainUrl/wp-content/themes/halimmovies/player.php" }
                     val nonce = Regex("""data-nonce=["']([^"']+)["']""").find(html)?.groupValues?.get(1) ?: ""
-                    val r = app.get(
+                    val r = getRetry(
                         purl,
+                        headers = hdr + mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to wp),
                         params = mapOf(
                             "episode_slug" to cfg("episode_slug").ifBlank { "full" },
                             "server_id" to cfg("server").ifBlank { "${n}" },
@@ -162,8 +175,7 @@ class Moviecat3Provider : MainAPI() {
                             "post_id" to cfg("post_id"),
                             "nonce" to nonce,
                             "custom_var" to cfg("custom_var")
-                        ),
-                        headers = hdr + mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to wp)
+                        )
                     )
                     ClipboardLogger.logAndCopy("Server $n player.php", "url=$purl nonce=$nonce HTTP ${r.code}\n${r.text.take(700)}")
                     embed = findEmbed(r.text)
