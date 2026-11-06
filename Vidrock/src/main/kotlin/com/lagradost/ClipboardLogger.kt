@@ -1,4 +1,4 @@
-package com.moviecat3
+package com.lagradost
 
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -9,41 +9,33 @@ import android.util.Log
 import com.lagradost.cloudstream3.CloudStreamApp
 
 object ClipboardLogger {
-    private const val TAG = "Moviecat3Logger"
-    private const val MAX_CHARS = 60_000
+    private const val TAG = "VidrockLogger"
 
-    /** true = luôn copy log vào clipboard; false = chỉ copy khi tiêu đề chứa "Error"/"Exception". */
-    private const val COPY_ALWAYS = true
-
-    private val buffer = StringBuilder()
-
-    /** Xoá log cũ (gọi ở đầu mỗi phiên: load / loadLinks). */
-    @Synchronized
-    fun reset() {
-        buffer.setLength(0)
-    }
-
-    /** Ghi nối tiếp vào bộ đệm rồi copy TOÀN BỘ log vào clipboard. */
-    @Synchronized
     fun logAndCopy(title: String, message: String) {
-        val entry = "=== [$title] ===\n$message\n"
-        Log.d(TAG, entry)
-        buffer.append(entry).append('\n')
-        if (buffer.length > MAX_CHARS) buffer.delete(0, buffer.length - MAX_CHARS)
-        if (!COPY_ALWAYS && !title.contains("Error", true) && !title.contains("Exception", true)) return
-        val text = buffer.toString()
+        val logMessage = "=== [$title] ===\n$message\n==================="
+        Log.d(TAG, logMessage)
+
         try {
             val context = CloudStreamApp.context ?: return
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+
             Handler(Looper.getMainLooper()).post {
-                try {
-                    clipboard.setPrimaryClip(ClipData.newPlainText("Moviecat3 Log", text))
-                } catch (e: Exception) {
-                    Log.e(TAG, "Failed to copy to clipboard", e)
-                }
+                val clip = ClipData.newPlainText("Plugin Log", logMessage)
+                clipboard.setPrimaryClip(clip)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to copy to clipboard", e)
+        }
+    }
+
+    fun reset() {
+        try {
+            val ctx = CloudStreamApp.context ?: return
+            val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            cm.setPrimaryClip(ClipData.newPlainText("", ""))
+            Log.d(TAG, "Clipboard reset")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to reset clipboard: ${e.message}")
         }
     }
 }
