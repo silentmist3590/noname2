@@ -184,6 +184,15 @@ class Moviecat3Provider : MainAPI() {
                 }
                 if (embed == null) return@forEachIndexed
 
+                // hlsfast.com/#id -> API resolve -> trang player thật (vd turboembed.com/xxxx)
+                if (embed.contains("hlsfast.com") && embed.contains("#")) {
+                    val id = embed.substringAfter("#")
+                    val base = Regex("""^(https?://[^/]+)""").find(embed)!!.groupValues[1]
+                    val rr = app.get("$base/api/public/resolve?file1=$id", headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"))
+                    ClipboardLogger.logAndCopy("Server $n resolve", "HTTP ${rr.code}\n${rr.text.take(300)}")
+                    val u = Regex("\"url\"\\s*:\\s*\"([^\"]+)\"").find(rr.text)?.groupValues?.get(1)?.replace("\\/", "/")
+                    if (u != null) embed = u
+                }
                 val ep = app.get(embed, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")).text
                 subRegex.findAll(ep).map { it.value.replace("\\/", "/") }.distinct().forEach {
                     subtitleCallback.invoke(SubtitleFile("English", it))
@@ -202,10 +211,10 @@ class Moviecat3Provider : MainAPI() {
                 if (ok) { found = true; return@forEachIndexed }
                 // Fallback 2: WebView
                 val seen = mutableListOf<String>()
-                val hit = sniffStream(embed, "$mainUrl/", ua, seen, Regex("""\.m3u8|\.mpd|/api/hls/serve""", RegexOption.IGNORE_CASE), 30_000L)
+                val hit = sniffStream(embed, "$mainUrl/", ua, seen, Regex("""\.m3u8|\.mpd|\.mp4(\?|$)|/api/hls/serve""", RegexOption.IGNORE_CASE), 40_000L)
                 ClipboardLogger.logAndCopy("Server $n WebView", "hit=$hit\nrequests(${seen.size}):\n" + seen.joinToString("\n"))
                 if (hit != null) {
-                    emit(callback, "Moviecat3 S$n", hit, embed, ExtractorLinkType.M3U8)
+                    emit(callback, "Moviecat3 S$n", hit, embed, if (hit.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8)
                     found = true
                 }
             } catch (e: Exception) {
