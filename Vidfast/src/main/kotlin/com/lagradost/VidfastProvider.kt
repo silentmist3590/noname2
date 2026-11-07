@@ -25,8 +25,8 @@ import org.json.JSONObject
 // 1. CẤU HÌNH API KEY VÀ PROXY
 // =====================================================================================
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
-private const val TMDB_API_KEY = "YOUR_TMDB_API_KEY"
-private const val OMDB_API_KEY = "YOUR_OMDB_API_KEY"
+private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
+private const val IMG_PROXY = "https://wsrv.nl/?url="
 private const val TRAKT_CLIENT_ID = "YOUR_TRAKT_CLIENT_ID"
 private const val TRAKT_ACCESS_TOKEN = ""
 
