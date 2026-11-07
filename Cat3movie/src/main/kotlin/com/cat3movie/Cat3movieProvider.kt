@@ -26,7 +26,11 @@ import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
 class Cat3movieProvider : MainAPI() {
-    override var mainUrl = "https://cat3movie.org"
+    // >>> ĐỔI thành URL Cloudflare Worker của bạn (không có dấu / ở cuối). Xem hướng dẫn worker. <<<
+    private val workerUrl = "https://cat3movie-proxy.silentmist3590.workers.dev"
+    // Site thật: dùng làm Referer cho các server video (hlsfree/hlsfast cần Referer là site gốc)
+    private val site = "https://cat3movie.org"
+    override var mainUrl = workerUrl
     override var name = "Cat3movie"
     override var lang = "en"
     override val hasMainPage = true
@@ -118,7 +122,7 @@ class Cat3movieProvider : MainAPI() {
             val h = it.attr("data-href"); if (h.isNotBlank()) watch.add(fixUrl(h))
         }
         doc.select("a[href*=/watch-]").forEach { watch.add(fixUrl(it.attr("href"))) }
-        Regex("""https?:\\?/\\?/cat3movie\.org\\?/watch-[^"'\s<>\\]+?\.html""").findAll(doc.html()).forEach {
+        Regex("""https?:\\?/\\?/[^/"'\s<>\\]+\\?/watch-[^"'\s<>\\]+?\.html""").findAll(doc.html()).forEach {
             watch.add(it.value.replace("\\/", "/"))
         }
         ClipboardLogger.logAndCopy("load", "url=$url\ntitle=$title\nwatch(${watch.size}):\n" + watch.joinToString("\n"))
@@ -214,7 +218,7 @@ class Cat3movieProvider : MainAPI() {
                     val hit = sniffStream(wp, "$mainUrl/", ua, seen, Regex("""\.m3u8|\.mpd|/api/hls/serve""", RegexOption.IGNORE_CASE), 40_000L)
                     ClipboardLogger.logAndCopy("Server $n WebView(watch)", "hit=$hit\nrequests(${seen.size}):\n" + seen.joinToString("\n"))
                     if (hit != null) {
-                        emit(callback, "Cat3movie S$n", hit, if (hit.contains("hlsfree.com")) "https://hlsfree.com/" else "$mainUrl/", ExtractorLinkType.M3U8)
+                        emit(callback, "Cat3movie S$n", hit, if (hit.contains("hlsfree.com")) "https://hlsfree.com/" else "$site/", ExtractorLinkType.M3U8)
                         found = true
                     }
                     return@forEachIndexed
@@ -225,12 +229,12 @@ class Cat3movieProvider : MainAPI() {
                 if (embed.contains("hlsfast.com") && embed.contains("#")) {
                     val id = embed.substringAfter("#")
                     val base = Regex("""^(https?://[^/]+)""").find(embed)!!.groupValues[1]
-                    val rr = app.get("$base/api/public/resolve?file1=$id", headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/"))
+                    val rr = app.get("$base/api/public/resolve?file1=$id", headers = mapOf("User-Agent" to ua, "Referer" to "$site/"))
                     ClipboardLogger.logAndCopy("Server $n resolve", "HTTP ${rr.code}\n${rr.text.take(300)}")
                     val u = Regex("\"url\"\\s*:\\s*\"([^\"]+)\"").find(rr.text)?.groupValues?.get(1)?.replace("\\/", "/")
                     if (u != null) embed = u
                 }
-                val ep = app.get(embed, headers = mapOf("User-Agent" to ua, "Referer" to "$mainUrl/")).text
+                val ep = app.get(embed, headers = mapOf("User-Agent" to ua, "Referer" to "$site/")).text
                 subRegex.findAll(ep).map { it.value.replace("\\/", "/") }.distinct().forEach {
                     subtitleCallback.invoke(SubtitleFile("English", it))
                 }
@@ -242,13 +246,13 @@ class Cat3movieProvider : MainAPI() {
                     return@forEachIndexed
                 }
                 // Fallback 1: extractor có sẵn
-                val ok = try { loadExtractor(embed, "$mainUrl/", subtitleCallback, callback) } catch (e: Exception) {
+                val ok = try { loadExtractor(embed, "$site/", subtitleCallback, callback) } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e; false
                 }
                 if (ok) { found = true; return@forEachIndexed }
                 // Fallback 2: WebView
                 val seen = mutableListOf<String>()
-                val hit = sniffStream(embed, "$mainUrl/", ua, seen, Regex("""\.m3u8|\.mpd|\.mp4(\?|$)|/api/hls/serve""", RegexOption.IGNORE_CASE), 40_000L)
+                val hit = sniffStream(embed, "$site/", ua, seen, Regex("""\.m3u8|\.mpd|\.mp4(\?|$)|/api/hls/serve""", RegexOption.IGNORE_CASE), 40_000L)
                 ClipboardLogger.logAndCopy("Server $n WebView", "hit=$hit\nrequests(${seen.size}):\n" + seen.joinToString("\n"))
                 if (hit != null) {
                     emit(callback, "Cat3movie S$n", hit, embed, if (hit.contains(".mp4")) ExtractorLinkType.VIDEO else ExtractorLinkType.M3U8)
