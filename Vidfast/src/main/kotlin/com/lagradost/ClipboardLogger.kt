@@ -1,4 +1,4 @@
-package com.cat3movie
+package com.lagradost
 
 import android.content.ClipData
 import android.content.ClipboardManager
