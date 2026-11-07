@@ -262,6 +262,10 @@ class VidrockProvider : MainAPI() {
                             val u = request?.url?.toString() ?: return null
                             if (!junkRegex.containsMatchIn(u) && seen.size < 100) seen.add(u.take(220))
                             if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
+                            // Log toàn bộ header của request m3u8
+                                val headers = request?.requestHeaders ?: emptyMap()
+                                val headerLog = headers.entries.joinToString("\n") { "${it.key}: ${it.value}" }
+                                ClipboardLogger.logAndCopy("M3U8 Headers", "URL: $u\n\n$headerLog")
                                 handler.post { finish(u) }
                             }
                             return null
