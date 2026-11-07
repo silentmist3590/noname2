@@ -29,10 +29,9 @@ import java.net.URLEncoder
 private const val BASE_URL = "https://vidrock.to"
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
-private const val IMG_PROXY = "https://wsrv.nl/?url=" // Proxy ảnh cho VN
+private const val IMG_PROXY = "https://wsrv.nl/?url="
 
 private val ID_REGEX = Regex("""(movie|tv):(\d+)(?::(\d+):(\d+))?""")
-
 private class Ref(val type: String, val id: Int, val season: Int?, val episode: Int?)
 
 private fun parseRef(s: String): Ref? {
@@ -41,8 +40,11 @@ private fun parseRef(s: String): Ref? {
     return Ref(m.groupValues[1], id, m.groupValues[3].toIntOrNull(), m.groupValues[4].toIntOrNull())
 }
 
+// Data class để lưu URL và Headers của request m3u8
+private data class SniffResult(val url: String, val headers: Map<String, String>)
+
 // =====================================================================================
-// 2. API SERVICES
+// 2. API SERVICES (TMDB)
 // =====================================================================================
 object ApiServices {
     suspend fun getTmdbDetails(type: String, tmdbId: Int): JSONObject? {
@@ -66,7 +68,6 @@ class VidrockProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    // ⭐ SỬA ĐỔI: Dùng TMDB làm trang chủ thay vì file JSON của Vidrock
     override val mainPage = mainPageOf(
         "$TMDB_BASE_URL/trending/all/day?api_key=$TMDB_API_KEY" to "Trending Today",
         "$TMDB_BASE_URL/movie/popular?api_key=$TMDB_API_KEY" to "Popular Movies",
@@ -79,32 +80,24 @@ class VidrockProvider : MainAPI() {
         return "$IMG_PROXY${URLEncoder.encode(originalUrl, "UTF-8")}"
     }
 
-    // ---------------------------------------------------------------------------------
-    // TRANG CHỦ: Lấy dữ liệu từ TMDB
-    // ---------------------------------------------------------------------------------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         return try {
             val response = app.get("${request.data}&page=$page").text
             val json = JSONObject(response)
-            val results = json.optJSONArray("results") 
-                ?: throw Exception(json.optString("status_message", "TMDB không trả results"))
-            
+            val results = json.optJSONArray("results") ?: throw Exception("No results")
             val home = mutableListOf<SearchResponse>()
 
             for (i in 0 until results.length()) {
                 val item = results.getJSONObject(i)
                 val mediaType = item.optString("media_type", if (request.name.contains("TV")) "tv" else "movie")
                 if (mediaType != "movie" && mediaType != "tv") continue
-                
                 val id = item.optInt("id", 0)
                 if (id == 0) continue
                 
                 val title = item.optString("title", item.optString("name"))
-                val posterPath = item.optString("poster_path")
-
                 home.add(newMovieSearchResponse(title, "vidrock:$mediaType:$id", 
                     if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
-                    this.posterUrl = poster(posterPath)
+                    this.posterUrl = poster(item.optString("poster_path"))
                 })
             }
             newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
@@ -115,9 +108,6 @@ class VidrockProvider : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------------------------
-    // TÌM KIẾM: Dùng TMDB
-    // ---------------------------------------------------------------------------------
     override suspend fun search(query: String): List<SearchResponse> {
         return try {
             val q = URLEncoder.encode(query, "UTF-8")
@@ -132,8 +122,7 @@ class VidrockProvider : MainAPI() {
                 if (mediaType != "movie" && mediaType != "tv") continue
                 val id = item.optInt("id", 0)
                 if (id == 0) continue
-                val title = item.optString("title", item.optString("name"))
-                out.add(newMovieSearchResponse(title, "vidrock:$mediaType:$id",
+                out.add(newMovieSearchResponse(item.optString("title", item.optString("name")), "vidrock:$mediaType:$id",
                     if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
                     this.posterUrl = poster(item.optString("poster_path"))
                 })
@@ -141,14 +130,10 @@ class VidrockProvider : MainAPI() {
             out
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
-            ClipboardLogger.logAndCopy("Search Error", e.message ?: "Unknown")
             emptyList()
         }
     }
 
-    // ---------------------------------------------------------------------------------
-    // LOAD CHI TIẾT: Giữ nguyên
-    // ---------------------------------------------------------------------------------
     override suspend fun load(url: String): LoadResponse? {
         val ref = parseRef(url) ?: return null
         val tmdbId = ref.id
@@ -160,7 +145,6 @@ class VidrockProvider : MainAPI() {
         val description = json.optString("overview")
         val posterUrl = poster(json.optString("poster_path"))
         val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
-
         val canonical = "vidrock:$mediaType:$tmdbId"
 
         if (mediaType == "tv") {
@@ -179,13 +163,11 @@ class VidrockProvider : MainAPI() {
                             this.name = ep.optString("name")
                             this.episode = en
                             this.season = sn
-                            this.description = ep.optString("overview")
                             this.posterUrl = poster(ep.optString("still_path"), "w300")
                         })
                     }
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
-                    ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
                 }
             }
             return newTvSeriesLoadResponse(title, canonical, TvType.TvSeries, episodes) {
@@ -199,10 +181,10 @@ class VidrockProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // WEBVIEW SNIFFER
+    // WEBVIEW SNIFFER (Đã tối ưu)
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): String? {
+    private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): SniffResult? {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
@@ -212,7 +194,7 @@ class VidrockProvider : MainAPI() {
                     val w = 1080; val h = 1920
                     val wv = WebView(ctx)
                     var finished = false
-                    fun finish(res: String?) {
+                    fun finish(res: SniffResult?) {
                         if (finished) return
                         finished = true
                         handler.removeCallbacksAndMessages(null)
@@ -239,7 +221,7 @@ class VidrockProvider : MainAPI() {
                     val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
                     val clickJs = "(function(){function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
                         "fire(document.getElementById('bigPlay'));" +
-                        "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
+                        "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play],.vjs-big-play-button'));" +
                         "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();"
                     
                     var taps = 0
@@ -254,29 +236,42 @@ class VidrockProvider : MainAPI() {
                             wv.dispatchTouchEvent(d); wv.dispatchTouchEvent(u)
                             d.recycle(); u.recycle()
                         } catch (_: Exception) {}
-                        if (taps < 25) handler.postDelayed({ tap() }, 1500)
+                        if (taps < 40) handler.postDelayed({ tap() }, 1500) // Tăng lên 40 lần click
                     }
 
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                             val u = request?.url?.toString() ?: return null
-                            if (!junkRegex.containsMatchIn(u) && seen.size < 100) seen.add(u.take(220))
+                            
+                            if (!junkRegex.containsMatchIn(u) && seen.size < 150) {
+                                seen.add(u.take(220))
+                            }
+                            
                             if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
-                            // Log toàn bộ header của request m3u8
-                                val headers = request?.requestHeaders ?: emptyMap()
-                                val headerLog = headers.entries.joinToString("\n") { "${it.key}: ${it.value}" }
-                                ClipboardLogger.logAndCopy("M3U8 Headers", "URL: $u\n\n$headerLog")
-                                handler.post { finish(u) }
+                                // Lấy toàn bộ headers của request m3u8 (Referer, Origin, Cookie...)
+                                val reqHeaders = request?.requestHeaders ?: emptyMap()
+                                val hit = SniffResult(u, reqHeaders)
+                                
+                                val headerLog = reqHeaders.entries.joinToString("\n") { "${it.key}: ${it.value}" }
+                                ClipboardLogger.logAndCopy("Sniff HIT", "URL: $u\nHeaders:\n$headerLog")
+                                
+                                handler.post { finish(hit) }
                             }
                             return null
                         }
+
+                        // CHỈ chặn quảng cáo, không chặn bất kỳ redirect nào khác (cho phép vercetti.org)
                         override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                             val u = request?.url?.toString() ?: return false
-                            val adHosts = listOf("doubleclick", "googlesyndication", "popads", "onclickads", "adsterra")
+                            val adHosts = listOf("doubleclick", "googlesyndication", "popads", "onclickads", "adsterra", "propellerads")
                             val isAd = adHosts.any { u.contains(it, true) }
-                            if (isAd) seen.add("BLOCKED AD: " + u.take(160))
-                            return isAd
+                            if (isAd) {
+                                seen.add("BLOCKED AD: " + u.take(160))
+                                return true
+                            }
+                            return false
                         }
+
                         override fun onPageFinished(view: WebView?, url: String?) {
                             handler.postDelayed({ tap() }, 800)
                         }
@@ -287,7 +282,8 @@ class VidrockProvider : MainAPI() {
                     wv.translationX = -4000f
                     try { CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
 
-                    handler.postDelayed({ finish(null) }, 120_000L)
+                    // TĂNG TIMEOUT LÊN 180 GIÂY (3 phút) để đợi quảng cáo chạy xong
+                    handler.postDelayed({ finish(null) }, 180_000L)
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                 } catch (e: Exception) {
                     ClipboardLogger.logAndCopy("Sniff Exception", e.stackTraceToString().take(800))
@@ -297,9 +293,9 @@ class VidrockProvider : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------------------------
+    // =====================================================================================
     // LOAD LINKS
-    // ---------------------------------------------------------------------------------
+    // =====================================================================================
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
@@ -322,23 +318,41 @@ class VidrockProvider : MainAPI() {
         try {
             ClipboardLogger.logAndCopy("Embed URL", embedUrl)
             val seen = mutableListOf<String>()
-            val finalUrl = sniffStream(embedUrl, "$BASE_URL/", ua, seen)
+            val result = sniffStream(embedUrl, "$BASE_URL/", ua, seen)
             
             ClipboardLogger.logAndCopy("Requests Seen", seen.joinToString("\n"))
-            ClipboardLogger.logAndCopy("Result URL", "$finalUrl")
+            ClipboardLogger.logAndCopy("Result URL", if (result == null) "null" else result.url)
 
-            if (finalUrl.isNullOrEmpty()) {
+            if (result == null) {
                 ClipboardLogger.logAndCopy("Error", "WebView không bắt được link stream.")
                 return false
             }
 
-            val origin = Regex("""^(https?://[^/]+)""").find(embedUrl)?.groupValues?.get(1) ?: BASE_URL
+            // ⭐ Lấy headers thật từ WebView (để vượt qua CDN vercetti.org)
+            val finalHeaders = result.headers.toMutableMap()
+            
+            // Nếu WebView không gửi Referer, ta phải tự thêm vào
+            if (finalHeaders.keys.none { it.equals("Referer", true) }) {
+                finalHeaders["Referer"] = "$BASE_URL/"
+            }
+            // Đảm bảo có Origin
+            if (finalHeaders.keys.none { it.equals("Origin", true) }) {
+                finalHeaders["Origin"] = BASE_URL
+            }
+            // Đảm bảo có User-Agent
+            if (finalHeaders.keys.none { it.equals("User-Agent", true) }) {
+                finalHeaders["User-Agent"] = ua
+            }
+
             callback.invoke(
                 ExtractorLink(
-                    source = this.name, name = "Vidrock", url = finalUrl,
-                    referer = "$origin/", quality = Qualities.P1080.value,
+                    source = this.name, 
+                    name = "Vidrock", 
+                    url = result.url,
+                    referer = finalHeaders["Referer"] ?: "$BASE_URL/", 
+                    quality = Qualities.P1080.value,
                     type = ExtractorLinkType.M3U8,
-                    headers = mapOf("Origin" to origin, "Referer" to "$origin/", "User-Agent" to ua)
+                    headers = finalHeaders
                 )
             )
             return true
