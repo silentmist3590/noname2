@@ -62,13 +62,37 @@ class Cat3movieProvider : MainAPI() {
         }
     }
 
-    private fun parseGrid(doc: org.jsoup.nodes.Document): List<SearchResponse> =
-        doc.select("article.thumb.grid-item, article.grid-item").mapNotNull { it.toCard() }
+    private fun parseGrid(doc: org.jsoup.nodes.Document): List<SearchResponse> {
+        var items = doc.select("article.thumb.grid-item, article.grid-item, article.thumb").mapNotNull { it.toCard() }
+        if (items.isEmpty()) {
+            items = doc.select("a.halim-thumb").mapNotNull { a ->
+                val href = fixUrl(a.attr("href"))
+                val t = a.attr("title").trim()
+                if (t.isBlank()) null else {
+                    val img = a.selectFirst("img")
+                    val po = img?.attr("data-src")?.ifBlank { null } ?: img?.attr("src")
+                    newMovieSearchResponse(t, href, TvType.NSFW) { this.posterUrl = po?.let { fixUrlNull(it) } }
+                }
+            }
+        }
+        return items.distinctBy { it.url }
+    }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         ClipboardLogger.reset()
-        val doc = app.get(pageUrl(request.data, page), headers = hdr).document
-        return newHomePageResponse(request.name, parseGrid(doc), hasNext = true)
+        val url = pageUrl(request.data, page)
+        return try {
+            val r = getRetry(url, hdr)
+            val doc = r.document
+            val items = parseGrid(doc)
+            ClipboardLogger.logAndCopy("MainPage", "url=$url HTTP ${r.code} htmlLen=${r.text.length} items=${items.size}" +
+                if (items.isEmpty()) "\n" + r.text.take(400) else "")
+            newHomePageResponse(request.name, items, hasNext = items.isNotEmpty())
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("MainPage Error", "url=$url\n${e.message}\n${e.stackTraceToString().take(500)}")
+            newHomePageResponse(request.name, emptyList(), hasNext = false)
+        }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
