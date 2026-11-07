@@ -16,7 +16,6 @@ private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
 private const val IMG_PROXY = "https://wsrv.nl/?url="
 
-// Regex nhận diện ID: vidrock:movie:123 hoặc vidrock:tv:123:1:1
 private val ID_REGEX = Regex("""(movie|tv):(\d+)(?::(\d+):(\d+))?""")
 private class Ref(val type: String, val id: Int, val season: Int?, val episode: Int?)
 
@@ -63,9 +62,6 @@ class VidrockProvider : MainAPI() {
         return "$IMG_PROXY${URLEncoder.encode(originalUrl, "UTF-8")}"
     }
 
-    // ---------------------------------------------------------------------------------
-    // TRANG CHỦ
-    // ---------------------------------------------------------------------------------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         return try {
             val response = app.get("${request.data}&page=$page").text
@@ -95,9 +91,6 @@ class VidrockProvider : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------------------------
-    // TÌM KIẾM
-    // ---------------------------------------------------------------------------------
     override suspend fun search(query: String): List<SearchResponse> {
         return try {
             val q = URLEncoder.encode(query, "UTF-8")
@@ -127,9 +120,6 @@ class VidrockProvider : MainAPI() {
         }
     }
 
-    // ---------------------------------------------------------------------------------
-    // CHI TIẾT PHIM
-    // ---------------------------------------------------------------------------------
     override suspend fun load(url: String): LoadResponse? {
         val ref = parseRef(url) ?: return null
         val tmdbId = ref.id
@@ -177,7 +167,7 @@ class VidrockProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // LOAD LINKS (Sử dụng WebViewResolver)
+    // LOAD LINKS (Sử dụng WebViewResolver - Đã sửa lỗi Type)
     // =====================================================================================
     override suspend fun loadLinks(
         data: String,
@@ -204,10 +194,8 @@ class VidrockProvider : MainAPI() {
         val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
         try {
-            // Cấu hình WebViewResolver để "bắt" request .m3u8
             val resolver = WebViewResolver(
                 interceptUrl = Regex("""\.m3u8"""),
-                // Script tự động click nút Play để vượt qua quảng cáo
                 script = """
                     (function(){
                         function fire(el){if(!el)return;try{el.click();}catch(e){}}
@@ -220,8 +208,12 @@ class VidrockProvider : MainAPI() {
             )
 
             ClipboardLogger.logAndCopy("Resolver Start", "Loading: $embedUrl")
-            // Bắt đầu quá trình resolve
-            val m3u8Url = resolver.resolveUsingWebView(embedUrl, referer = "$BASE_URL/")
+            
+            // ⭐ resolveUsingWebView trả về Pair<Request?, List<Request>>
+            val result = resolver.resolveUsingWebView(embedUrl, referer = "$BASE_URL/")
+            
+            // Lấy URL từ Request đầu tiên (nếu có)
+            val m3u8Url = result?.first?.url?.toString()
             
             ClipboardLogger.logAndCopy("Resolver Result", "URL: $m3u8Url")
 
@@ -230,7 +222,6 @@ class VidrockProvider : MainAPI() {
                 return false
             }
 
-            // Tạo ExtractorLink với headers chuẩn xác để vượt CDN
             val requiredHeaders = mapOf(
                 "User-Agent" to ua,
                 "Referer" to "https://vidrock.to/",
