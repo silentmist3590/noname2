@@ -26,8 +26,9 @@ import org.json.JSONObject
 // =====================================================================================
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
+private const val OMDB_API_KEY = "a116862a"
 private const val IMG_PROXY = "https://wsrv.nl/?url="
-private const val TRAKT_CLIENT_ID = "YOUR_TRAKT_CLIENT_ID"
+private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
 private const val TRAKT_ACCESS_TOKEN = ""
 
 // Định danh nội bộ: "vidfast:movie:<id>" / "vidfast:tv:<id>" / "vidfast:tv:<id>:<s>:<e>".
