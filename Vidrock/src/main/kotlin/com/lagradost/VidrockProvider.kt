@@ -20,7 +20,6 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
-import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 
@@ -32,7 +31,6 @@ private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
 private const val IMG_PROXY = "https://wsrv.nl/?url=" // Proxy ảnh cho VN
 
-// Định danh nội bộ: "vidrock:movie:<tmdbId>" hoặc "vidrock:tv:<tmdbId>:<season>:<episode>"
 private val ID_REGEX = Regex("""(movie|tv):(\d+)(?::(\d+):(\d+))?""")
 
 private class Ref(val type: String, val id: Int, val season: Int?, val episode: Int?)
@@ -44,10 +42,9 @@ private fun parseRef(s: String): Ref? {
 }
 
 // =====================================================================================
-// 2. API SERVICES (Chỉ cần TMDB để lấy metadata phim)
+// 2. API SERVICES
 // =====================================================================================
 object ApiServices {
-    // Hàm tiện ích để lấy thông tin phim từ TMDB
     suspend fun getTmdbDetails(type: String, tmdbId: Int): JSONObject? {
         return try {
             val url = "$TMDB_BASE_URL/$type/$tmdbId?api_key=$TMDB_API_KEY"
@@ -69,10 +66,11 @@ class VidrockProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    // Sử dụng danh sách JSON có sẵn của Vidrock cho trang chủ
+    // ⭐ SỬA ĐỔI: Dùng TMDB làm trang chủ thay vì file JSON của Vidrock
     override val mainPage = mainPageOf(
-        "$BASE_URL/list/movie.json" to "Movies",
-        "$BASE_URL/list/tv.json" to "TV Shows"
+        "$TMDB_BASE_URL/trending/all/day?api_key=$TMDB_API_KEY" to "Trending Today",
+        "$TMDB_BASE_URL/movie/popular?api_key=$TMDB_API_KEY" to "Popular Movies",
+        "$TMDB_BASE_URL/tv/popular?api_key=$TMDB_API_KEY" to "Popular TV Shows"
     )
 
     private fun poster(path: String?, size: String = "w500"): String? {
@@ -82,32 +80,34 @@ class VidrockProvider : MainAPI() {
     }
 
     // ---------------------------------------------------------------------------------
-    // TRANG CHỦ: Lấy dữ liệu từ file JSON của Vidrock
+    // TRANG CHỦ: Lấy dữ liệu từ TMDB
     // ---------------------------------------------------------------------------------
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         return try {
-            // Vidrock cung cấp toàn bộ danh sách trong 1 file JSON, không cần phân trang
-            val response = app.get(request.data).text
-            val jsonArray = JSONArray(response)
+            val response = app.get("${request.data}&page=$page").text
+            val json = JSONObject(response)
+            val results = json.optJSONArray("results") 
+                ?: throw Exception(json.optString("status_message", "TMDB không trả results"))
+            
             val home = mutableListOf<SearchResponse>()
 
-            for (i in 0 until jsonArray.length()) {
-                val item = jsonArray.getJSONObject(i)
-                // Cấu trúc JSON có thể chứa id (tmdb), title, poster_path...
-                val id = item.optInt("tmdb_id", item.optInt("id", 0))
+            for (i in 0 until results.length()) {
+                val item = results.getJSONObject(i)
+                val mediaType = item.optString("media_type", if (request.name.contains("TV")) "tv" else "movie")
+                if (mediaType != "movie" && mediaType != "tv") continue
+                
+                val id = item.optInt("id", 0)
                 if (id == 0) continue
                 
-                val type = if (request.name.contains("TV")) "tv" else "movie"
                 val title = item.optString("title", item.optString("name"))
                 val posterPath = item.optString("poster_path")
 
-                home.add(newMovieSearchResponse(title, "vidrock:$type:$id", 
-                    if (type == "tv") TvType.TvSeries else TvType.Movie) {
+                home.add(newMovieSearchResponse(title, "vidrock:$mediaType:$id", 
+                    if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
                     this.posterUrl = poster(posterPath)
                 })
             }
-            // Trả về toàn bộ danh sách trong 1 trang
-            newHomePageResponse(request.name, home, hasNext = false)
+            newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
         } catch (e: Exception) {
             if (e is java.util.concurrent.CancellationException) throw e
             ClipboardLogger.logAndCopy("getMainPage Error", e.message ?: "Unknown")
@@ -116,7 +116,7 @@ class VidrockProvider : MainAPI() {
     }
 
     // ---------------------------------------------------------------------------------
-    // TÌM KIẾM: Vidrock không có API search riêng, ta dùng TMDB để tìm
+    // TÌM KIẾM: Dùng TMDB
     // ---------------------------------------------------------------------------------
     override suspend fun search(query: String): List<SearchResponse> {
         return try {
@@ -147,7 +147,7 @@ class VidrockProvider : MainAPI() {
     }
 
     // ---------------------------------------------------------------------------------
-    // LOAD CHI TIẾT: Lấy metadata từ TMDB, tạo danh sách tập cho TV
+    // LOAD CHI TIẾT: Giữ nguyên
     // ---------------------------------------------------------------------------------
     override suspend fun load(url: String): LoadResponse? {
         val ref = parseRef(url) ?: return null
@@ -166,7 +166,6 @@ class VidrockProvider : MainAPI() {
         if (mediaType == "tv") {
             val episodes = mutableListOf<Episode>()
             val seasonsCount = json.optInt("number_of_seasons", 1)
-            // Lặp qua các mùa để lấy danh sách tập
             for (s in 1..seasonsCount) {
                 try {
                     val seasonUrl = "$TMDB_BASE_URL/tv/$tmdbId/season/$s?api_key=$TMDB_API_KEY"
@@ -176,7 +175,6 @@ class VidrockProvider : MainAPI() {
                         val ep = eps.getJSONObject(e)
                         val sn = ep.optInt("season_number", s)
                         val en = ep.optInt("episode_number", e + 1)
-                        // Tạo ID duy nhất cho từng tập
                         episodes.add(newEpisode("vidrock:tv:$tmdbId:$sn:$en") {
                             this.name = ep.optString("name")
                             this.episode = en
@@ -201,7 +199,7 @@ class VidrockProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // WEBVIEW SNIFFER (Cơ chế tương tự Vidsrcsu)
+    // WEBVIEW SNIFFER
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): String? {
@@ -221,9 +219,7 @@ class VidrockProvider : MainAPI() {
                         try { wv.stopLoading(); (wv.parent as? ViewGroup)?.removeView(wv); wv.destroy() } catch (_: Exception) {}
                         cont.resume(res)
                     }
-                    // Regex tìm luồng stream
                     val streamRegex = Regex("""\.m3u8|\.mpd|master\.txt""", RegexOption.IGNORE_CASE)
-                    // Regex bỏ qua file rác
                     val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
 
                     wv.settings.apply {
@@ -236,12 +232,10 @@ class VidrockProvider : MainAPI() {
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
 
-                    // Chặn popup
                     wv.webChromeClient = object : WebChromeClient() {
                         override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
                     }
 
-                    // JS để click nút Play và fake popup
                     val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
                     val clickJs = "(function(){function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
                         "fire(document.getElementById('bigPlay'));" +
@@ -272,7 +266,6 @@ class VidrockProvider : MainAPI() {
                             }
                             return null
                         }
-                        // Chỉ chặn quảng cáo, cho phép redirect
                         override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                             val u = request?.url?.toString() ?: return false
                             val adHosts = listOf("doubleclick", "googlesyndication", "popads", "onclickads", "adsterra")
@@ -290,7 +283,6 @@ class VidrockProvider : MainAPI() {
                     wv.translationX = -4000f
                     try { CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
 
-                    // Timeout 120s
                     handler.postDelayed({ finish(null) }, 120_000L)
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                 } catch (e: Exception) {
@@ -302,7 +294,7 @@ class VidrockProvider : MainAPI() {
     }
 
     // ---------------------------------------------------------------------------------
-    // LOAD LINKS: Xây dựng URL nhúng và gọi Sniffer
+    // LOAD LINKS
     // ---------------------------------------------------------------------------------
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.reset()
@@ -326,7 +318,6 @@ class VidrockProvider : MainAPI() {
         try {
             ClipboardLogger.logAndCopy("Embed URL", embedUrl)
             val seen = mutableListOf<String>()
-            // Gọi WebView để bắt luồng
             val finalUrl = sniffStream(embedUrl, "$BASE_URL/", ua, seen)
             
             ClipboardLogger.logAndCopy("Requests Seen", seen.joinToString("\n"))
@@ -337,7 +328,6 @@ class VidrockProvider : MainAPI() {
                 return false
             }
 
-            // Phát luồng
             val origin = Regex("""^(https?://[^/]+)""").find(embedUrl)?.groupValues?.get(1) ?: BASE_URL
             callback.invoke(
                 ExtractorLink(
