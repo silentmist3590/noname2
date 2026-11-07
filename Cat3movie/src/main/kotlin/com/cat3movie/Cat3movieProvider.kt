@@ -26,11 +26,11 @@ import org.jsoup.nodes.Element
 import java.net.URLEncoder
 
 class Cat3movieProvider : MainAPI() {
-    // >>> ĐỔI thành URL Cloudflare Worker của bạn (không có dấu / ở cuối). Xem hướng dẫn worker. <<<
-    private val workerUrl = "https://cat3movie-proxy.silentmist3590.workers.dev"
+    // Để TRỐNG = truy cập trực tiếp cat3movie.org (dùng khi đã bật VPN). Chỉ điền URL worker nếu worker vào được.
+    private val workerUrl = ""
     // Site thật: dùng làm Referer cho các server video (hlsfree/hlsfast cần Referer là site gốc)
     private val site = "https://cat3movie.org"
-    override var mainUrl = workerUrl
+    override var mainUrl = if (workerUrl.isBlank()) site else workerUrl
     override var name = "Cat3movie"
     override var lang = "en"
     override val hasMainPage = true
