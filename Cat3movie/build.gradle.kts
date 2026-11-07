@@ -1,5 +1,5 @@
 // use an integer for version numbers
-version = 2
+version = 5
 
 cloudstream {
     description = "Cat3movie - cat3movie.org (18+). Chỉ dành cho người từ 18 tuổi trở lên."
