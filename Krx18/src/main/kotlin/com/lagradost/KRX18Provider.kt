@@ -1,4 +1,4 @@
-package com.lagradost
+package com.krx18
 
 import android.annotation.SuppressLint
 import android.content.Context
@@ -424,15 +424,60 @@ class KRX18Provider : MainAPI() {
             }
         }
 
-        val q = Regex("""/hls/(\d{3,4})/""").find(playlist)?.groupValues?.get(1)?.toIntOrNull()
-        ClipboardLogger.logAndCopy("9stream OK", "playlist=$playlist\nquality=$q")
-        callback.invoke(
-            newExtractorLink(this.name, if (q != null) "$label ${q}p" else label, playlist, ExtractorLinkType.M3U8) {
-                this.referer = "$origin/"
-                this.quality = q ?: Qualities.Unknown.value
-                this.headers = mapOf("User-Agent" to ua, "Origin" to origin, "Referer" to "$origin/")
+        val hdrs = mapOf("User-Agent" to ua, "Origin" to origin, "Referer" to "$origin/")
+        suspend fun emitQ(u: String, q: Int?) {
+            callback.invoke(
+                newExtractorLink(this.name, if (q != null && q > 0) "$label ${q}p" else label, u, ExtractorLinkType.M3U8) {
+                    this.referer = "$origin/"
+                    this.quality = q ?: Qualities.Unknown.value
+                    this.headers = hdrs
+                }
+            )
+        }
+        val qRegex = Regex("""/hls/(\d{3,4})/""")
+        val cur = qRegex.find(playlist)?.groupValues?.get(1)?.toIntOrNull()
+        val emitted = LinkedHashSet<Int>()
+        try {
+            val body = app.get(playlist, headers = hdrs).text
+            if (body.contains("#EXT-X-STREAM-INF")) {
+                // Master playlist: liệt kê từng độ phân giải
+                val lines = body.lines()
+                var n = 0
+                for (i in lines.indices) {
+                    if (!lines[i].startsWith("#EXT-X-STREAM-INF")) continue
+                    val h = Regex("""RESOLUTION=\d+x(\d+)""").find(lines[i])?.groupValues?.get(1)?.toIntOrNull()
+                    val uri = lines.drop(i + 1).firstOrNull { it.isNotBlank() && !it.startsWith("#") }?.trim() ?: continue
+                    val abs = java.net.URI(playlist).resolve(uri).toString()
+                    emitQ(abs, h)
+                    if (h != null) emitted.add(h)
+                    n++
+                }
+                ClipboardLogger.logAndCopy("9stream master", "variants=$n qualities=$emitted")
             }
-        )
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("9stream master Error", e.message ?: "")
+        }
+        // Luôn phát bản gốc (master hoặc bản đang có)
+        emitQ(playlist, cur)
+        if (cur != null) emitted.add(cur)
+        // Playlist theo từng chất lượng (/hls/720/...): thử các chất lượng anh em
+        if (cur != null) {
+            for (q in listOf(1080, 720, 480, 360, 240)) {
+                if (q == cur || q in emitted) continue
+                val alt = playlist.replace("/hls/$cur/", "/hls/$q/")
+                try {
+                    val r = app.get(alt, headers = hdrs)
+                    val ok = r.code == 200 && r.text.trimStart().startsWith("#EXTM3U")
+                    ClipboardLogger.logAndCopy("9stream alt ${q}p", "HTTP ${r.code} ok=$ok\n$alt")
+                    if (ok) { emitQ(alt, q); emitted.add(q) }
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    ClipboardLogger.logAndCopy("9stream alt ${q}p Error", e.message ?: "")
+                }
+            }
+        }
+        ClipboardLogger.logAndCopy("9stream OK", "playlist=$playlist\nqualities=$emitted")
         return true
     }
 }
