@@ -13,3 +13,11 @@ cloudstream {
 android {
     namespace = "com.cat3movie"
 }
+dependencies {
+    val cloudstream by configurations
+    val implementation by configurations
+    cloudstream("com.lagradost:cloudstream3:pre-release")
+    implementation(kotlin("stdlib"))
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
+    ...
+}
