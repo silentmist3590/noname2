@@ -53,25 +53,33 @@ jobs:
                               with z.open(manifest_name) as f:
                                   manifest = json.load(f)
                                   
-                                  # Lấy thông tin chính xác từ manifest
+                                  plugin_class = manifest.get('pluginClassName', manifest.get('internalName', 'com.lagradost.Unknown'))
                                   plugin_name = manifest.get('name', file.replace('.cs3', ''))
-                                  internal_name = manifest.get('internalName', manifest.get('pluginClassName', plugin_name))
-                                  version = int(manifest.get('version', 1))
                                   
-                                  # Đảm bảo URL chính xác (lưu ý tên repo của bạn là noname2)
+                                  # ⭐ TỰ ĐỘNG ĐỌC VERSION TỪ FILE .cs3 (Không ép buộc nữa)
+                                  real_version = int(manifest.get('version', 1))
+                                  
+                                  raw_tv_types = manifest.get('tvTypes', ["Movie", "TvSeries"])
+                                  valid_tv_types = []
+                                  for t in raw_tv_types:
+                                      if t in ["Movie", "TvSeries", "Cartoon", "Anime", "Documentary", "AsianDrama", "Live", "Others"]:
+                                          valid_tv_types.append(t)
+                                  if not valid_tv_types:
+                                      valid_tv_types = ["Movie", "TvSeries"]
+
                                   url = f"https://raw.githubusercontent.com/silentmist3590/noname2/builds/{file}"
                                   
                                   plugins.append({
                                       "name": plugin_name,
-                                      "internalName": internal_name,
-                                      "version": version,
+                                      "internalName": plugin_class,
+                                      "version": real_version, # Dùng version thật
                                       "description": manifest.get('description', f"Plugin {plugin_name}"),
-                                      "authors": ["Silentmist3590"],
+                                      "authors": manifest.get('authors', ["Silentmist3590"]),
                                       "repositoryUrl": "https://github.com/silentmist3590/noname2",
                                       "url": url,
                                       "iconUrl": "",
-                                      "tvTypes": manifest.get('tvTypes', ["Movie", "TvSeries"]),
-                                      "language": "en"
+                                      "tvTypes": valid_tv_types,
+                                      "language": manifest.get('language', "en")
                                   })
                   except Exception as e:
                       print(f"Lỗi khi đọc file {file}: {e}")
@@ -81,7 +89,7 @@ jobs:
 
           repo_data = {
               "name": "Noname CloudStream Repository",
-              "description": "Kho plugin phim tiếng Việt tự động",
+              "description": "Kho plugin phim tiếng Việt",
               "manifestVersion": 1,
               "pluginLists": [
                   "https://raw.githubusercontent.com/silentmist3590/noname2/builds/plugins.json"
