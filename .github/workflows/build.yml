@@ -29,20 +29,13 @@ jobs:
       - name: Build with Gradle
         run: gradle make --warning-mode all
 
-      # ==========================================
-      # 1. GOM FILE .cs3 VÀO THƯ MỤC BUILDS
-      # ==========================================
       - name: Prepare builds directory
         run: |
           mkdir -p builds
-          echo "=== DANH SÁCH FILE .cs3 TÌM THẤY ==="
+          echo "=== COPY FILE .cs3 ==="
           find . -name "*.cs3" -exec cp -v {} builds/ \;
-          echo "=== KIỂM TRA THƯ MỤC BUILDS ==="
           ls -la builds/
 
-      # ==========================================
-      # 2. TỰ ĐỘNG TẠO REPO.JSON (Thay vì plugins.json)
-      # ==========================================
       - name: Generate repo.json
         run: |
           python3 - <<'EOF'
@@ -52,7 +45,7 @@ jobs:
           builds_dir = 'builds'
           
           if not os.path.exists(builds_dir) or not os.listdir(builds_dir):
-              print("LỖI: Không tìm thấy file .cs3 nào trong thư mục builds!")
+              print("LỖI: Không tìm thấy file .cs3 nào!")
               exit(1)
           
           for file in os.listdir(builds_dir):
@@ -61,42 +54,49 @@ jobs:
                   print(f"Đang xử lý: {file}")
                   try:
                       with zipfile.ZipFile(file_path, 'r') as z:
-                          if 'manifest.json' in z.namelist():
-                              with z.open('manifest.json') as f:
+                          # Cố gắng tìm manifest.json bên trong file .cs3
+                          manifest_name = 'manifest.json' if 'manifest.json' in z.namelist() else 'plugin.json'
+                          
+                          if manifest_name in z.namelist():
+                              with z.open(manifest_name) as f:
                                   manifest = json.load(f)
-                                  plugin_name = manifest.get('name', file.replace('.cs3', ''))
-                                  version = manifest.get('version', 1) 
                                   
+                                  # Lấy thông tin an toàn
+                                  plugin_name = manifest.get('name', file.replace('.cs3', ''))
+                                  version = int(manifest.get('version', 1))
+                                  
+                                  # Đảm bảo authors là một mảng
+                                  authors = manifest.get('authors', ["Silentmist3590"])
+                                  if isinstance(authors, str): authors = [authors]
+                                  
+                                  # Đảm bảo tvTypes là mảng
+                                  tv_types = manifest.get('tvTypes', ["Movie", "TvSeries"])
+                                  if isinstance(tv_types, str): tv_types = [tv_types]
+
                                   url = f"https://raw.githubusercontent.com/silentmist3590/noname2/builds/{file}"
                                   
                                   plugins.append({
                                       "name": plugin_name,
                                       "internalName": plugin_name,
                                       "version": version,
-                                      "description": f"Plugin {plugin_name}",
-                                      "authors": ["Silentmist3590"],
+                                      "description": manifest.get('description', f"Plugin {plugin_name}"),
+                                      "authors": authors,
                                       "repositoryUrl": "https://github.com/silentmist3590/noname2",
                                       "url": url,
-                                      "iconUrl": "",
-                                      "tvTypes": ["Movie", "TvSeries"],
-                                      "language": "en"
+                                      "iconUrl": manifest.get('iconUrl', ""),
+                                      "tvTypes": tv_types,
+                                      "language": manifest.get('language', "en")
                                   })
+                          else:
+                              print(f"CẢNH BÁO: Không tìm thấy manifest.json trong {file}")
                   except Exception as e:
                       print(f"Lỗi khi đọc file {file}: {e}")
           
-          if not plugins:
-              print("LỖI: Không thể đọc được manifest.json từ bất kỳ file .cs3 nào!")
-              exit(1)
-              
-          # ⭐ Đổi tên file đầu ra thành repo.json
           with open(os.path.join(builds_dir, 'repo.json'), 'w') as f:
               json.dump(plugins, f, indent=2)
-          print(f"THÀNH CÔNG: Đã tạo xong repo.json với {len(plugins)} plugin.")
+          print(f"THÀNH CÔNG: Đã tạo repo.json với {len(plugins)} plugin.")
           EOF
 
-      # ==========================================
-      # 3. PUSH LÊN NHÁNH BUILDS
-      # ==========================================
       - name: Deploy to builds branch
         uses: peaceiris/actions-gh-pages@v4
         with:
