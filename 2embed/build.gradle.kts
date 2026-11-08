@@ -11,7 +11,3 @@ cloudstream {
 android {
     namespace = "com.lagradost"
 }
-dependencies {
-    // Thư viện coroutines bắt buộc cho WebView Extractor
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
-}
