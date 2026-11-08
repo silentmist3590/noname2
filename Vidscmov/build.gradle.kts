@@ -2,7 +2,7 @@
 cloudstream {
     description = "Vidsrc.mov API provider with TMDB Proxy, OMDb, Trakt integration and auto-copy debug logs"
     authors = listOf("silentmist3590")
-    version = 14
+    version = 15
     status = 1
     tvTypes = listOf("Movie", "TvSeries")
     requiresResources = false
