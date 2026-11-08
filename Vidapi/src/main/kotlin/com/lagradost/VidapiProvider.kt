@@ -4,6 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink // ⭐ Thêm import này
 import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Handler
@@ -32,7 +33,7 @@ import java.net.URLEncoder
 private const val BASE_URL = "https://vidapi.ru"
 private const val EMBED_BASE_URL = "https://vaplayer.ru"
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
-private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
+private const val TMDB_API_KEY = "b9e1ff7ff423790bf7df202e661377ca"
 private const val IMG_PROXY = "https://wsrv.nl/?url="
 
 private val ID_REGEX = Regex("""(movie|tv):(\d+)(?::(\d+):(\d+))?""")
@@ -191,7 +192,7 @@ class VidapiProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // WEBVIEW SNIFFER (Đã tối ưu cho VidAPI)
+    // WEBVIEW SNIFFER
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): SniffResult? {
@@ -222,7 +223,6 @@ class VidapiProvider : MainAPI() {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         mediaPlaybackRequiresUserGesture = false
-                        // Cho phép popup để đánh lừa quảng cáo
                         javaScriptCanOpenWindowsAutomatically = true
                         setSupportMultipleWindows(true)
                         userAgentString = ua
@@ -231,7 +231,6 @@ class VidapiProvider : MainAPI() {
 
                     wv.webChromeClient = object : WebChromeClient() {
                         override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean {
-                            // Tạo một WebView ảo cho tab quảng cáo, đợi 10s rồi hủy
                             val popupView = WebView(ctx)
                             popupView.settings.javaScriptEnabled = true
                             popupView.webViewClient = object : WebViewClient() {
@@ -300,7 +299,7 @@ class VidapiProvider : MainAPI() {
                     wv.translationX = -4000f
                     try { CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
 
-                    handler.postDelayed({ finish(null) }, 300_000L) // Tăng lên 5 phút
+                    handler.postDelayed({ finish(null) }, 300_000L)
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                 } catch (e: Exception) {
                     ClipboardLogger.logAndCopy("Sniff Exception", e.stackTraceToString().take(800))
@@ -311,7 +310,7 @@ class VidapiProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // LOAD LINKS (Bóc tách đa chất lượng & Phụ đề)
+    // LOAD LINKS (Đã cập nhật newExtractorLink)
     // =====================================================================================
     override suspend fun loadLinks(
         data: String,
@@ -341,7 +340,6 @@ class VidapiProvider : MainAPI() {
 
             result.subtitles.forEach { subtitleCallback.invoke(it) }
 
-            // Xử lý đa chất lượng (Parse Master M3U8)
             val reqHeaders = mapOf("User-Agent" to ua, "Referer" to "$BASE_URL/", "Origin" to BASE_URL)
             val m3u8Content = runBlocking { try { app.get(result.url, headers = reqHeaders).text } catch (_: Exception) { "" } }
 
@@ -349,7 +347,6 @@ class VidapiProvider : MainAPI() {
             val matches = qualityRegex.findAll(m3u8Content)
 
             if (matches.count() > 0) {
-                // Có nhiều chất lượng
                 matches.forEach { match ->
                     val height = match.groupValues[2].toIntOrNull() ?: 0
                     val subUrl = match.groupValues[3].trim()
@@ -363,11 +360,35 @@ class VidapiProvider : MainAPI() {
                         height >= 480 -> Qualities.P480.value
                         else -> Qualities.P360.value
                     }
-                    callback.invoke(ExtractorLink(this.name, "$name ${height}p", fullSubUrl, "$BASE_URL/", q, headers = reqHeaders))
+                    
+                    // ⭐ Sử dụng newExtractorLink thay vì constructor ExtractorLink
+                    callback.invoke(
+                        newExtractorLink(
+                            source = this.name,
+                            name = "${this.name} ${height}p",
+                            url = fullSubUrl,
+                            type = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = "$BASE_URL/"
+                            this.quality = q
+                            this.headers = reqHeaders
+                        }
+                    )
                 }
             } else {
-                // Chỉ có một chất lượng
-                callback.invoke(ExtractorLink(this.name, this.name, result.url, "$BASE_URL/", Qualities.Unknown.value, headers = reqHeaders))
+                // ⭐ Sử dụng newExtractorLink cho luồng đơn
+                callback.invoke(
+                    newExtractorLink(
+                        source = this.name,
+                        name = this.name,
+                        url = result.url,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = "$BASE_URL/"
+                        this.quality = Qualities.Unknown.value
+                        this.headers = reqHeaders
+                    }
+                )
             }
             return true
 
