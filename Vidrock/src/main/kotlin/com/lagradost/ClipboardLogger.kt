@@ -14,11 +14,9 @@ object ClipboardLogger {
     fun logAndCopy(title: String, message: String) {
         val logMessage = "=== [$title] ===\n$message\n==================="
         Log.d(TAG, logMessage)
-
         try {
             val context = CloudStreamApp.context ?: return
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-
             Handler(Looper.getMainLooper()).post {
                 val clip = ClipData.newPlainText("Plugin Log", logMessage)
                 clipboard.setPrimaryClip(clip)
