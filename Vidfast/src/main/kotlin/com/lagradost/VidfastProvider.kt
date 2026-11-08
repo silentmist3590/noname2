@@ -200,10 +200,7 @@ class VidfastProvider : MainAPI() {
             val description = json.optString("overview")
             val poster = poster(json.optString("poster_path"))
             val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
-            val imdbId = json.optString("imdb_id").ifEmpty { json.optJSONObject("external_ids")?.optString("imdb_id") ?: "" }
-                }
-            }
-
+            
             val canonical = "vidfast:$mediaType:$tmdbIdInt"
             if (mediaType == "tv") {
                 val episodes = mutableListOf<Episode>()
