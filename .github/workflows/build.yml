@@ -34,6 +34,16 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '17'
+      - name: Cache Gradle distribution from mirror
+              run: |
+                mkdir -p $HOME/.gradle/wrapper/dists/gradle-8.14-bin
+                cd $HOME/.gradle/wrapper/dists/gradle-8.14-bin
+                # Tải từ Tencent Cloud mirror
+                curl -L -o gradle-8.14-bin.zip https://mirrors.cloud.tencent.com/gradle/gradle-8.14-bin.zip
+                unzip -q gradle-8.14-bin.zip
+                # Tạo file .ok để Wrapper biết đã có sẵn
+                touch gradle-8.14-bin.zip.ok
+              shell: bash
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
