@@ -163,10 +163,6 @@ class VidsrctoProvider : MainAPI() {
             val posterUrl = poster(json.optString("poster_path"))
             val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
             val imdbId = json.optString("imdb_id")
-
-            var score: Score? = null
-            if (imdbId.isNotEmpty()) {
-                ApiServices.getOmdbData(imdbId)?.toDoubleOrNull()?.let { score = Score.from10(it) }
             }
 
             val canonical = "vidsrcto:$mt:$tid"
@@ -191,11 +187,11 @@ class VidsrctoProvider : MainAPI() {
                     }
                 }
                 newTvSeriesLoadResponse(title, canonical, TvType.TvSeries, episodes) {
-                    this.posterUrl = posterUrl; this.plot = description; this.year = year; this.score = score
+                    this.posterUrl = posterUrl; this.plot = description; this.year = year
                 }
             } else {
                 newMovieLoadResponse(title, canonical, TvType.Movie, canonical) {
-                    this.posterUrl = posterUrl; this.plot = description; this.year = year; this.score = score
+                    this.posterUrl = posterUrl; this.plot = description; this.year = year
                 }
             }
         } catch (e: Exception) {
