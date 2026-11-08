@@ -11,4 +11,5 @@ include(":Moviecat3")
 include(":Vidrock")
 include(":Vidfast")
 include(":Cat3movie")
+include(":Clubcat3")
 rootProject.name = "CloudstreamPlugins"
