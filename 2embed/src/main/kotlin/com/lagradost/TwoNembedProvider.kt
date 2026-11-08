@@ -161,7 +161,7 @@ class TwoNembedProvider : MainAPI() {
         }
     }
 
-    override suspend fun load(url: String): LoadResponse? {
+        override suspend fun load(url: String): LoadResponse? {
         val ref = parseRef(url)
         if (ref == null) {
             ClipboardLogger.logAndCopy("load Error", "Không đọc được id từ url: $url")
@@ -169,25 +169,26 @@ class TwoNembedProvider : MainAPI() {
         }
         val mediaType = ref.type
         val tmdbIdInt = ref.id
+
         try {
-            val response = tmdbGet(if (mediaType == "tv") "/tv/$tmdbIdInt?append_to_response=external_ids" else "/movie/$tmdbIdInt")
+            val response = app.get("$TMDB_BASE_URL/$mediaType/$tmdbIdInt?api_key=$TMDB_API_KEY").text
             val json = JSONObject(response)
             if (json.has("status_code")) throw Exception("TMDB: ${json.optString("status_message")}")
+            
             val title = json.optString("title", json.optString("name"))
             val description = json.optString("overview")
-            val poster = poster(json.optString("poster_path"))
+            val posterUrl = poster(json.optString("poster_path"))
             val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
-            val imdbId = json.optString("imdb_id").ifEmpty { json.optJSONObject("external_ids")?.optString("imdb_id") ?: "" }
-                }
-            }
-
+            
+            // Đã xóa hoàn toàn phần Score ở đây
             val canonical = "2embed:$mediaType:$tmdbIdInt"
+
             if (mediaType == "tv") {
                 val episodes = mutableListOf<Episode>()
                 val seasonsCount = json.optInt("number_of_seasons", 1)
                 for (s in 1..seasonsCount) {
                     try {
-                        val seasonJson = JSONObject(tmdbGet("/tv/$tmdbIdInt/season/$s"))
+                        val seasonJson = JSONObject(app.get("$TMDB_BASE_URL/tv/$tmdbIdInt/season/$s?api_key=$TMDB_API_KEY").text)
                         val eps = seasonJson.optJSONArray("episodes") ?: continue
                         for (e in 0 until eps.length()) {
                             val ep = eps.getJSONObject(e)
@@ -198,19 +199,26 @@ class TwoNembedProvider : MainAPI() {
                                 this.episode = en
                                 this.season = sn
                                 this.description = ep.optString("overview")
-                                this.posterUrl = img(ep.optString("still_path"), "w300")
+                                this.posterUrl = poster(ep.optString("still_path"), "w300")
                             })
                         }
                     } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
                         ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
                     }
                 }
                 return newTvSeriesLoadResponse(title, canonical, TvType.TvSeries, episodes) {
-                    this.posterUrl = poster; this.plot = description; this.year = year
+                    this.posterUrl = posterUrl
+                    this.plot = description
+                    this.year = year
+                    // Đã xóa this.score
                 }
             } else {
                 return newMovieLoadResponse(title, canonical, TvType.Movie, canonical) {
-                    this.posterUrl = poster; this.plot = description; this.year = year
+                    this.posterUrl = posterUrl
+                    this.plot = description
+                    this.year = year
+                    // Đã xóa this.score
                 }
             }
         } catch (e: Exception) {
