@@ -201,6 +201,14 @@ class VidscmovProvider : MainAPI() {
             val description = json.optString("overview")
             val poster = poster(json.optString("poster_path"))
             val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
+            val imdbId = json.optString("imdb_id").ifEmpty { json.optJSONObject("external_ids")?.optString("imdb_id") ?: "" }
+
+            var imdbScore: Score? = null
+            if (imdbId.isNotEmpty()) {
+                ApiServices.getOmdbData(imdbId)?.let { ratingStr ->
+                    ratingStr.toDoubleOrNull()?.let { imdbScore = Score.from10(it) }
+                }
+            }
 
             val canonical = "vidscmov:$mediaType:$tmdbIdInt"
             if (mediaType == "tv") {
@@ -228,11 +236,11 @@ class VidscmovProvider : MainAPI() {
                     }
                 }
                 return newTvSeriesLoadResponse(title, canonical, TvType.TvSeries, episodes) {
-                    this.posterUrl = poster; this.plot = description; this.year = year
+                    this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
                 }
             } else {
                 return newMovieLoadResponse(title, canonical, TvType.Movie, canonical) {
-                    this.posterUrl = poster; this.plot = description; this.year = year
+                    this.posterUrl = poster; this.plot = description; this.year = year; this.score = imdbScore
                 }
             }
         } catch (e: Exception) {
@@ -355,7 +363,7 @@ class VidscmovProvider : MainAPI() {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
-                val appCtx: Context? = CloudStreamApp.context
+                val appCtx: Context? = ClipboardLogger.appContext()
                 val act = CommonActivity.activity
                 val ctx: Context? = act ?: appCtx
                 if (ctx == null) {
