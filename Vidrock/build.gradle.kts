@@ -5,7 +5,7 @@ cloudstream {
     description = "Vidrock.to - The Movie and TVserie"
     authors = listOf("silentmist3590")
     status = 1
-    version = 9
+    version = 10
     tvTypes = listOf("Movie","TVSeries")
     requiresResources = false
     language = "en"
