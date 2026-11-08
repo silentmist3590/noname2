@@ -3,9 +3,10 @@ name: Build CloudStream Plugins
 on:
   push:
     branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -20,35 +21,73 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # BƯỚC NÀY GIÚP VƯỢT LỖI 504 BẰNG CÁCH TẢI TỪ MIRROR TENCENT
-      - name: Cache Gradle distribution from mirror
-        run: |
-          mkdir -p $HOME/.gradle/wrapper/dists/gradle-8.14-bin
-          cd $HOME/.gradle/wrapper/dists/gradle-8.14-bin
-          curl -L -o gradle-8.14-bin.zip https://mirrors.cloud.tencent.com/gradle/gradle-8.14-bin.zip
-          unzip -q gradle-8.14-bin.zip
-          touch gradle-8.14-bin.zip.ok
-        shell: bash
-        
-      - name: Clear Gradle Cache
-        run: |
-          rm -rf ~/.gradle/caches/modules-2/files-2.1/org.jetbrains.kotlin
-          rm -rf ~/.gradle/caches/modules-2/metadata-*
-        shell: bash
-      
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '8.14'
 
-       # Bỏ qua gradlew, gọi thẳng lệnh gradle
       - name: Build with Gradle
         run: gradle make --warning-mode all
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      # ==========================================
+      # 1. GOM FILE .cs3 VÀO THƯ MỤC BUILDS
+      # ==========================================
+      - name: Prepare builds directory
+        run: |
+          mkdir -p builds
+          find . -name "*.cs3" -exec cp {} builds/ \;
+
+      # ==========================================
+      # 2. TỰ ĐỘNG TẠO PLUGINS.JSON TỪ FILE .cs3
+      # ==========================================
+      - name: Generate plugins.json
+        run: |
+          python3 - <<'EOF'
+          import json, os, zipfile
+          
+          plugins = []
+          builds_dir = 'builds'
+          
+          for file in os.listdir(builds_dir):
+              if file.endswith('.cs3'):
+                  file_path = os.path.join(builds_dir, file)
+                  try:
+                      # File .cs3 thực chất là file ZIP chứa manifest.json
+                      with zipfile.ZipFile(file_path, 'r') as z:
+                          if 'manifest.json' in z.namelist():
+                              with z.open('manifest.json') as f:
+                                  manifest = json.load(f)
+                                  plugin_name = manifest.get('name', file.replace('.cs3', ''))
+                                  # Tự động lấy version chuẩn xác từ file build
+                                  version = manifest.get('version', 1) 
+                                  
+                                  plugins.append({
+                                      "name": plugin_name,
+                                      "internalName": plugin_name,
+                                      "version": version,
+                                      "description": f"Plugin {plugin_name}",
+                                      "authors": ["Silentmist3590"],
+                                      "repositoryUrl": "https://github.com/silentmist3590/noname2",
+                                      "url": f"https://raw.githubusercontent.com/silentmist3590/noname2/builds/{file}",
+                                      "iconUrl": "",
+                                      "tvTypes": ["Movie", "TvSeries"],
+                                      "language": "en"
+                                  })
+                  except Exception as e:
+                      print(f"Lỗi khi đọc file {file}: {e}")
+          
+          with open(os.path.join(builds_dir, 'plugins.json'), 'w') as f:
+              json.dump(plugins, f, indent=2)
+          print("Đã tạo xong plugins.json với version tự động!")
+          EOF
+
+      # ==========================================
+      # 3. PUSH LÊN NHÁNH BUILDS
+      # ==========================================
+      - name: Deploy to builds branch
+        uses: peaceiris/actions-gh-pages@v4
         with:
-          name: CloudStream-Plugins
-          path: |
-            **/build/*.cs3
-            **/build/outputs/apk/debug/*.apk
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./builds
+          publish_branch: builds
+          force_orphan: true # Ghi đè nhánh builds để tránh xung đột
