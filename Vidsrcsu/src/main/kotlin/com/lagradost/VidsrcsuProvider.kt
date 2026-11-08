@@ -180,9 +180,6 @@ class VidsrcsuProvider : MainAPI() {
             val description = json.optString("overview")
             val posterUrl = poster(json.optString("poster_path"))
             val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
-            val imdbId = json.optString("imdb_id")
-                }
-            }
 
             val canonical = "vidsrcsu:$mediaType:$tmdbIdInt"
             if (mediaType == "tv") {
