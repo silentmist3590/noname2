@@ -37,7 +37,7 @@ jobs:
 
        # Bỏ qua gradlew, gọi thẳng lệnh gradle
       - name: Build with Gradle
-        run: gradle make
+        run: gradle make --warning-mode all
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
