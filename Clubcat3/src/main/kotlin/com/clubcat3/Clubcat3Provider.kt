@@ -26,6 +26,7 @@ import java.net.URLEncoder
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
+import org.jsoup.parser.Parser
 
 class Clubcat3Provider : MainAPI() {
     override var mainUrl = "https://www.cat3movie.club"
@@ -55,6 +56,10 @@ class Clubcat3Provider : MainAPI() {
     private val srcRe = Regex("""\[jwplayer\s+id=.\s*(https?:[^\s'’′"\]]+)""")
     private val directRe = Regex("""https?://[^\s"'<>\\]+?\.(?:m3u8|mp4)[^\s"'<>\\]*""")
 
+    /** content.rendered chứa thực thể HTML (vd &#8242; thay cho ′, &#038; thay cho &) -> giải mã trước khi tách link. */
+    private fun rendered(o: JSONObject): String =
+        Parser.unescapeEntities(o.optJSONObject("content")?.optString("rendered") ?: "", false)
+
     private fun clean(s: String) = Jsoup.parse(s).text().trim()
 
     private fun poster(o: JSONObject, content: String): String? {
@@ -65,7 +70,7 @@ class Clubcat3Provider : MainAPI() {
     private fun toCard(o: JSONObject): SearchResponse? {
         val link = o.optString("link").ifBlank { return null }
         val title = clean(o.optJSONObject("title")?.optString("rendered") ?: "").ifBlank { return null }
-        val content = o.optJSONObject("content")?.optString("rendered") ?: ""
+        val content = rendered(o)
         val p = poster(o, content)
         return newMovieSearchResponse(title, link, TvType.NSFW) { this.posterUrl = p }
     }
@@ -112,7 +117,7 @@ class Clubcat3Provider : MainAPI() {
         val r = app.get(api, headers = hdr)
         val arr = JSONArray(r.text)
         val o = arr.getJSONObject(0)
-        val content = o.optJSONObject("content")?.optString("rendered") ?: ""
+        val content = rendered(o)
         val title = clean(o.optJSONObject("title")?.optString("rendered") ?: slug)
         val sources = extractSources(content)
         ClipboardLogger.logAndCopy("load", "api=$api HTTP ${r.code}\ntitle=$title\nsources(${sources.size}):\n" + sources.joinToString("\n"))
