@@ -4,16 +4,15 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.util.Log
-import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.CommonActivity
 
 object ClipboardLogger {
     private const val TAG = "PluginLogger"
 
-    // Lấy Context an toàn, không dùng CloudStreamApp
+    // Ghi nhớ: Chỉ lấy context qua CommonActivity
     private fun getContext(): Context? {
         return try {
-            CommonActivity.activity ?: app.context
+            CommonActivity.activity
         } catch (e: Throwable) {
             null
         }
