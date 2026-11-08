@@ -199,7 +199,7 @@ class TwoNembedProvider : MainAPI() {
                                 this.episode = en
                                 this.season = sn
                                 this.description = ep.optString("overview")
-                                this.posterUrl = poster(ep.optString("still_path"), "w300")
+                                this.posterUrl = poster(ep.optString("still_path"))
                             })
                         }
                     } catch (e: Exception) {
