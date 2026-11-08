@@ -10,6 +10,7 @@ include(":Krx18")
 include(":Moviecat3")
 include(":Vidrock")
 include(":Vidfast")
+include(":Vidapi")
 include(":Cat3movie")
 include(":Clubcat3")
 rootProject.name = "CloudstreamPlugins"
