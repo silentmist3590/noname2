@@ -35,11 +35,9 @@ jobs:
         with:
           gradle-version: '8.14'
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x gradlew
-
+       # Bỏ qua gradlew, gọi thẳng lệnh gradle
       - name: Build with Gradle
-        run: ./gradlew make
+        run: gradle make
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
