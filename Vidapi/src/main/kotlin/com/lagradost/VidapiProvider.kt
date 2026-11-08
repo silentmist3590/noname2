@@ -33,7 +33,7 @@ import java.net.URLEncoder
 private const val BASE_URL = "https://vidapi.ru"
 private const val EMBED_BASE_URL = "https://vaplayer.ru"
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
-private const val TMDB_API_KEY = "b9e1ff7ff423790bf7df202e661377ca"
+private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
 private const val IMG_PROXY = "https://wsrv.nl/?url="
 
 private val ID_REGEX = Regex("""(movie|tv):(\d+)(?::(\d+):(\d+))?""")
