@@ -9,8 +9,8 @@ import com.lagradost.cloudstream3.CommonActivity
 object ClipboardLogger {
     private const val TAG = "PluginLogger"
 
+    // Lấy Context an toàn qua CommonActivity, không dùng CloudStreamApp
     private fun getContext(): Context? {
-        // Chỉ sử dụng CommonActivity, bỏ hoàn toàn app.context để tránh lỗi
         return try {
             CommonActivity.activity
         } catch (e: Throwable) {
@@ -22,7 +22,7 @@ object ClipboardLogger {
         val logMessage = "=== [$title] ===\n$message\n==================="
         Log.d(TAG, logMessage)
         try {
-            val ctx = getContext() ?: return // Nếu không có context thì bỏ qua
+            val ctx = getContext() ?: return
             val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val clip = ClipData.newPlainText("Plugin Log", logMessage)
             clipboard.setPrimaryClip(clip)
@@ -33,7 +33,7 @@ object ClipboardLogger {
 
     fun reset() {
         try {
-            val ctx = getContext() ?: return // Nếu không có context thì bỏ qua
+            val ctx = getContext() ?: return
             val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             cm.setPrimaryClip(ClipData.newPlainText("", ""))
         } catch (e: Exception) {
