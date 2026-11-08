@@ -6,7 +6,6 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import com.lagradost.cloudstream3.CloudStreamApp
 
 object ClipboardLogger {
     private const val TAG = "Clubcat3Logger"
@@ -17,13 +16,31 @@ object ClipboardLogger {
 
     private val buffer = StringBuilder()
 
-    /** Xoá log cũ (gọi ở đầu mỗi phiên: load / loadLinks). */
+    /** Lấy Context mà không phụ thuộc lớp CloudStreamApp/AcraApplication (tên đổi theo phiên bản app). */
+    private fun appContext(): Context? {
+        try {
+            val at = Class.forName("android.app.ActivityThread")
+            val app = at.getMethod("currentApplication").invoke(null) as? Context
+            if (app != null) return app
+        } catch (_: Throwable) {
+        }
+        for (cls in listOf("com.lagradost.cloudstream3.CloudStreamApp", "com.lagradost.cloudstream3.AcraApplication")) {
+            try {
+                val c = Class.forName(cls)
+                val comp = c.getField("Companion").get(null)
+                val ctx = comp.javaClass.getMethod("getContext").invoke(comp) as? Context
+                if (ctx != null) return ctx
+            } catch (_: Throwable) {
+            }
+        }
+        return null
+    }
+
     @Synchronized
     fun reset() {
         buffer.setLength(0)
     }
 
-    /** Ghi nối tiếp vào bộ đệm rồi copy TOÀN BỘ log vào clipboard. */
     @Synchronized
     fun logAndCopy(title: String, message: String) {
         val entry = "=== [$title] ===\n$message\n"
@@ -33,16 +50,16 @@ object ClipboardLogger {
         if (!COPY_ALWAYS && !title.contains("Error", true) && !title.contains("Exception", true)) return
         val text = buffer.toString()
         try {
-            val context = CloudStreamApp.context ?: return
+            val context = appContext() ?: return
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             Handler(Looper.getMainLooper()).post {
                 try {
                     clipboard.setPrimaryClip(ClipData.newPlainText("Clubcat3 Log", text))
-                } catch (e: Exception) {
+                } catch (e: Throwable) {
                     Log.e(TAG, "Failed to copy to clipboard", e)
                 }
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             Log.e(TAG, "Failed to copy to clipboard", e)
         }
     }
