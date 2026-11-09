@@ -50,11 +50,7 @@ private data class SniffResult(
     val headers: Map<String, String>,
     val subtitles: List<SubtitleFile> = emptyList()
 )
-private data class SniffResult(
-    val url: String,
-    val headers: Map<String, String>,
-    val subtitles: List<SubtitleFile> = emptyList()
-)
+
 // Chặn quảng cáo
 private val AD_DOMAINS = listOf(
     "rapidadexchange.com", "youradexchange.com", "adexchangerapid.com",
