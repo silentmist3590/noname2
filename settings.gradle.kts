@@ -13,6 +13,7 @@ include(":Vidfast")
 include(":Vidapi")
 include(":Cat3movie")
 include(":Clubcat3")
+include(":NontonGo")
 
 pluginManagement {
     repositories {
