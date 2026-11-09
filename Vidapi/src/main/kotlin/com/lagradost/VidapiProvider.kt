@@ -19,7 +19,6 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import kotlinx.coroutines.runBlocking
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 import org.json.JSONArray
@@ -182,8 +181,46 @@ class VidapiProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // LOAD LINKS: Nạp trực tiếp trang embed, dùng WebView tùy chỉnh để vượt Cloudflare
+    // LOAD LINKS: gọi thẳng API stream của player (streamdata.vaplayer.ru); WebView chỉ là dự phòng
     // =====================================================================================
+    private val playerOrigin = "https://nextgencloudfabric.com"
+
+    /** Phát 1 master playlist: tách từng độ phân giải nếu có, ngược lại phát nguyên link. */
+    private suspend fun emitMaster(m3u8Url: String, label: String, ua: String, callback: (ExtractorLink) -> Unit) {
+        val reqHeaders = mapOf("User-Agent" to ua, "Referer" to "$playerOrigin/", "Origin" to playerOrigin)
+        val content = try { app.get(m3u8Url, headers = reqHeaders).text } catch (_: Throwable) { "" }
+        val matches = Regex("""#EXT-X-STREAM-INF:.*RESOLUTION=(\d+)x(\d+).*\n(.*)""").findAll(content).toList()
+        ClipboardLogger.logAndCopy("Master", "$label $m3u8Url\nvariants=${matches.size}")
+        if (matches.isNotEmpty()) {
+            matches.forEach { match ->
+                val height = match.groupValues[2].toIntOrNull() ?: 0
+                val subUrl = match.groupValues[3].trim()
+                val full = if (subUrl.startsWith("http")) subUrl else m3u8Url.substringBeforeLast("/") + "/" + subUrl
+                val q = when {
+                    height >= 1080 -> Qualities.P1080.value
+                    height >= 720 -> Qualities.P720.value
+                    height >= 480 -> Qualities.P480.value
+                    else -> Qualities.P360.value
+                }
+                callback.invoke(
+                    newExtractorLink(this.name, "${this.name} $label ${height}p", full, ExtractorLinkType.M3U8) {
+                        this.referer = "$playerOrigin/"
+                        this.quality = q
+                        this.headers = reqHeaders
+                    }
+                )
+            }
+        } else {
+            callback.invoke(
+                newExtractorLink(this.name, "${this.name} $label", m3u8Url, ExtractorLinkType.M3U8) {
+                    this.referer = "$playerOrigin/"
+                    this.quality = Qualities.Unknown.value
+                    this.headers = reqHeaders
+                }
+            )
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -196,80 +233,60 @@ class VidapiProvider : MainAPI() {
         val ref = parseRef(data) ?: return false
         val embedUrl = if (ref.type == "movie") "$BASE_URL/embed/movie/${ref.id}"
                        else "$BASE_URL/embed/tv/${ref.id}/${ref.season}/${ref.episode}"
-        
         val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
         try {
             val imdbId = imdbCache[ref.id] ?: ""
             ApiServices.fetchSubtitles(imdbId, subtitleCallback)
 
-            // BƯỚC 1: Gọi WebView tùy chỉnh trên toàn bộ trang embed
-            ClipboardLogger.logAndCopy("Step 1", "Mở WebView tùy chỉnh trên: $embedUrl")
-            val sniffedResult = sniffWithCustomWebView(embedUrl, "$BASE_URL/", ua)
+            // BƯỚC 1: gọi thẳng API stream (cùng API mà player.min.js dùng)
+            val apiUrl = "https://streamdata.vaplayer.ru/api.php?tmdb=${ref.id}&type=${ref.type}" +
+                if (ref.type == "tv") "&season=${ref.season}&episode=${ref.episode}" else ""
+            var found = false
+            try {
+                val r = app.get(apiUrl, headers = mapOf("User-Agent" to ua, "Referer" to "$playerOrigin/", "Origin" to playerOrigin, "Accept" to "application/json"))
+                ClipboardLogger.logAndCopy("Step 1 API", "url=$apiUrl\nHTTP ${r.code}\n${r.text.take(400)}")
+                if (r.text.trimStart().startsWith("{")) {
+                    val root = JSONObject(r.text)
+                    val d = root.optJSONObject("data")
+                    val urls = d?.optJSONArray("stream_urls")
+                    if (urls != null) {
+                        for (i in 0 until urls.length()) {
+                            val u = urls.optString(i).replace("\\/", "/")
+                            if (u.startsWith("http")) {
+                                emitMaster(u, "S${i + 1}", ua, callback)
+                                found = true
+                            }
+                        }
+                    }
+                    // Phụ đề mặc định của player (nếu có): mảng các object {file/url, label/lang}
+                    val subs = root.optJSONArray("default_subs") ?: d?.optJSONArray("default_subs")
+                    if (subs != null) {
+                        for (i in 0 until subs.length()) {
+                            val o = subs.optJSONObject(i) ?: continue
+                            val f = o.optString("file").ifEmpty { o.optString("url") }
+                            if (f.startsWith("http")) subtitleCallback.invoke(SubtitleFile(o.optString("label").ifEmpty { o.optString("lang", "Sub") }, f))
+                        }
+                    }
+                }
+            } catch (e: Throwable) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                ClipboardLogger.logAndCopy("Step 1 API Exception", e.message ?: "")
+            }
+            if (found) return true
 
+            // BƯỚC 2 (dự phòng): WebView tùy chỉnh trên trang embed
+            ClipboardLogger.logAndCopy("Step 2", "API không có link -> mở WebView: $embedUrl")
+            val sniffedResult = sniffWithCustomWebView(embedUrl, "$BASE_URL/", ua)
             if (sniffedResult == null) {
                 ClipboardLogger.logAndCopy("Error", "WebView tùy chỉnh không bắt được link m3u8.")
                 return false
             }
-            
             ClipboardLogger.logAndCopy("Step 2", "Bắt được M3U8: ${sniffedResult.first}")
-
-            // BƯỚC 2: Xử lý đa chất lượng và phát link
-            val m3u8Url = sniffedResult.first
-            // Referer cho CDN phải là domain của player (nextgencloudfabric.com), 
-            // nhưng vì chúng ta không trích xuất được nó một cách chắc chắn, 
-            // hãy thử dùng BASE_URL trước, nếu lỗi có thể thử domain khác.
-            val reqHeaders = mapOf("User-Agent" to ua, "Referer" to "$BASE_URL/", "Origin" to BASE_URL)
-            val m3u8Content = runBlocking { try { app.get(m3u8Url, headers = reqHeaders).text } catch (_: Exception) { "" } }
-
-            val qualityRegex = Regex("""#EXT-X-STREAM-INF:.*RESOLUTION=(\d+)x(\d+).*\n(.*)""")
-            val matches = qualityRegex.findAll(m3u8Content)
-
-            if (matches.count() > 0) {
-                matches.forEach { match ->
-                    val height = match.groupValues[2].toIntOrNull() ?: 0
-                    val subUrl = match.groupValues[3].trim()
-                    val fullSubUrl = if (subUrl.startsWith("http")) subUrl else {
-                        val base = m3u8Url.substringBeforeLast("/")
-                        "$base/$subUrl"
-                    }
-                    val q = when {
-                        height >= 1080 -> Qualities.P1080.value
-                        height >= 720 -> Qualities.P720.value
-                        height >= 480 -> Qualities.P480.value
-                        else -> Qualities.P360.value
-                    }
-                    
-                    callback.invoke(
-                        newExtractorLink(
-                            source = this.name,
-                            name = "${this.name} ${height}p",
-                            url = fullSubUrl,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = "$BASE_URL/"
-                            this.quality = q
-                            this.headers = reqHeaders
-                        }
-                    )
-                }
-            } else {
-                callback.invoke(
-                    newExtractorLink(
-                        source = this.name,
-                        name = this.name,
-                        url = m3u8Url,
-                        type = ExtractorLinkType.M3U8
-                    ) {
-                        this.referer = "$BASE_URL/"
-                        this.quality = Qualities.Unknown.value
-                        this.headers = reqHeaders
-                    }
-                )
-            }
+            emitMaster(sniffedResult.first, "WV", ua, callback)
             return true
-
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            if (e is java.util.concurrent.CancellationException) throw e
             ClipboardLogger.logAndCopy("Exception", e.message ?: "")
             return false
         }
@@ -295,6 +312,7 @@ class VidapiProvider : MainAPI() {
                     val h = 1920
                     val wv = WebView(ctx)
                     var finished = false
+                    val seenReq = java.util.Collections.synchronizedList(mutableListOf<String>())
                     val collectedSubtitles = mutableListOf<SubtitleFile>()
 
                     fun finish(res: Pair<String, List<SubtitleFile>>?) {
@@ -362,6 +380,7 @@ class VidapiProvider : MainAPI() {
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                             val u = request?.url?.toString() ?: return null
+                            if (seenReq.size < 80) seenReq.add(u)
                             
                             val adDomains = listOf("doubleclick", "googlesyndication", "popads", "onclickads", "adsterra", "propellerads")
                             if (adDomains.any { u.contains(it, true) }) {
@@ -389,7 +408,7 @@ class VidapiProvider : MainAPI() {
                     wv.translationX = -4000f
                     try { CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
                     
-                    handler.postDelayed({ finish(null) }, 180_000L)
+                    handler.postDelayed({ ClipboardLogger.logAndCopy("CustomWebView timeout", "requests(${seenReq.size}):\n" + seenReq.joinToString("\n")); finish(null) }, 120_000L)
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                     
                 } catch (e: Exception) {
