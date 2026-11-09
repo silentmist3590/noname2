@@ -3,7 +3,7 @@ cloudstream {
     description = "Vidsrcsu provider with TMDB Proxy, OMDb, Trakt integration and auto-copy debug logs"
     authors = listOf("silentmist3590")
     status = 1
-    version = 14
+    version = 15
     tvTypes = listOf("Movie", "TvSeries")
     requiresResources = false
 }
