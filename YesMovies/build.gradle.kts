@@ -5,7 +5,7 @@ cloudstream {
     description = "yesmovies.press"
     authors = listOf("silentmist3590")
     status = 1
-    language = en
+    language = "en"
     tvTypes = listOf("Movie", "TVseries")
     requiresResources = false
 }
