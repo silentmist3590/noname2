@@ -50,7 +50,11 @@ private data class SniffResult(
     val headers: Map<String, String>,
     val subtitles: List<SubtitleFile> = emptyList()
 )
-
+private data class SniffResult(
+    val url: String,
+    val headers: Map<String, String>,
+    val subtitles: List<SubtitleFile> = emptyList()
+)
 // Chặn quảng cáo
 private val AD_DOMAINS = listOf(
     "rapidadexchange.com", "youradexchange.com", "adexchangerapid.com",
@@ -210,7 +214,7 @@ class VidapiProvider : MainAPI() {
                     val h = 1920
                     val wv = WebView(ctx)
                     var finished = false
-                    fun finish(res: String?) {
+                    fun finish(res: SniffResult?) {
                         if (finished) return
                         finished = true
                         handler.removeCallbacksAndMessages(null)
@@ -263,7 +267,10 @@ class VidapiProvider : MainAPI() {
                             val u = request?.url?.toString() ?: return null
                             if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
                             if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
-                                handler.post { finish(u) }
+                                    val reqHeaders = request?.requestHeaders ?: emptyMap()
+                                    val hit = SniffResult(u, reqHeaders, collectedSubtitles) // <--- Tạo Object
+                                    ClipboardLogger.logAndCopy("Sniff HIT", "URL: $u")
+                                    handler.post { finish(hit) } // <--- Trả về Object
                             }
                             return null
                         }
