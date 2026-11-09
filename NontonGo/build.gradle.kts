@@ -2,7 +2,7 @@ cloudstream {
     description = "Nontongo.win - The Movie and TVserie"
     authors = listOf("silentmist3590")
     status = 1
-    version = 1
+    version = 2
     tvTypes = listOf("Movie","TVSeries")
     requiresResources = false
     language = "en"
