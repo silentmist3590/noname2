@@ -12,3 +12,4 @@ cloudstream {
 
 android {
     namespace = "com.lagradost"
+}
