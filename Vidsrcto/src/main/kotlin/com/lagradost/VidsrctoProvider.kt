@@ -2,6 +2,7 @@ package com.lagradost
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.newExtractorLink // ⭐ Thêm import này
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import android.annotation.SuppressLint
@@ -199,7 +200,7 @@ class VidsrctoProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // WEBVIEW SNIFFER — capture URL + Referer + Origin, timeout 180s, chỉ chặn ads
+    // WEBVIEW SNIFFER
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun sniffStream(
@@ -211,8 +212,14 @@ class VidsrctoProvider : MainAPI() {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
-                val ctx: Context? = CommonActivity.activity ?: CloudStreamApp.context
-                if (ctx == null) { cont.resume(null); return@post }
+                // ⭐ SỬA LỖI: Bỏ CloudStreamApp.context
+                val ctx: Context? = CommonActivity.activity
+                if (ctx == null) { 
+                    ClipboardLogger.logAndCopy("Sniff Error", "Không có Context")
+                    cont.resume(null)
+                    return@post 
+                }
+                
                 try {
                     val w = 1080; val h = 1920
                     val wv = WebView(ctx)
@@ -293,7 +300,6 @@ class VidsrctoProvider : MainAPI() {
                             }
 
                             if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
-                                // Capture Referer/Origin thật từ request
                                 val ref = reqHeaders["Referer"] ?: reqHeaders["referer"]
                                     ?: lastPlayerUrl.ifEmpty { initialReferer }
                                 val origin = reqHeaders["Origin"] ?: reqHeaders["origin"]
@@ -310,7 +316,6 @@ class VidsrctoProvider : MainAPI() {
                             return null
                         }
 
-                        // Chỉ chặn ad, cho phép mọi redirect player
                         override fun shouldOverrideUrlLoading(
                             view: WebView?,
                             request: WebResourceRequest?
@@ -338,7 +343,6 @@ class VidsrctoProvider : MainAPI() {
                     wv.translationX = -4000f
                     try { CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
 
-                    // 180s — chain vidsrc.sh → stellarconductornexus có thể mất 2-3 phút
                     handler.postDelayed({ finish(null) }, 180_000L)
 
                     wv.loadUrl(pageUrl, mapOf("Referer" to initialReferer))
@@ -364,7 +368,7 @@ class VidsrctoProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // LOAD LINKS — chain vidsrc.sh (giống Vidsrcsu đang chạy)
+    // LOAD LINKS
     // =====================================================================================
     override suspend fun loadLinks(
         data: String, isCasting: Boolean,
@@ -398,7 +402,6 @@ class VidsrctoProvider : MainAPI() {
             else
                 "$SRC_API?type=tv&id=$tmdbId&season=${ref.season}&episode=${ref.episode}"
 
-            // === BƯỚC 1: Gọi vs_src.php để lấy src URL ===
             ClipboardLogger.logAndCopy("Step1 vs_src", "URL: $srcApi")
             val r2 = app.get(srcApi, headers = mapOf(
                 "User-Agent" to ua,
@@ -413,7 +416,6 @@ class VidsrctoProvider : MainAPI() {
                 ?.let { cleanJsUrl(it) }
             ClipboardLogger.logAndCopy("Step1 src", "$srcUrl")
 
-            // === BƯỚC 2: Fetch src URL để lấy playerUrl ===
             var target: String? = null
             var wvReferer = "$VIDSRC_SH/"
 
@@ -444,13 +446,11 @@ class VidsrctoProvider : MainAPI() {
                 }
             }
 
-            // Fallback: dùng embed URL
             if (target == null) {
                 target = shEmbed
                 wvReferer = "$VIDSRC_SH/"
             }
 
-            // === BƯỚC 3: WebView sniff trên player page ===
             ClipboardLogger.logAndCopy("Step3 WebView", "Target: $target\nReferer: $wvReferer")
 
             val seen = mutableListOf<String>()
@@ -479,22 +479,24 @@ class VidsrctoProvider : MainAPI() {
                 "URL: ${finalUrl.take(300)}\nReferer: ${result.referer}\nOrigin: ${result.origin}"
             )
 
+            // ⭐ SỬA LỖI: Dùng newExtractorLink
             callback.invoke(
-                ExtractorLink(
+                newExtractorLink(
                     source = this.name,
                     name = "Vidsrcto",
                     url = finalUrl,
-                    referer = result.referer,
-                    quality = Qualities.P1080.value,
-                    type = ExtractorLinkType.M3U8,
-                    headers = mapOf(
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = result.referer
+                    this.quality = Qualities.P1080.value
+                    this.headers = mapOf(
                         "User-Agent" to ua,
                         "Referer" to result.referer,
                         "Origin" to result.origin,
                         "Accept" to "*/*",
                         "Accept-Language" to "vi-VN,vi;q=0.9,en;q=0.8"
                     )
-                )
+                }
             )
             return true
 
