@@ -2,7 +2,7 @@ package com.lagradost
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.newExtractorLink // ⭐ Thêm import này
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import android.annotation.SuppressLint
@@ -45,7 +45,6 @@ private fun parseRef(s: String): Ref? {
 
 private data class SniffResult(val url: String, val headers: Map<String, String>)
 
-// Danh sách các domain quảng cáo cần chặn đứng
 private val AD_DOMAINS = listOf(
     "rapidadexchange.com", "youradexchange.com", "adexchangerapid.com",
     "popads.net", "onclickads.net", "propellerads.com", "popcash.net",
@@ -68,7 +67,6 @@ object ApiServices {
         }
     }
 
-    // ⭐ Sửa lỗi API OpenSubtitles: Gọi riêng từng ngôn ngữ
     suspend fun fetchSubtitles(imdbId: String, subtitleCallback: (SubtitleFile) -> Unit) {
         if (imdbId.isEmpty()) return
         try {
@@ -77,7 +75,7 @@ object ApiServices {
                 "User-Agent" to "trailers.to-UA",
                 "X-User-Agent" to "trailers.to-UA"
             )
-            val languages = listOf("vie", "eng") // Gọi riêng tiếng Việt và tiếng Anh
+            val languages = listOf("vie", "eng")
 
             for (lang in languages) {
                 try {
@@ -241,10 +239,10 @@ class VidrockProvider : MainAPI() {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
-                // ⭐ SỬA LỖI: Loại bỏ CloudStreamApp.context
-                val ctx: Context? = CommonActivity.activity ?: ClipboardLogger.appContext()
+                // ⭐ CHỈ SỬ DỤNG CommonActivity.activity, BỎ HOÀN TOÀN appContext
+                val ctx: Context? = CommonActivity.activity
                 if (ctx == null) { 
-                    ClipboardLogger.logAndCopy("Sniff Error", "Không có Context")
+                    ClipboardLogger.logAndCopy("Sniff Error", "Không có Context từ CommonActivity")
                     cont.resume(null)
                     return@post 
                 }
@@ -406,7 +404,6 @@ class VidrockProvider : MainAPI() {
                 "Origin" to "https://vidrock.to"
             )
 
-            // ⭐ SỬA LỖI: Dùng newExtractorLink thay vì constructor
             callback.invoke(
                 newExtractorLink(
                     source = this.name, 
