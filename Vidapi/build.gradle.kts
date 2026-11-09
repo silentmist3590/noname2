@@ -1,6 +1,3 @@
-// use an integer for version numbers
-
-
 cloudstream {
     description = "Vidapi.ru - The Movie and TVserie"
     authors = listOf("silentmist3590")
