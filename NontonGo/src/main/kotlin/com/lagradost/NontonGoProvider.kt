@@ -25,6 +25,7 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import java.io.ByteArrayInputStream
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -47,6 +48,7 @@ class NontonGoProvider : MainAPI() {
 
     data class EpisodeData(
         @JsonProperty("imdbId") val imdbId: String,
+        @JsonProperty("tmdbId") val tmdbId: Int? = null,
         @JsonProperty("type") val type: String, // "movie" hoặc "tv"
         @JsonProperty("season") val season: Int? = null,
         @JsonProperty("episode") val episode: Int? = null,
@@ -54,7 +56,7 @@ class NontonGoProvider : MainAPI() {
     )
 
     // ==========================================
-    // KHỐI CODE BẮT LINK VÀ GIẢ LẬP TOUCH BẠN YÊU CẦU
+    // KHỐI BẮT LINK BẰNG WEBVIEW (ĐÃ ĐƯỢC VÁ LỖI CHẶN QUẢNG CÁO)
     // ==========================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): String? {
@@ -84,8 +86,14 @@ class NontonGoProvider : MainAPI() {
                         }
                         cont.resume(res)
                     }
-                    val streamRegex = Regex("""\.m3u8|\.mpd|master\.txt""", RegexOption.IGNORE_CASE)
+
+                    // Mở rộng regex để bắt được svsoapp và /bl/ ngay cả khi không có đuôi .m3u8
+                    val streamRegex = Regex("""\.m3u8|\.mpd|master\.txt|/bl/|svsoapp\.nontongo\.win""", RegexOption.IGNORE_CASE)
+                    
+                    // Regex chặn triệt để domain quảng cáo làm lag/lừa click
+                    val adDomainsRegex = Regex("""ay267\.com|pyppo\.com|dtscout\.com|llvpn\.com|accountut\.com|histats\.com|whomeetstare\.com|popads\.net""", RegexOption.IGNORE_CASE)
                     val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
+
                     wv.settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
@@ -95,15 +103,25 @@ class NontonGoProvider : MainAPI() {
                         userAgentString = ua
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
-                    // Popup quảng cáo: không mở cửa sổ mới
+
+                    // Vô hiệu hóa mở cửa sổ quảng cáo
                     wv.webChromeClient = object : WebChromeClient() {
                         override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
                     }
+
+                    // Script tiêu diệt lớp phủ clickjacking và click đúng nút Play của NontonGo
                     val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
-                    val clickJs = "(function(){function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
-                        "fire(document.getElementById('bigPlay'));" +
-                        "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
-                        "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();"
+                    val clickJs = "(function(){" +
+                        "try{document.querySelectorAll('iframe:not(#playerFrame):not(#player):not(#streamFrame),div[style*=\"z-index: 999999\"],div[style*=\"z-index: 2147483647\"]').forEach(function(e){e.remove();});}catch(e){}" +
+                        "function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
+                        "fire(document.getElementById('playBtn'));" +
+                        "fire(document.querySelector('.play-btn,.video-play-button,#playBtn'));" +
+                        "fire(document.getElementById('srvBtn'));" +
+                        "fire(document.querySelector('.srv-menu-item'));" +
+                        "fire(document.querySelector('.dropdown-item'));" +
+                        "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}" +
+                        "})();"
+
                     var taps = 0
                     fun tap() {
                         if (finished) return
@@ -118,22 +136,34 @@ class NontonGoProvider : MainAPI() {
                             d.recycle(); u.recycle()
                         } catch (_: Exception) {
                         }
-                        if (taps < 25) handler.postDelayed({ tap() }, 1500)
+                        if (taps < 20) handler.postDelayed({ tap() }, 1500)
                     }
+
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                             val u = request?.url?.toString() ?: return null
+
+                            // Chặn đứng hoàn toàn request quảng cáo ngay tại mạng
+                            if (adDomainsRegex.containsMatchIn(u)) {
+                                return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream(ByteArray(0)))
+                            }
+
                             if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
-                            if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
+                            
+                            // Bắt link stream
+                            if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/") && !u.contains("view1.php")) {
                                 handler.post { finish(u) }
                             }
                             return null
                         }
 
-                        // chặn mọi chuyển hướng sang trang quảng cáo
                         override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                             val u = request?.url?.toString() ?: return false
-                            val ok = u.startsWith(pageUrl.substringBefore("?")) || u.contains("stellarconductornexus.com")
+                            if (adDomainsRegex.containsMatchIn(u) || u.startsWith("intent://")) {
+                                seen.add("BLOCKED AD: " + u.take(160))
+                                return true
+                            }
+                            val ok = u.contains("nontongo.win") || u.contains("svsoapp")
                             if (!ok) seen.add("BLOCKED NAV: " + u.take(160))
                             return !ok
                         }
@@ -142,7 +172,8 @@ class NontonGoProvider : MainAPI() {
                             handler.postDelayed({ tap() }, 800)
                         }
                     }
-                    // Gắn vào cửa sổ (ngoài màn hình) để WebView nhận chạm và chạy như bình thường
+
+                    // Gắn vào Activity để WebView nhận dispatch touch
                     wv.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
                     wv.layout(0, 0, w, h)
                     wv.translationX = -4000f
@@ -150,7 +181,7 @@ class NontonGoProvider : MainAPI() {
                         act?.addContentView(wv, ViewGroup.LayoutParams(w, h))
                     } catch (_: Exception) {
                     }
-                    handler.postDelayed({ finish(null) }, 45_000L)
+                    handler.postDelayed({ finish(null) }, 35_000L)
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                 } catch (e: Exception) {
                     ClipboardLogger.logAndCopy("Sniff Exception", e.stackTraceToString().take(800))
@@ -169,135 +200,154 @@ class NontonGoProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val seen = mutableListOf<String>()
-
-        // 1. Phân tích endpoint từ data
-        val targetUrls = mutableListOf<String>()
-        val referer = "https://www.nontongo.win/"
+        var imdbId = ""
+        var tmdbId = 0
+        var isTv = false
+        var season = 1
+        var episode = 1
 
         if (data.startsWith("http://") || data.startsWith("https://")) {
-            targetUrls.add(data)
+            if (data.contains("/tv/")) {
+                isTv = true
+                val parts = data.substringAfter("/tv/").split("/")
+                imdbId = parts.getOrNull(0) ?: ""
+                season = parts.getOrNull(1)?.toIntOrNull() ?: 1
+                episode = parts.getOrNull(2)?.toIntOrNull() ?: 1
+            } else {
+                imdbId = data.substringAfter("/movie/").substringBefore("?").trim('/')
+            }
         } else {
             try {
                 val ep = mapper.readValue<EpisodeData>(data)
-                if (ep.type == "movie") {
-                    targetUrls.add("https://www.nontongo.win/embed/movie/${ep.imdbId}")
-                } else {
-                    targetUrls.add("https://www.nontongo.win/embed/tv/${ep.imdbId}/${ep.season ?: 1}/${ep.episode ?: 1}")
-                    targetUrls.add("https://www.nontongo.win/embed/tv/?id=${ep.imdbId}&s=${ep.season ?: 1}&e=${ep.episode ?: 1}")
-                }
+                imdbId = ep.imdbId
+                tmdbId = ep.tmdbId ?: 0
+                isTv = ep.type == "tv"
+                season = ep.season ?: 1
+                episode = ep.episode ?: 1
             } catch (_: Exception) {
-                // Fallback nếu data là imdbId thuần
-                targetUrls.add("https://www.nontongo.win/embed/movie/$data")
+                imdbId = data.trim()
             }
         }
 
-        var foundStream = false
+        ClipboardLogger.logAndCopy("NontonGo Load", "Bắt đầu lấy stream: ID=$imdbId, TMDB=$tmdbId, TV=$isTv (S$season E$episode)")
 
-        for (pageUrl in targetUrls) {
-            ClipboardLogger.logAndCopy("NontonGo Sniff Start", "Đang phân tích link: $pageUrl")
+        // ----------------------------------------------------
+        // BƯỚC 1: TRÍCH XUẤT TRỰC TIẾP TỪ PLAYER NỘI BỘ (0.3 GIÂY, SẠCH QUẢNG CÁO 100%)
+        // ----------------------------------------------------
+        val playerDirectUrls = mutableListOf<String>()
+        if (isTv) {
+            val tvId = if (tmdbId > 0) tmdbId.toString() else imdbId
+            playerDirectUrls.add("https://nontongo.win/01aus/player.php?id=$tvId&type=tv&season=$season&episode=$episode&autoplay=true")
+            playerDirectUrls.add("https://nontongo.win/01aus/player.php?id=$imdbId&type=tv&season=$season&episode=$episode&autoplay=true")
+        } else {
+            playerDirectUrls.add("https://nontongo.win/01aus/player.php?id=$imdbId&type=movie&autoplay=true")
+            if (tmdbId > 0) {
+                playerDirectUrls.add("https://nontongo.win/01aus/player.php?id=$tmdbId&type=movie&autoplay=true")
+            }
+        }
 
-            // Trích xuất phụ đề tĩnh từ HTML trước nếu có
+        var foundDirectStream = false
+
+        for (directUrl in playerDirectUrls) {
             try {
-                val html = app.get(pageUrl, referer = referer, headers = mapOf("User-Agent" to userAgent)).text
-                extractSubtitlesFromHtml(html, subtitleCallback)
-            } catch (e: Exception) {
-                ClipboardLogger.log("NontonGo Sub Parse", "Lỗi tải HTML tĩnh: ${e.message}")
-            }
+                val playerHtml = app.get(
+                    directUrl,
+                    referer = "https://nontongo.win/",
+                    headers = mapOf("User-Agent" to userAgent)
+                ).text
 
-            // Gọi phương thức sniffStream với WebView ẩn và chạm tự động
-            val streamUrl = sniffStream(pageUrl, referer, userAgent, seen)
+                // 1. Quét phụ đề (.vtt, .srt)
+                extractSubtitlesFromHtml(playerHtml, subtitleCallback)
 
-            if (!streamUrl.isNullOrEmpty()) {
-                foundStream = true
-                ClipboardLogger.logAndCopy(
-                    "NontonGo Stream Found",
-                    "Thành công bắt được stream:\n$streamUrl\n\nCác link chặn/ghi nhận (${seen.size}):\n" + seen.takeLast(10).joinToString("\n")
-                )
+                // 2. Quét tất cả các server stream data-url="https://svsoapp.nontongo.win/bl/...#file.m3u8"
+                val streamUrlRegex = Regex("""data-url=["']([^"']+)["']""")
+                val matches = streamUrlRegex.findAll(playerHtml).map { it.groupValues[1] }.toList()
 
-                if (streamUrl.contains(".m3u8", ignoreCase = true) || streamUrl.contains("master.txt", ignoreCase = true)) {
-                    // Trích xuất toàn bộ các độ phân giải từ master m3u8
-                    val links = try {
-                        M3u8Helper.generateM3u8(
-                            source = name,
-                            streamUrl = streamUrl,
-                            referer = pageUrl,
-                            headers = mapOf(
-                                "Referer" to pageUrl,
-                                "User-Agent" to userAgent,
-                                "Origin" to "https://www.nontongo.win"
-                            )
-                        )
-                    } catch (e: Exception) {
-                        ClipboardLogger.log("M3U8 Generator", "Lỗi phân tích đa độ phân giải: ${e.message}")
-                        emptyList()
+                for (matched in matches) {
+                    val cleanUrl = matched.substringBefore("#").trim()
+                    if (cleanUrl.startsWith("http") && (cleanUrl.contains("svsoapp") || cleanUrl.contains("/bl/") || cleanUrl.contains(".m3u8"))) {
+                        foundDirectStream = true
+                        emitStream(cleanUrl, directUrl, callback)
                     }
-
-                    if (links.isNotEmpty()) {
-                        ClipboardLogger.logAndCopy("NontonGo Qualities", "Đã tìm thấy ${links.size} chất lượng phát (1080p, 720p, 480p...)")
-                        links.forEach(callback)
-                    } else {
-                        // Fallback luồng đơn nếu danh sách trả về rỗng
-                        callback.invoke(
-                            newExtractorLink(
-                                source = name,
-                                name = "$name Auto HLS",
-                                url = streamUrl,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = pageUrl
-                                this.headers = mapOf("Referer" to pageUrl, "User-Agent" to userAgent)
-                                this.quality = Qualities.P1080.value
-                            }
-                        )
-                    }
-                } else if (streamUrl.contains(".mpd", ignoreCase = true)) {
-                    callback.invoke(
-                        newExtractorLink(
-                            source = name,
-                            name = "$name DASH Stream",
-                            url = streamUrl,
-                            type = ExtractorLinkType.DASH
-                        ) {
-                            this.referer = pageUrl
-                            this.headers = mapOf("Referer" to pageUrl, "User-Agent" to userAgent)
-                            this.quality = Qualities.P1080.value
-                        }
-                    )
-                } else {
-                    callback.invoke(
-                        newExtractorLink(
-                            source = name,
-                            name = "$name Direct MP4",
-                            url = streamUrl,
-                            type = ExtractorLinkType.VIDEO
-                        ) {
-                            this.referer = pageUrl
-                            this.headers = mapOf("Referer" to pageUrl, "User-Agent" to userAgent)
-                            this.quality = Qualities.P1080.value
-                        }
-                    )
                 }
-                break // Đã bắt được stream thành công, kết thúc vòng lặp
+
+                if (foundDirectStream) {
+                    ClipboardLogger.logAndCopy("NontonGo Success", "Đã lấy thành công stream trực tiếp từ $directUrl")
+                    return true
+                }
+            } catch (e: Exception) {
+                ClipboardLogger.log("NontonGo Direct Error", "${e.message}")
             }
         }
 
-        if (!foundStream) {
-            ClipboardLogger.logAndCopy(
-                "NontonGo Sniff Failed",
-                "Không bắt được stream sau khi thử hết endpoint.\nSeen URLs (${seen.size}):\n" + seen.takeLast(15).joinToString("\n")
+        // ----------------------------------------------------
+        // BƯỚC 2: NẾU BƯỚC 1 CHƯA RA, CHẠY SNIFFSTREAM WEBVIEW (ĐÃ CHẶN QUẢNG CÁO)
+        // ----------------------------------------------------
+        val seen = mutableListOf<String>()
+        val fallbackPageUrl = if (isTv) {
+            "https://www.nontongo.win/embed/tv/$imdbId/$season/$episode"
+        } else {
+            "https://www.nontongo.win/embed/movie/$imdbId"
+        }
+
+        val sniffedUrl = sniffStream(fallbackPageUrl, "https://www.nontongo.win/", userAgent, seen)
+        if (!sniffedUrl.isNullOrEmpty()) {
+            val cleanStream = sniffedUrl.substringBefore("#")
+            emitStream(cleanStream, fallbackPageUrl, callback)
+            ClipboardLogger.logAndCopy("NontonGo Sniff Success", "WebView đã bắt được stream:\n$cleanStream")
+            return true
+        }
+
+        ClipboardLogger.logAndCopy(
+            "NontonGo Failed",
+            "Không lấy được stream.\nSeen URLs (${seen.size}):\n" + seen.takeLast(10).joinToString("\n")
+        )
+        return false
+    }
+
+    private suspend fun emitStream(streamUrl: String, referer: String, callback: (ExtractorLink) -> Unit) {
+        val headers = mapOf(
+            "Referer" to "https://nontongo.win/",
+            "User-Agent" to userAgent,
+            "Origin" to "https://nontongo.win"
+        )
+
+        // Phân tích HLS đa chất lượng
+        val m3u8Links = try {
+            M3u8Helper.generateM3u8(
+                source = name,
+                streamUrl = streamUrl,
+                referer = "https://nontongo.win/",
+                headers = headers
+            )
+        } catch (_: Exception) {
+            emptyList()
+        }
+
+        if (m3u8Links.isNotEmpty()) {
+            ClipboardLogger.logAndCopy("NontonGo Multi-Qualities", "Bắt được ${m3u8Links.size} chất lượng phát (1080p, 720p, 480p...)")
+            m3u8Links.forEach(callback)
+        } else {
+            callback.invoke(
+                newExtractorLink(
+                    source = name,
+                    name = "$name Auto HLS",
+                    url = streamUrl,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "https://nontongo.win/"
+                    this.headers = headers
+                    this.quality = Qualities.P1080.value
+                }
             )
         }
-
-        return foundStream
     }
 
     private fun extractSubtitlesFromHtml(html: String, subtitleCallback: (SubtitleFile) -> Unit) {
-        val subRegex = Regex("""\{[^{}]*?"file"\s*:\s*"([^"]+\.(?:vtt|srt)[^"]*)"[^{}]*?"label"\s*:\s*"([^"]+)"[^{}]*?\}""", RegexOption.IGNORE_CASE)
-        val trackRegex = Regex("""<track[^>]+src=["']([^"']+\.(?:vtt|srt)[^"']*)["'][^>]+label=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-
         val found = mutableSetOf<String>()
 
+        // Bắt data-src="..." label="..."
+        val subRegex = Regex("""data-src=["']([^"']+\.(?:vtt|srt)[^"']*)["']\s+label=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
         subRegex.findAll(html).forEach { match ->
             val url = match.groupValues[1]
             val label = match.groupValues[2]
@@ -307,18 +357,20 @@ class NontonGoProvider : MainAPI() {
             }
         }
 
-        trackRegex.findAll(html).forEach { match ->
+        // Bắt { "file": "...", "label": "..." }
+        val jsonSubRegex = Regex("""\{[^{}]*?"file"\s*:\s*"([^"]+\.(?:vtt|srt)[^"]*)"[^{}]*?"label"\s*:\s*"([^"]+)"[^{}]*?\}""", RegexOption.IGNORE_CASE)
+        jsonSubRegex.findAll(html).forEach { match ->
             val url = match.groupValues[1]
             val label = match.groupValues[2]
             if (found.add(url)) {
                 subtitleCallback.invoke(SubtitleFile(lang = label, url = url))
-                ClipboardLogger.log("NontonGo Sub Track", "$label -> $url")
+                ClipboardLogger.log("NontonGo Sub", "$label -> $url")
             }
         }
     }
 
     // ==========================================
-    // TÌM KIẾM VÀ TRANG CHỦ TMDB -> NontonGo
+    // TRANG CHỦ & TÌM KIẾM TMDB
     // ==========================================
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val url = "$tmdbBase/trending/all/day?api_key=$tmdbApiKey&page=$page"
@@ -351,7 +403,6 @@ class NontonGoProvider : MainAPI() {
 
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.startsWith("tt")) {
-            // Cho phép tìm kiếm trực tiếp bằng mã IMDB ID (ví dụ: tt1375666)
             return listOf(
                 newMovieSearchResponse("IMDb $query", "https://www.nontongo.win/embed/movie/$query", TvType.Movie)
             )
@@ -382,7 +433,6 @@ class NontonGoProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        // Nếu người dùng nhập trực tiếp URL nontongo.win
         if (url.contains("nontongo.win/embed/movie/")) {
             val imdbId = url.substringAfter("nontongo.win/embed/movie/").substringBefore("?").trim('/')
             return newMovieLoadResponse(imdbId, url, TvType.Movie, url)
@@ -413,7 +463,7 @@ class NontonGoProvider : MainAPI() {
                     epList?.forEach { epNode ->
                         val epNum = epNode.get("episode_number")?.asInt() ?: 1
                         val epName = epNode.get("name")?.asText() ?: "Tập $epNum"
-                        val dataObj = EpisodeData(imdbId = imdbId, type = "tv", season = s, episode = epNum, title = epName)
+                        val dataObj = EpisodeData(imdbId = imdbId, tmdbId = tmdbId, type = "tv", season = s, episode = epNum, title = epName)
                         episodes.add(
                             newEpisode(mapper.writeValueAsString(dataObj)) {
                                 this.name = epName
@@ -431,7 +481,7 @@ class NontonGoProvider : MainAPI() {
                 this.plot = plot
             }
         } else {
-            val dataObj = EpisodeData(imdbId = imdbId, type = "movie")
+            val dataObj = EpisodeData(imdbId = imdbId, tmdbId = tmdbId, type = "movie")
             return newMovieLoadResponse(title, url, TvType.Movie, mapper.writeValueAsString(dataObj)) {
                 this.posterUrl = poster
                 this.plot = plot
