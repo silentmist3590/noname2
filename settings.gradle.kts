@@ -14,6 +14,7 @@ include(":Vidapi")
 include(":Cat3movie")
 include(":Clubcat3")
 include(":NontonGo")
+include(":YesMovies")
 
 pluginManagement {
     repositories {
