@@ -2,6 +2,7 @@ package com.lagradost
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.newExtractorLink // ⭐ Thêm import này
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import android.annotation.SuppressLint
@@ -67,31 +68,40 @@ object ApiServices {
         }
     }
 
-    // Tự động lấy phụ đề từ OpenSubtitles
+    // ⭐ Sửa lỗi API OpenSubtitles: Gọi riêng từng ngôn ngữ
     suspend fun fetchSubtitles(imdbId: String, subtitleCallback: (SubtitleFile) -> Unit) {
         if (imdbId.isEmpty()) return
         try {
             val cleanId = imdbId.removePrefix("tt").trimStart('0').ifEmpty { imdbId }
-            // Lấy phụ đề tiếng Anh và tiếng Việt
-            val url = "https://rest.opensubtitles.org/search/imdbid-$cleanId/sublanguageid-eng,vie"
             val headers = mapOf(
                 "User-Agent" to "trailers.to-UA",
                 "X-User-Agent" to "trailers.to-UA"
             )
-            val res = app.get(url, headers = headers).text
-            val arr = JSONArray(res)
-            for (i in 0 until minOf(arr.length(), 10)) {
-                val item = arr.getJSONObject(i)
-                val subUrl = item.optString("SubDownloadLink")
-                val lang = item.optString("SubLanguageID", "eng")
-                val name = item.optString("MovieReleaseName", "Unknown")
-                if (subUrl.isNotEmpty()) {
-                    subtitleCallback.invoke(SubtitleFile("$lang - ${name.take(40)}", subUrl))
+            val languages = listOf("vie", "eng") // Gọi riêng tiếng Việt và tiếng Anh
+
+            for (lang in languages) {
+                try {
+                    val url = "https://rest.opensubtitles.org/search/imdbid-$cleanId/sublanguageid-$lang"
+                    val res = app.get(url, headers = headers).text
+                    if (!res.trim().startsWith("[")) continue
+
+                    val arr = JSONArray(res)
+                    for (i in 0 until minOf(arr.length(), 5)) {
+                        val item = arr.getJSONObject(i)
+                        val subUrl = item.optString("SubDownloadLink")
+                        val subLang = item.optString("SubLanguageID", lang)
+                        val name = item.optString("MovieReleaseName", "Unknown")
+                        if (subUrl.isNotEmpty()) {
+                            subtitleCallback.invoke(SubtitleFile("$subLang - ${name.take(40)}", subUrl))
+                        }
+                    }
+                    ClipboardLogger.logAndCopy("Subtitles ($lang)", "Loaded ${arr.length()} subs")
+                } catch (e: Exception) {
+                    ClipboardLogger.logAndCopy("Sub Error ($lang)", e.message ?: "")
                 }
             }
-            ClipboardLogger.logAndCopy("Subtitles", "Loaded ${arr.length()} subs from OpenSubtitles")
         } catch (e: Exception) {
-            ClipboardLogger.logAndCopy("Subtitles Error", e.message ?: "")
+            ClipboardLogger.logAndCopy("Subtitles Fatal Error", e.message ?: "")
         }
     }
 }
@@ -185,7 +195,6 @@ class VidrockProvider : MainAPI() {
         val posterUrl = poster(json.optString("poster_path"))
         val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
         
-        // Lưu IMDb ID để dùng cho phần lấy phụ đề
         val imdbId = json.optString("imdb_id")
         if (imdbId.isNotEmpty()) imdbCache[tmdbId] = imdbId
 
@@ -225,15 +234,21 @@ class VidrockProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // WEBVIEW SNIFFER (Xử lý triệt để Popup)
+    // WEBVIEW SNIFFER
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): SniffResult? {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
-                val ctx: Context? = CommonActivity.activity ?: CloudStreamApp.context
-                if (ctx == null) { cont.resume(null); return@post }
+                // ⭐ SỬA LỖI: Loại bỏ CloudStreamApp.context
+                val ctx: Context? = CommonActivity.activity ?: ClipboardLogger.appContext()
+                if (ctx == null) { 
+                    ClipboardLogger.logAndCopy("Sniff Error", "Không có Context")
+                    cont.resume(null)
+                    return@post 
+                }
+                
                 try {
                     val w = 1080; val h = 1920
                     val wv = WebView(ctx)
@@ -252,46 +267,35 @@ class VidrockProvider : MainAPI() {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         mediaPlaybackRequiresUserGesture = false
-                        // ⭐ Cho phép mở popup để mô phỏng đúng hành vi trình duyệt
                         javaScriptCanOpenWindowsAutomatically = true
                         setSupportMultipleWindows(true) 
                         userAgentString = ua
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
 
-                    // Xử lý khi trang web gọi window.open()
                     wv.webChromeClient = object : WebChromeClient() {
                         override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean {
-                            // Tạo một WebView ẩn cho tab quảng cáo mới
                             val popupView = WebView(ctx)
                             popupView.settings.javaScriptEnabled = true
                             popupView.webViewClient = object : WebViewClient() {
                                 override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                                     val u = request?.url?.toString() ?: return null
-                                    // Chặn đứng quảng cáo trong tab mới
                                     if (AD_DOMAINS.any { u.contains(it, ignoreCase = true) }) {
                                         return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream("".toByteArray()))
                                     }
                                     return null
                                 }
                             }
-                            
-                            // Giao WebView giả cho trang web
                             val transport = resultMsg?.obj as? WebView.WebViewTransport
                             transport?.webView = popupView
                             resultMsg?.sendToTarget()
-
-                            // Đợi 12 giây (mô phỏng thời gian load quảng cáo) rồi đóng tab đó lại
-                            // Việc này đánh lừa script rằng quảng cáo đã chạy xong
                             handler.postDelayed({
                                 try { popupView.destroy() } catch (_: Exception) {}
                             }, 12000)
-                            
                             return true
                         }
                     }
 
-                    // Script tự động click và fake popup (phòng trường hợp onCreateWindow không bắt được)
                     val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){},location:{href:''},document:{write:function(){}}}};}catch(e){}"
                     val clickJs = "(function(){function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
                         "fire(document.getElementById('bigPlay'));" +
@@ -304,14 +308,12 @@ class VidrockProvider : MainAPI() {
                         taps++
                         try {
                             wv.evaluateJavascript(fakePopup + clickJs, null)
-                            // Click vật lý vào giữa màn hình
                             val t = SystemClock.uptimeMillis()
                             val d = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, w / 2f, h / 2f, 0)
                             val u = MotionEvent.obtain(t, t + 60, MotionEvent.ACTION_UP, w / 2f, h / 2f, 0)
                             wv.dispatchTouchEvent(d); wv.dispatchTouchEvent(u)
                             d.recycle(); u.recycle()
                         } catch (_: Exception) {}
-                        // Click liên tục trong 3 phút
                         if (taps < 120) handler.postDelayed({ tap() }, 1500) 
                     }
 
@@ -347,7 +349,6 @@ class VidrockProvider : MainAPI() {
                     wv.translationX = -4000f
                     try { CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
 
-                    // Timeout tổng 180s
                     handler.postDelayed({ finish(null) }, 180_000L)
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                 } catch (e: Exception) {
@@ -381,7 +382,6 @@ class VidrockProvider : MainAPI() {
         val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
         try {
-            // 1. Tự động lấy phụ đề từ OpenSubtitles
             val imdbId = imdbCache[tmdbId] ?: try {
                 val tmdbJson = JSONObject(app.get("$TMDB_BASE_URL/$type/$tmdbId?api_key=$TMDB_API_KEY").text)
                 tmdbJson.optString("imdb_id").also { if (it.isNotEmpty()) imdbCache[tmdbId] = it }
@@ -389,7 +389,6 @@ class VidrockProvider : MainAPI() {
             
             ApiServices.fetchSubtitles(imdbId, subtitleCallback)
 
-            // 2. Tiến hành Sniff Video
             ClipboardLogger.logAndCopy("Embed URL", embedUrl)
             val seen = mutableListOf<String>()
             val result = sniffStream(embedUrl, "$BASE_URL/", ua, seen)
@@ -401,23 +400,24 @@ class VidrockProvider : MainAPI() {
                 return false
             }
 
-            // 3. Phát luồng với Headers chuẩn
             val requiredHeaders = mapOf(
                 "User-Agent" to ua,
                 "Referer" to "https://vidrock.to/",
                 "Origin" to "https://vidrock.to"
             )
 
+            // ⭐ SỬA LỖI: Dùng newExtractorLink thay vì constructor
             callback.invoke(
-                ExtractorLink(
+                newExtractorLink(
                     source = this.name, 
                     name = "Vidrock", 
                     url = result.url,
-                    referer = "https://vidrock.to/", 
-                    quality = Qualities.P1080.value,
-                    type = ExtractorLinkType.M3U8,
-                    headers = requiredHeaders
-                )
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = "https://vidrock.to/"
+                    this.quality = Qualities.P1080.value
+                    this.headers = requiredHeaders
+                }
             )
             return true
         } catch (e: Exception) {
