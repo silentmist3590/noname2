@@ -1,14 +1,28 @@
 package com.lagradost
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import android.annotation.SuppressLint
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayInputStream
 import java.net.URLEncoder
 
 // =====================================================================================
@@ -29,7 +43,7 @@ private fun parseRef(s: String): Ref? {
 }
 
 // =====================================================================================
-// 2. API SERVICES (Giữ nguyên phần lấy metadata và phụ đề)
+// 2. API SERVICES (Giữ nguyên)
 // =====================================================================================
 object ApiServices {
     suspend fun getTmdbDetails(type: String, tmdbId: Int): JSONObject? {
@@ -166,7 +180,7 @@ class VidapiProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // LOAD LINKS: Trích xuất Iframe trước, sau đó dùng WebViewResolver
+    // LOAD LINKS: Sử dụng WebView tùy chỉnh với dispatchTouchEvent
     // =====================================================================================
     override suspend fun loadLinks(
         data: String,
@@ -191,7 +205,7 @@ class VidapiProvider : MainAPI() {
             ClipboardLogger.logAndCopy("Step 1", "Đang tải HTML: $embedUrl")
             val embedHtml = app.get(embedUrl, headers = mapOf("User-Agent" to ua, "Referer" to "$BASE_URL/")).text
             
-            // BƯỚC 2: Trích xuất URL của iframe (thường là nextgencloudfabric.com hoặc vaplayer.ru)
+            // BƯỚC 2: Trích xuất URL của iframe
             val iframeUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
                 .find(embedHtml)?.groupValues?.get(1)?.let { 
                     if (it.startsWith("//")) "https:$it" else it 
@@ -204,42 +218,18 @@ class VidapiProvider : MainAPI() {
             
             ClipboardLogger.logAndCopy("Step 2", "Tìm thấy Iframe: $iframeUrl")
 
-            // BƯỚC 3: Dùng WebViewResolver trên chính iframe đó
-            val resolver = WebViewResolver(
-                interceptUrl = Regex("""\.m3u8"""),
-                script = """
-                    (function(){
-                        // Xóa dấu vết WebView (đánh lừa Cloudflare)
-                        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                        Object.defineProperty(navigator, 'languages', {get: () => ['vi-VN', 'vi', 'en']});
-                        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-                        window.chrome = { runtime: {} };
+            // BƯỚC 3: Dùng WebView tùy chỉnh với dispatchTouchEvent để "chạm" thật
+            val sniffedResult = sniffWithCustomWebView(iframeUrl, "$BASE_URL/", ua)
 
-                        // Tự động click Play
-                        function fire(el){if(!el)return;try{el.click();}catch(e){}}
-                        setInterval(function() {
-                            fire(document.getElementById('bigPlay'));
-                            fire(document.querySelector('.jw-icon-display,.jw-bigplay,[aria-label=Play],.vjs-big-play-button'));
-                            var v=document.querySelector('video');
-                            if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}
-                            fire(document.body);
-                        }, 1000);
-                    })();
-                """.trimIndent()
-            )
-
-            ClipboardLogger.logAndCopy("Step 3", "Đang Sniff Iframe bằng Resolver...")
-            val result = resolver.resolveUsingWebView(iframeUrl, referer = "$BASE_URL/")
-            val m3u8Url = result?.first?.url?.toString()
-
-            if (m3u8Url.isNullOrBlank()) {
-                ClipboardLogger.logAndCopy("Error", "Resolver không tìm thấy link m3u8 trong iframe.")
+            if (sniffedResult == null) {
+                ClipboardLogger.logAndCopy("Error", "WebView tùy chỉnh không bắt được link m3u8.")
                 return false
             }
             
-            ClipboardLogger.logAndCopy("Step 4", "Bắt được M3U8: $m3u8Url")
+            ClipboardLogger.logAndCopy("Step 3", "Bắt được M3U8: ${sniffedResult.first}")
 
             // BƯỚC 4: Xử lý đa chất lượng và phát link
+            val m3u8Url = sniffedResult.first
             val reqHeaders = mapOf("User-Agent" to ua, "Referer" to iframeUrl, "Origin" to BASE_URL)
             val m3u8Content = runBlocking { try { app.get(m3u8Url, headers = reqHeaders).text } catch (_: Exception) { "" } }
 
@@ -293,6 +283,138 @@ class VidapiProvider : MainAPI() {
         } catch (e: Exception) {
             ClipboardLogger.logAndCopy("Exception", e.message ?: "")
             return false
+        }
+    }
+
+    // =====================================================================================
+    // HÀM WEBVIEW TÙY CHỈNH: Gửi MotionEvent "chạm" thật để vượt Cloudflare
+    // =====================================================================================
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun sniffWithCustomWebView(pageUrl: String, referer: String, ua: String): Pair<String, List<SubtitleFile>>? {
+        return kotlin.coroutines.suspendCoroutine { cont ->
+            val handler = Handler(Looper.getMainLooper())
+            handler.post {
+                val ctx: Context? = CommonActivity.activity ?: ClipboardLogger.appContext()
+                if (ctx == null) {
+                    ClipboardLogger.logAndCopy("CustomWebView", "Không có Context")
+                    cont.resume(null)
+                    return@post
+                }
+                
+                try {
+                    val w = 1080
+                    val h = 1920
+                    val wv = WebView(ctx)
+                    var finished = false
+                    val collectedSubtitles = mutableListOf<SubtitleFile>()
+
+                    fun finish(res: Pair<String, List<SubtitleFile>>?) {
+                        if (finished) return
+                        finished = true
+                        handler.removeCallbacksAndMessages(null)
+                        try {
+                            wv.stopLoading()
+                            (wv.parent as? ViewGroup)?.removeView(wv)
+                            wv.destroy()
+                        } catch (_: Exception) {}
+                        cont.resume(res)
+                    }
+                    
+                    val streamRegex = Regex("""\.m3u8|\.mpd|master\.txt""", RegexOption.IGNORE_CASE)
+                    val subRegex = Regex("""\.(vtt|srt)""", RegexOption.IGNORE_CASE)
+                    val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
+                    
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        mediaPlaybackRequiresUserGesture = false
+                        javaScriptCanOpenWindowsAutomatically = false
+                        setSupportMultipleWindows(false)
+                        userAgentString = ua
+                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    }
+                    
+                    wv.webChromeClient = object : WebChromeClient() {
+                        override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
+                    }
+                    
+                    // Script chặn popup và click Play
+                    val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};alert=function(){};}catch(e){}"
+                    val clickJs = "(function(){" +
+                        "function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
+                        "fire(document.getElementById('bigPlay'));" +
+                        "fire(document.querySelector('.jw-icon-display,.jw-bigplay,[aria-label=Play],.vjs-big-play-button,.play-btn'));" +
+                        "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}" +
+                        "})();"
+                    
+                    var taps = 0
+                    fun tap() {
+                        if (finished) return
+                        taps++
+                        try {
+                            // 1. Chạy JavaScript để click
+                            wv.evaluateJavascript(fakePopup + clickJs, null)
+                            
+                            // 2. Gửi MotionEvent "chạm" thật vào giữa màn hình
+                            val t = SystemClock.uptimeMillis()
+                            val d = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, w / 2f, h / 2f, 0)
+                            val u = MotionEvent.obtain(t, t + 60, MotionEvent.ACTION_UP, w / 2f, h / 2f, 0)
+                            wv.dispatchTouchEvent(d)
+                            wv.dispatchTouchEvent(u)
+                            d.recycle()
+                            u.recycle()
+                        } catch (_: Exception) {}
+                        // Lặp lại tối đa 60 lần (1.5 phút)
+                        if (taps < 60) handler.postDelayed({ tap() }, 1500)
+                    }
+                    
+                    wv.webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                            val u = request?.url?.toString() ?: return null
+                            
+                            // Chặn quảng cáo
+                            val adDomains = listOf("doubleclick", "googlesyndication", "popads", "onclickads", "adsterra", "propellerads")
+                            if (adDomains.any { u.contains(it, true) }) {
+                                return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream("".toByteArray()))
+                            }
+                            
+                            if (!junkRegex.containsMatchIn(u)) {
+                                // Ghi log các request để debug nếu cần
+                            }
+                            
+                            // Bắt phụ đề
+                            if (subRegex.containsMatchIn(u)) {
+                                collectedSubtitles.add(SubtitleFile(u.substringAfterLast("/").take(20), u))
+                            }
+
+                            // Bắt link m3u8 và trả về kết quả
+                            if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
+                                ClipboardLogger.logAndCopy("CustomWebView HIT", "URL: $u")
+                                handler.post { finish(Pair(u, collectedSubtitles)) }
+                            }
+                            return null
+                        }
+
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            handler.postDelayed({ tap() }, 800)
+                        }
+                    }
+                    
+                    // Gắn WebView vào cửa sổ (ẩn) để nhận được sự kiện chạm
+                    wv.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
+                    wv.layout(0, 0, w, h)
+                    wv.translationX = -4000f
+                    try { CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
+                    
+                    // Timeout tổng 180 giây
+                    handler.postDelayed({ finish(null) }, 180_000L)
+                    wv.loadUrl(pageUrl, mapOf("Referer" to referer))
+                    
+                } catch (e: Exception) {
+                    ClipboardLogger.logAndCopy("CustomWebView Exception", e.stackTraceToString().take(800))
+                    cont.resume(null)
+                }
+            }
         }
     }
 }
