@@ -4,7 +4,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.newExtractorLink // ⭐ Thêm import này
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Handler
@@ -192,24 +192,29 @@ class VidapiProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // WEBVIEW SNIFFER
+    // WEBVIEW SNIFFER (Đã sửa để trả về SniffResult chứa URL và Phụ đề)
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): String? {
+    private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): SniffResult? {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
-                val appCtx: Context? = ClipboardLogger.appContext()
-                val act = CommonActivity.activity
-                val ctx: Context? = act ?: appCtx
-                if (ctx == null) {
+                val ctx: Context? = CommonActivity.activity ?: ClipboardLogger.appContext()
+                if (ctx == null) { 
                     ClipboardLogger.logAndCopy("Sniff", "Không có Context để tạo WebView")
                     cont.resume(null)
-                } else try {
+                    return@post 
+                }
+                
+                try {
                     val w = 1080
                     val h = 1920
                     val wv = WebView(ctx)
                     var finished = false
+                    
+                    // ⭐ Khai báo danh sách phụ đề
+                    val collectedSubtitles = mutableListOf<SubtitleFile>()
+
                     fun finish(res: SniffResult?) {
                         if (finished) return
                         finished = true
@@ -218,12 +223,14 @@ class VidapiProvider : MainAPI() {
                             wv.stopLoading()
                             (wv.parent as? ViewGroup)?.removeView(wv)
                             wv.destroy()
-                        } catch (_: Exception) {
-                        }
+                        } catch (_: Exception) {}
                         cont.resume(res)
                     }
+                    
                     val streamRegex = Regex("""\.m3u8|\.mpd|master\.txt""", RegexOption.IGNORE_CASE)
+                    val subRegex = Regex("""\.(vtt|srt)""", RegexOption.IGNORE_CASE)
                     val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
+                    
                     wv.settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
@@ -233,15 +240,17 @@ class VidapiProvider : MainAPI() {
                         userAgentString = ua
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
-                    // Popup quảng cáo: không mở cửa sổ mới
+                    
                     wv.webChromeClient = object : WebChromeClient() {
                         override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
                     }
+                    
                     val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
                     val clickJs = "(function(){function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
                         "fire(document.getElementById('bigPlay'));" +
                         "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
                         "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();"
+                    
                     var taps = 0
                     fun tap() {
                         if (finished) return
@@ -254,27 +263,39 @@ class VidapiProvider : MainAPI() {
                             wv.dispatchTouchEvent(d)
                             wv.dispatchTouchEvent(u)
                             d.recycle(); u.recycle()
-                        } catch (_: Exception) {
-                        }
+                        } catch (_: Exception) {}
                         if (taps < 25) handler.postDelayed({ tap() }, 1500)
                     }
+                    
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                             val u = request?.url?.toString() ?: return null
-                            if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
+                            
+                            // Chặn quảng cáo
+                            if (AD_DOMAINS.any { u.contains(it, true) }) {
+                                return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream("".toByteArray()))
+                            }
+                            
+                            if (!junkRegex.containsMatchIn(u) && seen.size < 150) seen.add(u.take(220))
+                            
+                            // Bắt phụ đề
+                            if (subRegex.containsMatchIn(u)) {
+                                collectedSubtitles.add(SubtitleFile(u.substringAfterLast("/").take(20), u))
+                            }
+
+                            // Bắt stream và trả về Object SniffResult
                             if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
-                                    val reqHeaders = request?.requestHeaders ?: emptyMap()
-                                    val hit = SniffResult(u, reqHeaders, collectedSubtitles) // <--- Tạo Object
-                                    ClipboardLogger.logAndCopy("Sniff HIT", "URL: $u")
-                                    handler.post { finish(hit) } // <--- Trả về Object
+                                val reqHeaders = request?.requestHeaders ?: emptyMap()
+                                val hit = SniffResult(u, reqHeaders, collectedSubtitles)
+                                ClipboardLogger.logAndCopy("Sniff HIT", "URL: $u")
+                                handler.post { finish(hit) }
                             }
                             return null
                         }
 
-                        // chặn mọi chuyển hướng sang trang quảng cáo
                         override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                             val u = request?.url?.toString() ?: return false
-                            val ok = u.startsWith(pageUrl.substringBefore("?")) || u.contains("stellarconductornexus.com")
+                            val ok = u.startsWith(pageUrl.substringBefore("?"))
                             if (!ok) seen.add("BLOCKED NAV: " + u.take(160))
                             return !ok
                         }
@@ -283,16 +304,15 @@ class VidapiProvider : MainAPI() {
                             handler.postDelayed({ tap() }, 800)
                         }
                     }
-                    // Gắn vào cửa sổ (ngoài màn hình) để WebView nhận chạm và chạy như bình thường
+                    
                     wv.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
                     wv.layout(0, 0, w, h)
                     wv.translationX = -4000f
-                    try {
-                        act?.addContentView(wv, ViewGroup.LayoutParams(w, h))
-                    } catch (_: Exception) {
-                    }
-                    handler.postDelayed({ finish(null) }, 45_000L)
+                    try { CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
+                    
+                    handler.postDelayed({ finish(null) }, 120_000L) // Tăng thời gian chờ lên 2 phút
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
+                    
                 } catch (e: Exception) {
                     ClipboardLogger.logAndCopy("Sniff Exception", e.stackTraceToString().take(800))
                     cont.resume(null)
@@ -302,7 +322,7 @@ class VidapiProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // LOAD LINKS (Đã cập nhật newExtractorLink)
+    // LOAD LINKS
     // =====================================================================================
     override suspend fun loadLinks(
         data: String,
@@ -323,16 +343,21 @@ class VidapiProvider : MainAPI() {
             ApiServices.fetchSubtitles(imdbId, subtitleCallback)
 
             val seen = mutableListOf<String>()
+            
+            // ⭐ result bây giờ là SniffResult?
             val result = sniffStream(embedUrl, "$BASE_URL/", ua, seen)
 
-            if (result == null) {
+            if (result == null || result.url.isBlank()) {
                 ClipboardLogger.logAndCopy("Error", "WebView không bắt được link.")
                 return false
             }
 
+            // ⭐ Phát phụ đề bắt được từ WebView
             result.subtitles.forEach { subtitleCallback.invoke(it) }
 
             val reqHeaders = mapOf("User-Agent" to ua, "Referer" to "$BASE_URL/", "Origin" to BASE_URL)
+            
+            // ⭐ Xử lý đa chất lượng từ URL gốc
             val m3u8Content = runBlocking { try { app.get(result.url, headers = reqHeaders).text } catch (_: Exception) { "" } }
 
             val qualityRegex = Regex("""#EXT-X-STREAM-INF:.*RESOLUTION=(\d+)x(\d+).*\n(.*)""")
@@ -353,7 +378,6 @@ class VidapiProvider : MainAPI() {
                         else -> Qualities.P360.value
                     }
                     
-                    // ⭐ Sử dụng newExtractorLink thay vì constructor ExtractorLink
                     callback.invoke(
                         newExtractorLink(
                             source = this.name,
@@ -368,7 +392,6 @@ class VidapiProvider : MainAPI() {
                     )
                 }
             } else {
-                // ⭐ Sử dụng newExtractorLink cho luồng đơn
                 callback.invoke(
                     newExtractorLink(
                         source = this.name,
