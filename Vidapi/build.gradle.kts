@@ -2,7 +2,7 @@ cloudstream {
     description = "Vidapi.ru - The Movie and TVserie"
     authors = listOf("silentmist3590")
     status = 1
-    version = 7
+    version = 8
     tvTypes = listOf("Movie","TVSeries")
     requiresResources = false
     language = "en"
