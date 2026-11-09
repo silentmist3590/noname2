@@ -7,10 +7,8 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class NontonGoPlugin : Plugin() {
     override fun load(context: Context) {
-        // Lưu Android Context an toàn cho ClipboardLogger
-        NontonGoProvider.appContext = context
-
+        // Khởi tạo Context cho ClipboardLogger và WebView
+        ClipboardLogger.init(context)
         registerMainAPI(NontonGoProvider())
-        registerExtractorAPI(NontonGoExtractor())
     }
 }
