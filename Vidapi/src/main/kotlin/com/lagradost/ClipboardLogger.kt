@@ -12,7 +12,7 @@ object ClipboardLogger {
     private const val MAX_CHARS = 60_000
 
     /** true = luôn copy log vào clipboard; false = chỉ copy khi tiêu đề chứa "Error"/"Exception". */
-    private const val COPY_ALWAYS = false
+    private const val COPY_ALWAYS = true
 
     private val buffer = StringBuilder()
 
