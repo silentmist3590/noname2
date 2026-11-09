@@ -1,7 +1,7 @@
 package com.lagradost
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.WebViewResolver // ⭐ Thêm thư viện vượt Cloudflare
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
@@ -15,7 +15,6 @@ import java.net.URLEncoder
 // 1. CẤU HÌNH
 // =====================================================================================
 private const val BASE_URL = "https://vidapi.ru"
-private const val EMBED_BASE_URL = "https://vidapi.ru" // ⭐ Đổi về domain gốc
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
 private const val IMG_PROXY = "https://wsrv.nl/?url="
@@ -30,7 +29,7 @@ private fun parseRef(s: String): Ref? {
 }
 
 // =====================================================================================
-// 2. API SERVICES
+// 2. API SERVICES (Giữ nguyên phần lấy metadata và phụ đề)
 // =====================================================================================
 object ApiServices {
     suspend fun getTmdbDetails(type: String, tmdbId: Int): JSONObject? {
@@ -167,7 +166,7 @@ class VidapiProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // LOAD LINKS: Sử dụng WebViewResolver để vượt Cloudflare
+    // LOAD LINKS: Trích xuất Iframe trước, sau đó dùng WebViewResolver
     // =====================================================================================
     override suspend fun loadLinks(
         data: String,
@@ -179,8 +178,8 @@ class VidapiProvider : MainAPI() {
         ClipboardLogger.logAndCopy("LoadLinks", "Data: $data")
 
         val ref = parseRef(data) ?: return false
-        val embedUrl = if (ref.type == "movie") "$EMBED_BASE_URL/embed/movie/${ref.id}"
-                       else "$EMBED_BASE_URL/embed/tv/${ref.id}/${ref.season}/${ref.episode}"
+        val embedUrl = if (ref.type == "movie") "$BASE_URL/embed/movie/${ref.id}"
+                       else "$BASE_URL/embed/tv/${ref.id}/${ref.season}/${ref.episode}"
         
         val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
@@ -188,18 +187,35 @@ class VidapiProvider : MainAPI() {
             val imdbId = imdbCache[ref.id] ?: ""
             ApiServices.fetchSubtitles(imdbId, subtitleCallback)
 
-            // ⭐ CẤU HÌNH WEBVIEWRESOLVER (Tự động vượt Cloudflare)
+            // BƯỚC 1: Tải HTML của trang embed để tìm iframe
+            ClipboardLogger.logAndCopy("Step 1", "Đang tải HTML: $embedUrl")
+            val embedHtml = app.get(embedUrl, headers = mapOf("User-Agent" to ua, "Referer" to "$BASE_URL/")).text
+            
+            // BƯỚC 2: Trích xuất URL của iframe (thường là nextgencloudfabric.com hoặc vaplayer.ru)
+            val iframeUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                .find(embedHtml)?.groupValues?.get(1)?.let { 
+                    if (it.startsWith("//")) "https:$it" else it 
+                }
+
+            if (iframeUrl == null) {
+                ClipboardLogger.logAndCopy("Error", "Không tìm thấy iframe trong HTML của trang embed.")
+                return false
+            }
+            
+            ClipboardLogger.logAndCopy("Step 2", "Tìm thấy Iframe: $iframeUrl")
+
+            // BƯỚC 3: Dùng WebViewResolver trên chính iframe đó
             val resolver = WebViewResolver(
                 interceptUrl = Regex("""\.m3u8"""),
                 script = """
                     (function(){
-                        // 1. Xóa dấu vết WebView (đánh lừa Cloudflare)
+                        // Xóa dấu vết WebView (đánh lừa Cloudflare)
                         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                         Object.defineProperty(navigator, 'languages', {get: () => ['vi-VN', 'vi', 'en']});
                         Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
                         window.chrome = { runtime: {} };
 
-                        // 2. Tự động click Play và vượt quảng cáo
+                        // Tự động click Play
                         function fire(el){if(!el)return;try{el.click();}catch(e){}}
                         setInterval(function() {
                             fire(document.getElementById('bigPlay'));
@@ -212,21 +228,19 @@ class VidapiProvider : MainAPI() {
                 """.trimIndent()
             )
 
-            ClipboardLogger.logAndCopy("Resolver Start", "Loading: $embedUrl")
-            
-            // ⭐ resolveUsingWebView trả về Pair (Request?, List<Request>)
-            val result = resolver.resolveUsingWebView(embedUrl, referer = "$BASE_URL/")
-            
-            // Lấy URL m3u8
+            ClipboardLogger.logAndCopy("Step 3", "Đang Sniff Iframe bằng Resolver...")
+            val result = resolver.resolveUsingWebView(iframeUrl, referer = "$BASE_URL/")
             val m3u8Url = result?.first?.url?.toString()
 
             if (m3u8Url.isNullOrBlank()) {
-                ClipboardLogger.logAndCopy("Error", "Không tìm thấy link m3u8 qua Resolver.")
+                ClipboardLogger.logAndCopy("Error", "Resolver không tìm thấy link m3u8 trong iframe.")
                 return false
             }
+            
+            ClipboardLogger.logAndCopy("Step 4", "Bắt được M3U8: $m3u8Url")
 
-            // Lấy headers chuẩn xác
-            val reqHeaders = mapOf("User-Agent" to ua, "Referer" to "$BASE_URL/", "Origin" to BASE_URL)
+            // BƯỚC 4: Xử lý đa chất lượng và phát link
+            val reqHeaders = mapOf("User-Agent" to ua, "Referer" to iframeUrl, "Origin" to BASE_URL)
             val m3u8Content = runBlocking { try { app.get(m3u8Url, headers = reqHeaders).text } catch (_: Exception) { "" } }
 
             val qualityRegex = Regex("""#EXT-X-STREAM-INF:.*RESOLUTION=(\d+)x(\d+).*\n(.*)""")
@@ -254,7 +268,7 @@ class VidapiProvider : MainAPI() {
                             url = fullSubUrl,
                             type = ExtractorLinkType.M3U8
                         ) {
-                            this.referer = "$BASE_URL/"
+                            this.referer = iframeUrl
                             this.quality = q
                             this.headers = reqHeaders
                         }
@@ -268,7 +282,7 @@ class VidapiProvider : MainAPI() {
                         url = m3u8Url,
                         type = ExtractorLinkType.M3U8
                     ) {
-                        this.referer = "$BASE_URL/"
+                        this.referer = iframeUrl
                         this.quality = Qualities.Unknown.value
                         this.headers = reqHeaders
                     }
