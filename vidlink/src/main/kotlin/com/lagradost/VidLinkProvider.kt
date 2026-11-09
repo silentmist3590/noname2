@@ -4,7 +4,6 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.Qualities
 import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Handler
@@ -23,7 +22,6 @@ import android.webkit.WebViewClient
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 import org.json.JSONObject
-import org.json.JSONArray
 import java.net.URI
 import java.net.URLEncoder
 import java.util.Base64
@@ -33,7 +31,6 @@ import java.util.Base64
 // =====================================================================================
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
-private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
 private const val TRAKT_ACCESS_TOKEN = ""
 
@@ -48,21 +45,9 @@ private fun parseRef(s: String): Ref? {
 }
 
 // =====================================================================================
-// 2. DỊCH VỤ HỖ TRỢ (OMDb & Trakt Scrobble)
+// 2. DỊCH VỤ HỖ TRỢ (Trakt Scrobble)
 // =====================================================================================
 object ApiServices {
-    suspend fun getOmdbData(imdbId: String): String? {
-        return try {
-            val res = app.get("https://www.omdbapi.com/?apikey=$OMDB_API_KEY&i=$imdbId").text
-            val json = JSONObject(res)
-            val rating = json.optString("imdbRating")
-            if (rating.isNotEmpty() && rating != "N/A") rating else null
-        } catch (e: Exception) {
-            ClipboardLogger.logAndCopy("OMDb Error", e.message ?: "Unknown")
-            null
-        }
-    }
-
     suspend fun sendTraktScrobble(
         action: String,
         type: String,
@@ -198,12 +183,6 @@ class VidlinkProvider : MainAPI() {
             }
         }
 
-        var ratingStr: String? = null
-        val imdbId = detailJson.optString("imdb_id")
-        if (imdbId.isNotEmpty()) {
-            ratingStr = ApiServices.getOmdbData(imdbId)
-        }
-
         if (isMovie) {
             ApiServices.sendTraktScrobble("start", "movie", ref.id, 0.0f)
             return newMovieLoadResponse(title, url, TvType.Movie, "vidlink:movie:${ref.id}") {
@@ -212,7 +191,7 @@ class VidlinkProvider : MainAPI() {
                 this.plot = plot
                 this.year = year
                 this.tags = genres
-                if (ratingStr != null) this.score = Score.from10(ratingStr.toDoubleOrNull())
+                // ⭐ Đã xóa hoàn toàn phần Score
             }
         } else {
             ApiServices.sendTraktScrobble("start", "show", ref.id, 0.0f, 1, 1)
@@ -246,7 +225,7 @@ class VidlinkProvider : MainAPI() {
                 this.plot = plot
                 this.year = year
                 this.tags = genres
-                if (ratingStr != null) this.score = Score.from10(ratingStr.toDoubleOrNull())
+                // ⭐ Đã xóa hoàn toàn phần Score
             }
         }
     }
@@ -319,9 +298,8 @@ class VidlinkProvider : MainAPI() {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
-                val appCtx: Context? = CloudStreamApp.context
-                val act = CommonActivity.activity
-                val ctx: Context? = act ?: appCtx
+                // ⭐ SỬA LỖI CONTEXT: Chỉ dùng CommonActivity
+                val ctx: Context? = CommonActivity.activity
                 if (ctx == null) {
                     ClipboardLogger.logAndCopy("VidLink", "Không có Context để khởi tạo WebView")
                     cont.resume(null)
@@ -346,7 +324,6 @@ class VidlinkProvider : MainAPI() {
                         cont.resume(res)
                     }
 
-                    // Tự động timeout sau 25 giây nếu không nhận được dữ liệu
                     handler.postDelayed({
                         if (!finished) {
                             ClipboardLogger.logAndCopy("VidLink Timeout", "Seen requests:\n" + seen.takeLast(12).joinToString("\n"))
@@ -368,7 +345,6 @@ class VidlinkProvider : MainAPI() {
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
 
-                    // Hook fetch và bắt log console chứa payload JSON từ API
                     val hookScript = """
                         (function() {
                             if (window.__vhooked) return;
@@ -455,7 +431,6 @@ class VidlinkProvider : MainAPI() {
                                 seen.add(u.take(200))
                             }
 
-                            // Nếu bắt được link .mpd hoặc .m3u8 trực tiếp
                             if (streamRegex.containsMatchIn(u)) {
                                 val isDash = u.contains(".mpd")
                                 handler.post {
@@ -484,7 +459,7 @@ class VidlinkProvider : MainAPI() {
                     wv.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
                     wv.layout(0, 0, w, h)
                     wv.translationX = -4000f
-                    act?.addContentView(wv, ViewGroup.LayoutParams(w, h))
+                    CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h))
 
                     val headers = mapOf(
                         "Referer" to "https://vidlink.pro/",
@@ -521,7 +496,6 @@ class VidlinkProvider : MainAPI() {
         val result = sniffStream(pageUrl, ua, seen)
 
         if (result != null && result.streamUrl.isNotEmpty()) {
-            // Đẩy toàn bộ danh sách phụ đề vào CloudStream
             result.subtitles.forEach { sub ->
                 subtitleCallback.invoke(sub)
             }
