@@ -195,66 +195,53 @@ class VidapiProvider : MainAPI() {
     // WEBVIEW SNIFFER
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): SniffResult? {
+    private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): String? {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
-                val ctx: Context? = CommonActivity.activity ?: CloudStreamApp.context
-                if (ctx == null) { cont.resume(null); return@post }
-                try {
-                    val w = 1080; val h = 1920
+                val appCtx: Context? = ClipboardLogger.appContext()
+                val act = CommonActivity.activity
+                val ctx: Context? = act ?: appCtx
+                if (ctx == null) {
+                    ClipboardLogger.logAndCopy("Sniff", "Không có Context để tạo WebView")
+                    cont.resume(null)
+                } else try {
+                    val w = 1080
+                    val h = 1920
                     val wv = WebView(ctx)
                     var finished = false
-                    val collectedSubtitles = mutableListOf<SubtitleFile>()
-
-                    fun finish(res: SniffResult?) {
+                    fun finish(res: String?) {
                         if (finished) return
                         finished = true
                         handler.removeCallbacksAndMessages(null)
-                        try { wv.stopLoading(); (wv.parent as? ViewGroup)?.removeView(wv); wv.destroy() } catch (_: Exception) {}
+                        try {
+                            wv.stopLoading()
+                            (wv.parent as? ViewGroup)?.removeView(wv)
+                            wv.destroy()
+                        } catch (_: Exception) {
+                        }
                         cont.resume(res)
                     }
-
-                    val streamRegex = Regex("""\.m3u8|\.mpd""", RegexOption.IGNORE_CASE)
-                    val subRegex = Regex("""\.(vtt|srt)""", RegexOption.IGNORE_CASE)
+                    val streamRegex = Regex("""\.m3u8|\.mpd|master\.txt""", RegexOption.IGNORE_CASE)
                     val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
-
                     wv.settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         mediaPlaybackRequiresUserGesture = false
-                        javaScriptCanOpenWindowsAutomatically = true
-                        setSupportMultipleWindows(true)
+                        javaScriptCanOpenWindowsAutomatically = false
+                        setSupportMultipleWindows(false)
                         userAgentString = ua
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
-
+                    // Popup quảng cáo: không mở cửa sổ mới
                     wv.webChromeClient = object : WebChromeClient() {
-                        override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean {
-                            val popupView = WebView(ctx)
-                            popupView.settings.javaScriptEnabled = true
-                            popupView.webViewClient = object : WebViewClient() {
-                                override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
-                                    if (AD_DOMAINS.any { request?.url.toString().contains(it, true) }) {
-                                        return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream("".toByteArray()))
-                                    }
-                                    return null
-                                }
-                            }
-                            val transport = resultMsg?.obj as? WebView.WebViewTransport
-                            transport?.webView = popupView
-                            resultMsg?.sendToTarget()
-                            handler.postDelayed({ try { popupView.destroy() } catch (_: Exception) {} }, 10000)
-                            return true
-                        }
+                        override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
                     }
-
                     val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
                     val clickJs = "(function(){function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
                         "fire(document.getElementById('bigPlay'));" +
-                        "fire(document.querySelector('.jw-icon-display,.jw-bigplay,[aria-label=Play],.vjs-big-play-button,.play-btn'));" +
+                        "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
                         "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();"
-
                     var taps = 0
                     fun tap() {
                         if (finished) return
@@ -264,42 +251,44 @@ class VidapiProvider : MainAPI() {
                             val t = SystemClock.uptimeMillis()
                             val d = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, w / 2f, h / 2f, 0)
                             val u = MotionEvent.obtain(t, t + 60, MotionEvent.ACTION_UP, w / 2f, h / 2f, 0)
-                            wv.dispatchTouchEvent(d); wv.dispatchTouchEvent(u)
+                            wv.dispatchTouchEvent(d)
+                            wv.dispatchTouchEvent(u)
                             d.recycle(); u.recycle()
-                        } catch (_: Exception) {}
-                        if (taps < 100) handler.postDelayed({ tap() }, 1500)
+                        } catch (_: Exception) {
+                        }
+                        if (taps < 25) handler.postDelayed({ tap() }, 1500)
                     }
-
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                             val u = request?.url?.toString() ?: return null
-                            
-                            if (AD_DOMAINS.any { u.contains(it, true) }) {
-                                return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream("".toByteArray()))
-                            }
-                            if (!junkRegex.containsMatchIn(u) && seen.size < 150) seen.add(u.take(220))
-
-                            if (subRegex.containsMatchIn(u)) {
-                                collectedSubtitles.add(SubtitleFile(u.substringAfterLast("/").take(20), u))
-                            }
-
+                            if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
                             if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
-                                val reqHeaders = request?.requestHeaders ?: emptyMap()
-                                val hit = SniffResult(u, reqHeaders, collectedSubtitles)
-                                ClipboardLogger.logAndCopy("Sniff HIT", "URL: $u")
-                                handler.post { finish(hit) }
+                                handler.post { finish(u) }
                             }
                             return null
                         }
-                        override fun onPageFinished(view: WebView?, url: String?) { handler.postDelayed({ tap() }, 800) }
-                    }
 
+                        // chặn mọi chuyển hướng sang trang quảng cáo
+                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                            val u = request?.url?.toString() ?: return false
+                            val ok = u.startsWith(pageUrl.substringBefore("?")) || u.contains("stellarconductornexus.com")
+                            if (!ok) seen.add("BLOCKED NAV: " + u.take(160))
+                            return !ok
+                        }
+
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            handler.postDelayed({ tap() }, 800)
+                        }
+                    }
+                    // Gắn vào cửa sổ (ngoài màn hình) để WebView nhận chạm và chạy như bình thường
                     wv.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
                     wv.layout(0, 0, w, h)
                     wv.translationX = -4000f
-                    try { CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
-
-                    handler.postDelayed({ finish(null) }, 300_000L)
+                    try {
+                        act?.addContentView(wv, ViewGroup.LayoutParams(w, h))
+                    } catch (_: Exception) {
+                    }
+                    handler.postDelayed({ finish(null) }, 45_000L)
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                 } catch (e: Exception) {
                     ClipboardLogger.logAndCopy("Sniff Exception", e.stackTraceToString().take(800))
