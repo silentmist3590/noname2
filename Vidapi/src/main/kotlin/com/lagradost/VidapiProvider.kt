@@ -20,11 +20,12 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import kotlinx.coroutines.runBlocking
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.net.URLEncoder
-import kotlin.coroutines.resume
 
 // =====================================================================================
 // 1. CẤU HÌNH
@@ -181,7 +182,7 @@ class VidapiProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // LOAD LINKS: Sử dụng WebView tùy chỉnh với dispatchTouchEvent
+    // LOAD LINKS: Nạp trực tiếp trang embed, dùng WebView tùy chỉnh để vượt Cloudflare
     // =====================================================================================
     override suspend fun loadLinks(
         data: String,
@@ -202,36 +203,23 @@ class VidapiProvider : MainAPI() {
             val imdbId = imdbCache[ref.id] ?: ""
             ApiServices.fetchSubtitles(imdbId, subtitleCallback)
 
-            // BƯỚC 1: Tải HTML của trang embed để tìm iframe
-            ClipboardLogger.logAndCopy("Step 1", "Đang tải HTML: $embedUrl")
-            val embedHtml = app.get(embedUrl, headers = mapOf("User-Agent" to ua, "Referer" to "$BASE_URL/")).text
-            
-            // BƯỚC 2: Trích xuất URL của iframe
-            val iframeUrl = Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-                .find(embedHtml)?.groupValues?.get(1)?.let { 
-                    if (it.startsWith("//")) "https:$it" else it 
-                }
-
-            if (iframeUrl == null) {
-                ClipboardLogger.logAndCopy("Error", "Không tìm thấy iframe trong HTML của trang embed.")
-                return false
-            }
-            
-            ClipboardLogger.logAndCopy("Step 2", "Tìm thấy Iframe: $iframeUrl")
-
-            // BƯỚC 3: Dùng WebView tùy chỉnh với dispatchTouchEvent để "chạm" thật
-            val sniffedResult = sniffWithCustomWebView(iframeUrl, "$BASE_URL/", ua)
+            // BƯỚC 1: Gọi WebView tùy chỉnh trên toàn bộ trang embed
+            ClipboardLogger.logAndCopy("Step 1", "Mở WebView tùy chỉnh trên: $embedUrl")
+            val sniffedResult = sniffWithCustomWebView(embedUrl, "$BASE_URL/", ua)
 
             if (sniffedResult == null) {
                 ClipboardLogger.logAndCopy("Error", "WebView tùy chỉnh không bắt được link m3u8.")
                 return false
             }
             
-            ClipboardLogger.logAndCopy("Step 3", "Bắt được M3U8: ${sniffedResult.first}")
+            ClipboardLogger.logAndCopy("Step 2", "Bắt được M3U8: ${sniffedResult.first}")
 
-            // BƯỚC 4: Xử lý đa chất lượng và phát link
+            // BƯỚC 2: Xử lý đa chất lượng và phát link
             val m3u8Url = sniffedResult.first
-            val reqHeaders = mapOf("User-Agent" to ua, "Referer" to iframeUrl, "Origin" to BASE_URL)
+            // Referer cho CDN phải là domain của player (nextgencloudfabric.com), 
+            // nhưng vì chúng ta không trích xuất được nó một cách chắc chắn, 
+            // hãy thử dùng BASE_URL trước, nếu lỗi có thể thử domain khác.
+            val reqHeaders = mapOf("User-Agent" to ua, "Referer" to "$BASE_URL/", "Origin" to BASE_URL)
             val m3u8Content = runBlocking { try { app.get(m3u8Url, headers = reqHeaders).text } catch (_: Exception) { "" } }
 
             val qualityRegex = Regex("""#EXT-X-STREAM-INF:.*RESOLUTION=(\d+)x(\d+).*\n(.*)""")
@@ -259,7 +247,7 @@ class VidapiProvider : MainAPI() {
                             url = fullSubUrl,
                             type = ExtractorLinkType.M3U8
                         ) {
-                            this.referer = iframeUrl
+                            this.referer = "$BASE_URL/"
                             this.quality = q
                             this.headers = reqHeaders
                         }
@@ -273,7 +261,7 @@ class VidapiProvider : MainAPI() {
                         url = m3u8Url,
                         type = ExtractorLinkType.M3U8
                     ) {
-                        this.referer = iframeUrl
+                        this.referer = "$BASE_URL/"
                         this.quality = Qualities.Unknown.value
                         this.headers = reqHeaders
                     }
@@ -288,11 +276,11 @@ class VidapiProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // HÀM WEBVIEW TÙY CHỈNH: Gửi MotionEvent "chạm" thật để vượt Cloudflare
+    // HÀM WEBVIEW TÙY CHỈNH: Vượt Cloudflare và tương tác với iframe
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun sniffWithCustomWebView(pageUrl: String, referer: String, ua: String): Pair<String, List<SubtitleFile>>? {
-        return kotlin.coroutines.suspendCoroutine { cont ->
+        return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
                 val ctx: Context? = CommonActivity.activity ?: ClipboardLogger.appContext()
@@ -339,9 +327,13 @@ class VidapiProvider : MainAPI() {
                         override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
                     }
                     
-                    // Script chặn popup và click Play
+                    // Script mạnh mẽ: xóa dấu vết webdriver, chặn popup, tự động click
                     val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};alert=function(){};}catch(e){}"
                     val clickJs = "(function(){" +
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});" +
+                        "Object.defineProperty(navigator, 'languages', {get: () => ['vi-VN', 'vi', 'en']});" +
+                        "Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});" +
+                        "window.chrome = { runtime: {} };" +
                         "function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
                         "fire(document.getElementById('bigPlay'));" +
                         "fire(document.querySelector('.jw-icon-display,.jw-bigplay,[aria-label=Play],.vjs-big-play-button,.play-btn'));" +
@@ -353,10 +345,9 @@ class VidapiProvider : MainAPI() {
                         if (finished) return
                         taps++
                         try {
-                            // 1. Chạy JavaScript để click
                             wv.evaluateJavascript(fakePopup + clickJs, null)
                             
-                            // 2. Gửi MotionEvent "chạm" thật vào giữa màn hình
+                            // Gửi MotionEvent "chạm" thật
                             val t = SystemClock.uptimeMillis()
                             val d = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, w / 2f, h / 2f, 0)
                             val u = MotionEvent.obtain(t, t + 60, MotionEvent.ACTION_UP, w / 2f, h / 2f, 0)
@@ -365,7 +356,6 @@ class VidapiProvider : MainAPI() {
                             d.recycle()
                             u.recycle()
                         } catch (_: Exception) {}
-                        // Lặp lại tối đa 60 lần (1.5 phút)
                         if (taps < 60) handler.postDelayed({ tap() }, 1500)
                     }
                     
@@ -373,22 +363,15 @@ class VidapiProvider : MainAPI() {
                         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                             val u = request?.url?.toString() ?: return null
                             
-                            // Chặn quảng cáo
                             val adDomains = listOf("doubleclick", "googlesyndication", "popads", "onclickads", "adsterra", "propellerads")
                             if (adDomains.any { u.contains(it, true) }) {
                                 return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream("".toByteArray()))
                             }
                             
-                            if (!junkRegex.containsMatchIn(u)) {
-                                // Ghi log các request để debug nếu cần
-                            }
-                            
-                            // Bắt phụ đề
                             if (subRegex.containsMatchIn(u)) {
                                 collectedSubtitles.add(SubtitleFile(u.substringAfterLast("/").take(20), u))
                             }
 
-                            // Bắt link m3u8 và trả về kết quả
                             if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
                                 ClipboardLogger.logAndCopy("CustomWebView HIT", "URL: $u")
                                 handler.post { finish(Pair(u, collectedSubtitles)) }
@@ -401,13 +384,11 @@ class VidapiProvider : MainAPI() {
                         }
                     }
                     
-                    // Gắn WebView vào cửa sổ (ẩn) để nhận được sự kiện chạm
                     wv.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
                     wv.layout(0, 0, w, h)
                     wv.translationX = -4000f
                     try { CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
                     
-                    // Timeout tổng 180 giây
                     handler.postDelayed({ finish(null) }, 180_000L)
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                     
