@@ -1,368 +1,442 @@
 package com.lagradost
 
-import android.content.ClipData
-import android.content.ClipboardManager
+import android.annotation.SuppressLint
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.module.kotlin.readValue
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
-import com.lagradost.cloudstream3.utils.AppUtils.toJson
+import com.lagradost.cloudstream3.CommonActivity
+import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.INFER_TYPE
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.jsoup.Jsoup
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
-// ==========================================
-// 1. CLIPBOARD LOGGER (Ghi log copy bộ nhớ tạm)
-// ==========================================
-object ClipboardLogger {
-    private val logBuffer = StringBuilder()
-
-    fun log(tag: String, message: String) {
-        val entry = "[NontonGo - $tag] $message\n"
-        logBuffer.append(entry)
-        val fullLog = logBuffer.toString()
-
-        // Ghi ra Android Logcat
-        android.util.Log.d("NontonGoLog", entry)
-
-        // Sao chép tự động vào Clipboard của hệ điều hành
-        val ctx = NontonGoProvider.appContext ?: try {
-            AcraApplication.context
-        } catch (_: Exception) { null }
-
-        if (ctx != null) {
-            try {
-                Handler(Looper.getMainLooper()).post {
-                    try {
-                        val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                        val clip = ClipData.newPlainText("NontonGo_Logs", fullLog)
-                        clipboard?.setPrimaryClip(clip)
-                    } catch (_: Exception) {}
-                }
-            } catch (_: Exception) {}
-        }
-    }
-
-    fun clear() {
-        logBuffer.setLength(0)
-    }
-}
-
-// ==========================================
-// 2. MAIN PROVIDER (NontonGo)
-// ==========================================
-open class NontonGoProvider : MainAPI() {
+class NontonGoProvider : MainAPI() {
     override var mainUrl = "https://www.nontongo.win"
     override var name = "NontonGo"
     override val hasMainPage = true
+    override var lang = "en"
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
-    companion object {
-        var appContext: Context? = null
-        private const val CINEMETA_URL = "https://v3-cinemeta.strem.io"
-    }
+    private val userAgent =
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
 
-    override val mainPage = mainPageOf(
-        "$CINEMETA_URL/catalog/movie/top.json" to "Popular Movies",
-        "$CINEMETA_URL/catalog/series/top.json" to "Popular TV Shows",
+    private val mapper = jacksonObjectMapper()
+
+    // TMDB Hosts chống DNS ::1
+    private val tmdbBase = "https://api.tmdb.org/3"
+    private val tmdbApiKey = "8476a7ab80ad76f0936744df0430e67c"
+
+    data class EpisodeData(
+        @JsonProperty("imdbId") val imdbId: String,
+        @JsonProperty("type") val type: String, // "movie" hoặc "tv"
+        @JsonProperty("season") val season: Int? = null,
+        @JsonProperty("episode") val episode: Int? = null,
+        @JsonProperty("title") val title: String? = null
     )
 
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        ClipboardLogger.log("MainPage", "Loading: ${request.name} (page $page)")
-        val url = if (page <= 1) request.data else {
-            val skip = (page - 1) * 20
-            request.data.replace(".json", "/skip=$skip.json")
-        }
-
-        val json = app.get(url).text
-        val metas = parseJson<CinemetaCatalog>(json).metas ?: emptyList()
-
-        val list = metas.map { meta ->
-            val isMovie = meta.type == "movie"
-            newMovieSearchResponse(meta.name ?: "Unknown", meta.id, if (isMovie) TvType.Movie else TvType.TvSeries) {
-                this.posterUrl = meta.poster
-                this.year = meta.year?.toIntOrNull()
-            }
-        }
-
-        return newHomePageResponse(
-            list = HomePageList(
-                name = request.name,
-                list = list,
-                isHorizontalImages = false
-            ),
-            hasNext = metas.isNotEmpty()
-        )
-    }
-
-    override suspend fun search(query: String): List<SearchResponse> {
-        ClipboardLogger.log("Search", "Query: $query")
-        val cleanQuery = query.trim().replace(" ", "%20")
-        val movieSearch = "$CINEMETA_URL/catalog/movie/top/search=$cleanQuery.json"
-        val seriesSearch = "$CINEMETA_URL/catalog/series/top/search=$cleanQuery.json"
-
-        val results = mutableListOf<SearchResponse>()
-        listOf(movieSearch, seriesSearch).amap { url ->
-            try {
-                val json = app.get(url).text
-                val metas = parseJson<CinemetaCatalog>(json).metas ?: emptyList()
-                metas.forEach { meta ->
-                    val isMovie = meta.type == "movie"
-                    results.add(
-                        newMovieSearchResponse(meta.name ?: "Unknown", meta.id, if (isMovie) TvType.Movie else TvType.TvSeries) {
-                            this.posterUrl = meta.poster
-                            this.year = meta.year?.toIntOrNull()
+    // ==========================================
+    // KHỐI CODE BẮT LINK VÀ GIẢ LẬP TOUCH BẠN YÊU CẦU
+    // ==========================================
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): String? {
+        return suspendCoroutine { cont ->
+            val handler = Handler(Looper.getMainLooper())
+            handler.post {
+                val appCtx: Context? = ClipboardLogger.appContext()
+                val act = CommonActivity.activity
+                val ctx: Context? = act ?: appCtx
+                if (ctx == null) {
+                    ClipboardLogger.logAndCopy("Sniff", "Không có Context để tạo WebView")
+                    cont.resume(null)
+                } else try {
+                    val w = 1080
+                    val h = 1920
+                    val wv = WebView(ctx)
+                    var finished = false
+                    fun finish(res: String?) {
+                        if (finished) return
+                        finished = true
+                        handler.removeCallbacksAndMessages(null)
+                        try {
+                            wv.stopLoading()
+                            (wv.parent as? ViewGroup)?.removeView(wv)
+                            wv.destroy()
+                        } catch (_: Exception) {
                         }
-                    )
+                        cont.resume(res)
+                    }
+                    val streamRegex = Regex("""\.m3u8|\.mpd|master\.txt""", RegexOption.IGNORE_CASE)
+                    val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
+                    wv.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        mediaPlaybackRequiresUserGesture = false
+                        javaScriptCanOpenWindowsAutomatically = false
+                        setSupportMultipleWindows(false)
+                        userAgentString = ua
+                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    }
+                    // Popup quảng cáo: không mở cửa sổ mới
+                    wv.webChromeClient = object : WebChromeClient() {
+                        override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
+                    }
+                    val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
+                    val clickJs = "(function(){function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
+                        "fire(document.getElementById('bigPlay'));" +
+                        "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
+                        "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();"
+                    var taps = 0
+                    fun tap() {
+                        if (finished) return
+                        taps++
+                        try {
+                            wv.evaluateJavascript(fakePopup + clickJs, null)
+                            val t = SystemClock.uptimeMillis()
+                            val d = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, w / 2f, h / 2f, 0)
+                            val u = MotionEvent.obtain(t, t + 60, MotionEvent.ACTION_UP, w / 2f, h / 2f, 0)
+                            wv.dispatchTouchEvent(d)
+                            wv.dispatchTouchEvent(u)
+                            d.recycle(); u.recycle()
+                        } catch (_: Exception) {
+                        }
+                        if (taps < 25) handler.postDelayed({ tap() }, 1500)
+                    }
+                    wv.webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                            val u = request?.url?.toString() ?: return null
+                            if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
+                            if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
+                                handler.post { finish(u) }
+                            }
+                            return null
+                        }
+
+                        // chặn mọi chuyển hướng sang trang quảng cáo
+                        override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                            val u = request?.url?.toString() ?: return false
+                            val ok = u.startsWith(pageUrl.substringBefore("?")) || u.contains("stellarconductornexus.com")
+                            if (!ok) seen.add("BLOCKED NAV: " + u.take(160))
+                            return !ok
+                        }
+
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            handler.postDelayed({ tap() }, 800)
+                        }
+                    }
+                    // Gắn vào cửa sổ (ngoài màn hình) để WebView nhận chạm và chạy như bình thường
+                    wv.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
+                    wv.layout(0, 0, w, h)
+                    wv.translationX = -4000f
+                    try {
+                        act?.addContentView(wv, ViewGroup.LayoutParams(w, h))
+                    } catch (_: Exception) {
+                    }
+                    handler.postDelayed({ finish(null) }, 45_000L)
+                    wv.loadUrl(pageUrl, mapOf("Referer" to referer))
+                } catch (e: Exception) {
+                    ClipboardLogger.logAndCopy("Sniff Exception", e.stackTraceToString().take(800))
+                    cont.resume(null)
                 }
-            } catch (e: Exception) {
-                ClipboardLogger.log("SearchError", "${e.message}")
             }
         }
-        return results.distinctBy { it.url }
     }
 
-    override suspend fun load(url: String): LoadResponse {
-        val imdbId = url.substringAfterLast("/").substringBefore("?")
-        ClipboardLogger.log("Load", "Loading IMDb ID: $imdbId")
-
-        // Kiểm tra xem là phim lẻ hay phim bộ thông qua Cinemeta
-        val metaSeriesUrl = "$CINEMETA_URL/meta/series/$imdbId.json"
-        val seriesRes = try {
-            app.get(metaSeriesUrl).text
-        } catch (_: Exception) { null }
-
-        val seriesMeta = seriesRes?.let {
-            try { parseJson<CinemetaDetailResponse>(it).meta } catch (_: Exception) { null }
-        }
-
-        if (seriesMeta != null && !seriesMeta.videos.isNullOrEmpty()) {
-            val episodes = seriesMeta.videos.map { vid ->
-                val epData = EpisodeData(
-                    imdbId = imdbId,
-                    season = vid.season,
-                    episode = vid.number
-                )
-                newEpisode(epData.toJson()) {
-                    this.name = vid.title ?: "Episode ${vid.number}"
-                    this.season = vid.season
-                    this.episode = vid.number
-                }
-            }
-
-            return newTvSeriesLoadResponse(seriesMeta.name ?: "Unknown", url, TvType.TvSeries, episodes) {
-                this.posterUrl = seriesMeta.poster
-                this.plot = seriesMeta.description
-                this.year = seriesMeta.year?.toIntOrNull()
-            }
-        } else {
-            // Phim lẻ
-            val metaMovieUrl = "$CINEMETA_URL/meta/movie/$imdbId.json"
-            val movieJson = app.get(metaMovieUrl).text
-            val meta = parseJson<CinemetaDetailResponse>(movieJson).meta
-            val title = meta?.name ?: "Unknown"
-
-            val movieData = EpisodeData(imdbId = imdbId, season = null, episode = null)
-            return newMovieLoadResponse(title, url, TvType.Movie, movieData.toJson()) {
-                this.posterUrl = meta?.poster
-                this.plot = meta?.description
-                this.year = meta?.year?.toIntOrNull()
-            }
-        }
-    }
-
+    // ==========================================
+    // TRÍCH XUẤT STREAM & PHỤ ĐỀ (loadLinks)
+    // ==========================================
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        ClipboardLogger.log("LoadLinks", "Start loadLinks with payload: $data")
-        val epData = try {
-            parseJson<EpisodeData>(data)
-        } catch (_: Exception) {
-            // Hỗ trợ trường hợp data là link embed trực tiếp
-            val isTv = data.contains("/tv/")
-            val imdb = if (data.contains("tt")) Regex("""(tt\d+)""").find(data)?.groupValues?.get(1) ?: data else data
-            val season = if (isTv) Regex("""/tv/[^/]+/(\d+)""").find(data)?.groupValues?.get(1)?.toIntOrNull() ?: 1 else null
-            val episode = if (isTv) Regex("""/tv/[^/]+/\d+/(\d+)""").find(data)?.groupValues?.get(1)?.toIntOrNull() ?: 1 else null
-            EpisodeData(imdb, season, episode)
-        }
+        val seen = mutableListOf<String>()
 
-        val embedUrl = if (epData.season != null && epData.episode != null) {
-            "https://www.nontongo.win/embed/tv/${epData.imdbId}/${epData.season}/${epData.episode}"
+        // 1. Phân tích endpoint từ data
+        val targetUrls = mutableListOf<String>()
+        val referer = "https://www.nontongo.win/"
+
+        if (data.startsWith("http://") || data.startsWith("https://")) {
+            targetUrls.add(data)
         } else {
-            "https://www.nontongo.win/embed/movie/${epData.imdbId}"
+            try {
+                val ep = mapper.readValue<EpisodeData>(data)
+                if (ep.type == "movie") {
+                    targetUrls.add("https://www.nontongo.win/embed/movie/${ep.imdbId}")
+                } else {
+                    targetUrls.add("https://www.nontongo.win/embed/tv/${ep.imdbId}/${ep.season ?: 1}/${ep.episode ?: 1}")
+                    targetUrls.add("https://www.nontongo.win/embed/tv/?id=${ep.imdbId}&s=${ep.season ?: 1}&e=${ep.episode ?: 1}")
+                }
+            } catch (_: Exception) {
+                // Fallback nếu data là imdbId thuần
+                targetUrls.add("https://www.nontongo.win/embed/movie/$data")
+            }
         }
 
-        ClipboardLogger.log("LoadLinks", "Embed URL target: $embedUrl")
-        var hasLinks = false
+        var foundStream = false
 
-        try {
-            val embedHtml = app.get(
-                embedUrl,
-                headers = mapOf(
-                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                    "Referer" to "https://www.nontongo.win/"
+        for (pageUrl in targetUrls) {
+            ClipboardLogger.logAndCopy("NontonGo Sniff Start", "Đang phân tích link: $pageUrl")
+
+            // Trích xuất phụ đề tĩnh từ HTML trước nếu có
+            try {
+                val html = app.get(pageUrl, referer = referer, headers = mapOf("User-Agent" to userAgent)).text
+                extractSubtitlesFromHtml(html, subtitleCallback)
+            } catch (e: Exception) {
+                ClipboardLogger.log("NontonGo Sub Parse", "Lỗi tải HTML tĩnh: ${e.message}")
+            }
+
+            // Gọi phương thức sniffStream với WebView ẩn và chạm tự động
+            val streamUrl = sniffStream(pageUrl, referer, userAgent, seen)
+
+            if (!streamUrl.isNullOrEmpty()) {
+                foundStream = true
+                ClipboardLogger.logAndCopy(
+                    "NontonGo Stream Found",
+                    "Thành công bắt được stream:\n$streamUrl\n\nCác link chặn/ghi nhận (${seen.size}):\n" + seen.takeLast(10).joinToString("\n")
                 )
-            ).text
 
-            // Trích xuất cấu hình servers từ script của NontonGo
-            val serversJson = Regex("""\"servers\":\s*(\[.*?\])\s*,\s*\"""", RegexOption.DOT_MATCHES_ALL)
-                .find(embedHtml)?.groupValues?.get(1)
-
-            if (!serversJson.isNullOrEmpty()) {
-                val servers = parseJson<List<NontonGoServerItem>>(serversJson)
-                ClipboardLogger.log("Servers", "Found ${servers.size} servers: ${servers.map { it.name }}")
-
-                servers.amap { srv ->
-                    val watchUrl = if (epData.season != null && !srv.tvUrl.isNullOrEmpty()) srv.tvUrl else srv.movieUrl
-                    if (!watchUrl.isNullOrEmpty()) {
-                        val ok = extractFromWatchUrl(srv.name ?: "NontonGo", watchUrl, embedUrl, subtitleCallback, callback)
-                        if (ok) hasLinks = true
+                if (streamUrl.contains(".m3u8", ignoreCase = true) || streamUrl.contains("master.txt", ignoreCase = true)) {
+                    // Trích xuất toàn bộ các độ phân giải từ master m3u8
+                    val links = try {
+                        M3u8Helper.generateM3u8(
+                            source = name,
+                            streamUrl = streamUrl,
+                            referer = pageUrl,
+                            headers = mapOf(
+                                "Referer" to pageUrl,
+                                "User-Agent" to userAgent,
+                                "Origin" to "https://www.nontongo.win"
+                            )
+                        )
+                    } catch (e: Exception) {
+                        ClipboardLogger.log("M3U8 Generator", "Lỗi phân tích đa độ phân giải: ${e.message}")
+                        emptyList()
                     }
-                }
-            } else {
-                ClipboardLogger.log("Warning", "Could not find servers config in embed page")
-            }
-        } catch (e: Exception) {
-            ClipboardLogger.log("Error", "Embed error: ${e.message}")
-        }
 
-        return hasLinks
-    }
-
-    private suspend fun extractFromWatchUrl(
-        serverName: String,
-        watchUrl: String,
-        referer: String,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        try {
-            ClipboardLogger.log("Extract", "Fetching watchUrl: $watchUrl")
-            val watchHtml = app.get(watchUrl, referer = referer).text
-
-            // Tìm các iframe (như load.php hoặc player.php)
-            val iframes = Regex("""<iframe[^>]*src=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
-                .findAll(watchHtml).map { it.groupValues[1] }.toList()
-
-            for (iframe in iframes) {
-                if (iframe.contains("load.php") || iframe.contains("player.php")) {
-                    val playerUrl = if (iframe.contains("load.php")) {
-                        iframe.replace("load.php", "player.php") + "&autoplay=true"
-                    } else iframe
-
-                    ClipboardLogger.log("Extract", "Target Player URL: $playerUrl")
-                    val playerHtml = app.get(playerUrl, referer = watchUrl).text
-
-                    // 1. TRÍCH XUẤT TOÀN BỘ PHỤ ĐỀ (Subtitles)
-                    val tracks = Regex("""<track\s+kind=["']captions["']\s+data-src=["']([^"']+)["']\s+label=["']([^"']+)["']""")
-                        .findAll(playerHtml)
-                    var subCount = 0
-                    tracks.forEach { tr ->
-                        val subUrl = tr.groupValues[1]
-                        val subLabel = tr.groupValues[2]
-                        subtitleCallback.invoke(SubtitleFile(subLabel, subUrl))
-                        subCount++
-                    }
-                    ClipboardLogger.log("Subtitles", "Extracted $subCount subtitle tracks")
-
-                    // 2. TRÍCH XUẤT CÁC LUỒNG VIDEO & NHIỀU CHẤT LƯỢNG (Multi-Quality HLS)
-                    val buttonMatches = Regex("""<button[^>]*data-url=["']([^"']+)["'][^>]*>(.*?)</button>""", RegexOption.DOT_MATCHES_ALL)
-                        .findAll(playerHtml)
-
-                    var linkFound = false
-                    for (bm in buttonMatches) {
-                        var streamUrl = bm.groupValues[1].trim()
-                        val btnLabel = Jsoup.parse(bm.groupValues[2]).text().trim()
-
-                        if (streamUrl.contains("#file.m3u8")) {
-                            streamUrl = streamUrl.substringBefore("#file.m3u8")
-                        }
-
-                        if (streamUrl.startsWith("http")) {
-                            ClipboardLogger.log("StreamFound", "[$btnLabel] -> $streamUrl")
-                            linkFound = true
-
-                            // Sử dụng M3u8Helper để tự động quét toàn bộ chất lượng (1080p, 720p, 480p)
-                            val m3u8Links = try {
-                                M3u8Helper.generateM3u8(
-                                    source = "$serverName ($btnLabel)",
-                                    streamUrl = streamUrl,
-                                    referer = "https://nontongo.win/",
-                                    headers = mapOf("Referer" to "https://nontongo.win/", "Origin" to "https://nontongo.win/")
-                                )
-                            } catch (_: Exception) { emptyList() }
-
-                            if (m3u8Links.isNotEmpty()) {
-                                ClipboardLogger.log("M3U8", "Generated ${m3u8Links.size} qualities for $btnLabel")
-                                m3u8Links.forEach(callback)
-                            } else {
-                                callback.invoke(
-                                    newExtractorLink(
-                                        source = "$serverName ($btnLabel)",
-                                        name = "$serverName ($btnLabel) HLS",
-                                        url = streamUrl,
-                                        type = INFER_TYPE
-                                    ) {
-                                        this.referer = "https://nontongo.win/"
-                                        this.quality = Qualities.P1080.value
-                                    }
-                                )
+                    if (links.isNotEmpty()) {
+                        ClipboardLogger.logAndCopy("NontonGo Qualities", "Đã tìm thấy ${links.size} chất lượng phát (1080p, 720p, 480p...)")
+                        links.forEach(callback)
+                    } else {
+                        // Fallback luồng đơn nếu danh sách trả về rỗng
+                        callback.invoke(
+                            newExtractorLink(
+                                source = name,
+                                name = "$name Auto HLS",
+                                url = streamUrl,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = pageUrl
+                                this.headers = mapOf("Referer" to pageUrl, "User-Agent" to userAgent)
+                                this.quality = Qualities.P1080.value
                             }
-                        }
+                        )
                     }
-                    if (linkFound) return true
+                } else if (streamUrl.contains(".mpd", ignoreCase = true)) {
+                    callback.invoke(
+                        newExtractorLink(
+                            source = name,
+                            name = "$name DASH Stream",
+                            url = streamUrl,
+                            type = ExtractorLinkType.DASH
+                        ) {
+                            this.referer = pageUrl
+                            this.headers = mapOf("Referer" to pageUrl, "User-Agent" to userAgent)
+                            this.quality = Qualities.P1080.value
+                        }
+                    )
+                } else {
+                    callback.invoke(
+                        newExtractorLink(
+                            source = name,
+                            name = "$name Direct MP4",
+                            url = streamUrl,
+                            type = ExtractorLinkType.VIDEO
+                        ) {
+                            this.referer = pageUrl
+                            this.headers = mapOf("Referer" to pageUrl, "User-Agent" to userAgent)
+                            this.quality = Qualities.P1080.value
+                        }
+                    )
                 }
+                break // Đã bắt được stream thành công, kết thúc vòng lặp
             }
-        } catch (e: Exception) {
-            ClipboardLogger.log("ExtractError", "Error: ${e.message}")
         }
-        return false
+
+        if (!foundStream) {
+            ClipboardLogger.logAndCopy(
+                "NontonGo Sniff Failed",
+                "Không bắt được stream sau khi thử hết endpoint.\nSeen URLs (${seen.size}):\n" + seen.takeLast(15).joinToString("\n")
+            )
+        }
+
+        return foundStream
     }
 
-    // Model dữ liệu nội bộ
-    data class EpisodeData(
-        @JsonProperty("imdbId") val imdbId: String,
-        @JsonProperty("season") val season: Int? = null,
-        @JsonProperty("episode") val episode: Int? = null,
-    )
+    private fun extractSubtitlesFromHtml(html: String, subtitleCallback: (SubtitleFile) -> Unit) {
+        val subRegex = Regex("""\{[^{}]*?"file"\s*:\s*"([^"]+\.(?:vtt|srt)[^"]*)"[^{}]*?"label"\s*:\s*"([^"]+)"[^{}]*?\}""", RegexOption.IGNORE_CASE)
+        val trackRegex = Regex("""<track[^>]+src=["']([^"']+\.(?:vtt|srt)[^"']*)["'][^>]+label=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
 
-    data class NontonGoServerItem(
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("movie_url") val movieUrl: String? = null,
-        @JsonProperty("tv_url") val tvUrl: String? = null,
-    )
+        val found = mutableSetOf<String>()
 
-    data class CinemetaCatalog(
-        @JsonProperty("metas") val metas: List<CinemetaMeta>? = null
-    )
+        subRegex.findAll(html).forEach { match ->
+            val url = match.groupValues[1]
+            val label = match.groupValues[2]
+            if (found.add(url)) {
+                subtitleCallback.invoke(SubtitleFile(lang = label, url = url))
+                ClipboardLogger.log("NontonGo Sub", "$label -> $url")
+            }
+        }
 
-    data class CinemetaDetailResponse(
-        @JsonProperty("meta") val meta: CinemetaMeta? = null
-    )
+        trackRegex.findAll(html).forEach { match ->
+            val url = match.groupValues[1]
+            val label = match.groupValues[2]
+            if (found.add(url)) {
+                subtitleCallback.invoke(SubtitleFile(lang = label, url = url))
+                ClipboardLogger.log("NontonGo Sub Track", "$label -> $url")
+            }
+        }
+    }
 
-    data class CinemetaMeta(
-        @JsonProperty("id") val id: String,
-        @JsonProperty("type") val type: String? = null,
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("poster") val poster: String? = null,
-        @JsonProperty("description") val description: String? = null,
-        @JsonProperty("year") val year: String? = null,
-        @JsonProperty("videos") val videos: List<CinemetaVideo>? = null
-    )
+    // ==========================================
+    // TÌM KIẾM VÀ TRANG CHỦ TMDB -> NontonGo
+    // ==========================================
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val url = "$tmdbBase/trending/all/day?api_key=$tmdbApiKey&page=$page"
+        val response = app.get(url).text
+        val results = mapper.readTree(response).get("results")
 
-    data class CinemetaVideo(
-        @JsonProperty("id") val id: String,
-        @JsonProperty("title") val title: String? = null,
-        @JsonProperty("season") val season: Int,
-        @JsonProperty("number") val number: Int
-    )
+        val list = mutableListOf<SearchResponse>()
+        results?.forEach { item ->
+            val mediaType = item.get("media_type")?.asText() ?: "movie"
+            val title = item.get("title")?.asText() ?: item.get("name")?.asText() ?: return@forEach
+            val id = item.get("id")?.asInt() ?: return@forEach
+            val poster = item.get("poster_path")?.asText()?.let { "https://image.tmdb.org/t/p/w500$it" }
+
+            if (mediaType == "tv") {
+                list.add(newTvSeriesSearchResponse(title, "$tmdbBase/tv/$id?api_key=$tmdbApiKey", TvType.TvSeries) {
+                    this.posterUrl = poster
+                })
+            } else {
+                list.add(newMovieSearchResponse(title, "$tmdbBase/movie/$id?api_key=$tmdbApiKey", TvType.Movie) {
+                    this.posterUrl = poster
+                })
+            }
+        }
+
+        return newHomePageResponse(
+            list = HomePageList(name = "NontonGo Trending", list = list),
+            hasNext = list.isNotEmpty()
+        )
+    }
+
+    override suspend fun search(query: String): List<SearchResponse> {
+        if (query.startsWith("tt")) {
+            // Cho phép tìm kiếm trực tiếp bằng mã IMDB ID (ví dụ: tt1375666)
+            return listOf(
+                newMovieSearchResponse("IMDb $query", "https://www.nontongo.win/embed/movie/$query", TvType.Movie)
+            )
+        }
+
+        val url = "$tmdbBase/search/multi?api_key=$tmdbApiKey&query=$query"
+        val response = app.get(url).text
+        val results = mapper.readTree(response).get("results")
+        val list = mutableListOf<SearchResponse>()
+
+        results?.forEach { item ->
+            val mediaType = item.get("media_type")?.asText() ?: return@forEach
+            val title = item.get("title")?.asText() ?: item.get("name")?.asText() ?: return@forEach
+            val id = item.get("id")?.asInt() ?: return@forEach
+            val poster = item.get("poster_path")?.asText()?.let { "https://image.tmdb.org/t/p/w500$it" }
+
+            if (mediaType == "tv") {
+                list.add(newTvSeriesSearchResponse(title, "$tmdbBase/tv/$id?api_key=$tmdbApiKey", TvType.TvSeries) {
+                    this.posterUrl = poster
+                })
+            } else if (mediaType == "movie") {
+                list.add(newMovieSearchResponse(title, "$tmdbBase/movie/$id?api_key=$tmdbApiKey", TvType.Movie) {
+                    this.posterUrl = poster
+                })
+            }
+        }
+        return list
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        // Nếu người dùng nhập trực tiếp URL nontongo.win
+        if (url.contains("nontongo.win/embed/movie/")) {
+            val imdbId = url.substringAfter("nontongo.win/embed/movie/").substringBefore("?").trim('/')
+            return newMovieLoadResponse(imdbId, url, TvType.Movie, url)
+        }
+
+        val isTv = url.contains("/tv/")
+        val json = app.get(url).text
+        val tree = mapper.readTree(json)
+        val tmdbId = tree.get("id")?.asInt() ?: 0
+        val title = tree.get("title")?.asText() ?: tree.get("name")?.asText() ?: "Unknown"
+        val poster = tree.get("poster_path")?.asText()?.let { "https://image.tmdb.org/t/p/w500$it" }
+        val plot = tree.get("overview")?.asText()
+
+        // Lấy IMDB ID thông qua external_ids
+        val extUrl = "$tmdbBase/${if (isTv) "tv" else "movie"}/$tmdbId/external_ids?api_key=$tmdbApiKey"
+        val extJson = app.get(extUrl).text
+        val imdbId = mapper.readTree(extJson).get("imdb_id")?.asText() ?: "tt$tmdbId"
+
+        if (isTv) {
+            val seasonsCount = tree.get("number_of_seasons")?.asInt() ?: 1
+            val episodes = mutableListOf<Episode>()
+
+            for (s in 1..seasonsCount) {
+                val sUrl = "$tmdbBase/tv/$tmdbId/season/$s?api_key=$tmdbApiKey"
+                try {
+                    val sJson = app.get(sUrl).text
+                    val epList = mapper.readTree(sJson).get("episodes")
+                    epList?.forEach { epNode ->
+                        val epNum = epNode.get("episode_number")?.asInt() ?: 1
+                        val epName = epNode.get("name")?.asText() ?: "Tập $epNum"
+                        val dataObj = EpisodeData(imdbId = imdbId, type = "tv", season = s, episode = epNum, title = epName)
+                        episodes.add(
+                            Episode(
+                                data = mapper.writeValueAsString(dataObj),
+                                name = epName,
+                                season = s,
+                                episode = epNum
+                            )
+                        )
+                    }
+                } catch (_: Exception) {
+                }
+            }
+
+            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
+                this.posterUrl = poster
+                this.plot = plot
+            }
+        } else {
+            val dataObj = EpisodeData(imdbId = imdbId, type = "movie")
+            return newMovieLoadResponse(title, url, TvType.Movie, mapper.writeValueAsString(dataObj)) {
+                this.posterUrl = poster
+                this.plot = plot
+            }
+        }
+    }
 }
