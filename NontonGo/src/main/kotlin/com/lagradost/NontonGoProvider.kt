@@ -415,12 +415,11 @@ class NontonGoProvider : MainAPI() {
                         val epName = epNode.get("name")?.asText() ?: "Tập $epNum"
                         val dataObj = EpisodeData(imdbId = imdbId, type = "tv", season = s, episode = epNum, title = epName)
                         episodes.add(
-                            Episode(
-                                data = mapper.writeValueAsString(dataObj),
-                                name = epName,
-                                season = s,
-                                episode = epNum
-                            )
+                            newEpisode(mapper.writeValueAsString(dataObj)) {
+                                this.name = epName
+                                this.season = s
+                                this.episode = epNum
+                            }
                         )
                     }
                 } catch (_: Exception) {
