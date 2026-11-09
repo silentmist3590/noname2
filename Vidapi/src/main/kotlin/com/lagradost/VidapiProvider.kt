@@ -193,22 +193,28 @@ class VidapiProvider : MainAPI() {
         ClipboardLogger.logAndCopy("Master", "$label $m3u8Url\nvariants=${matches.size}")
         if (matches.isNotEmpty()) {
             matches.forEach { match ->
-                val height = match.groupValues[2].toIntOrNull() ?: 0
+                val w = match.groupValues[1].toIntOrNull() ?: 0
+                val hRaw = match.groupValues[2].toIntOrNull() ?: 0
                 val subUrl = match.groupValues[3].trim()
-                val full = if (subUrl.startsWith("http")) subUrl else m3u8Url.substringBeforeLast("/") + "/" + subUrl
-                val q = when {
-                    height >= 1080 -> Qualities.P1080.value
-                    height >= 720 -> Qualities.P720.value
-                    height >= 480 -> Qualities.P480.value
-                    else -> Qualities.P360.value
+                // URI trong master thường là đường dẫn tuyệt đối từ gốc ("/8Ybx.../index.m3u8") -> phải resolve đúng cách
+                val full = try { java.net.URI(m3u8Url).resolve(subUrl).toString() } catch (_: Throwable) {
+                    if (subUrl.startsWith("http")) subUrl else m3u8Url.substringBeforeLast("/") + "/" + subUrl
+                }
+                // Phim có viền đen nên chiều cao thật thấp hơn chuẩn (1920x800 = "1080p"): phân loại theo chiều rộng
+                val (q, tag) = when {
+                    w >= 1900 -> Qualities.P1080.value to 1080
+                    w >= 1260 -> Qualities.P720.value to 720
+                    w >= 840 -> Qualities.P480.value to 480
+                    else -> Qualities.P360.value to 360
                 }
                 callback.invoke(
-                    newExtractorLink(this.name, "${this.name} $label ${height}p", full, ExtractorLinkType.M3U8) {
+                    newExtractorLink(this.name, "${this.name} $label ${tag}p", full, ExtractorLinkType.M3U8) {
                         this.referer = "$playerOrigin/"
                         this.quality = q
                         this.headers = reqHeaders
                     }
                 )
+                ClipboardLogger.logAndCopy("Variant", "$label ${w}x$hRaw -> ${tag}p\n$full")
             }
         } else {
             callback.invoke(
