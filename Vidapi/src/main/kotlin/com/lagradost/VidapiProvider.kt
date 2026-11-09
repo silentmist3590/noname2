@@ -51,12 +51,13 @@ private data class SniffResult(
     val subtitles: List<SubtitleFile> = emptyList()
 )
 
-// Chặn quảng cáo
+// Danh sách domain quảng cáo cần chặn
 private val AD_DOMAINS = listOf(
     "rapidadexchange.com", "youradexchange.com", "adexchangerapid.com",
     "popads.net", "onclickads.net", "propellerads.com", "popcash.net",
     "adsterra.com", "adcash.com", "doubleclick.net", "googlesyndication",
-    "googleadservices", "googletagmanager", "googletagservices"
+    "googleadservices", "googletagmanager", "googletagservices",
+    "rtmark.net", "clickadu.com", "juicyads.com"
 )
 
 // =====================================================================================
@@ -74,25 +75,33 @@ object ApiServices {
         if (imdbId.isEmpty()) return
         try {
             val cleanId = imdbId.removePrefix("tt").trimStart('0').ifEmpty { imdbId }
-            val url = "https://rest.opensubtitles.org/search/imdbid-$cleanId/sublanguageid-eng,vie"
             val headers = mapOf("User-Agent" to "trailers.to-UA", "X-User-Agent" to "trailers.to-UA")
-            val res = app.get(url, headers = headers).text
             
-            // ⭐ Sửa lỗi: Kiểm tra xem dữ liệu trả về có phải là mảng JSON không
-            if (!res.trim().startsWith("[")) {
-                ClipboardLogger.logAndCopy("Sub Error", "OpenSubtitles trả về dữ liệu lỗi: ${res.take(50)}")
-                return
-            }
+            // ⭐ Gọi riêng từng ngôn ngữ để tránh lỗi API OpenSubtitles
+            val languages = listOf("vie", "eng") 
+            
+            for (lang in languages) {
+                try {
+                    val url = "https://rest.opensubtitles.org/search/imdbid-$cleanId/sublanguageid-$lang"
+                    val res = app.get(url, headers = headers).text
+                    
+                    if (!res.trim().startsWith("[")) continue
 
-            val arr = JSONArray(res)
-            for (i in 0 until minOf(arr.length(), 10)) {
-                val item = arr.getJSONObject(i)
-                val subUrl = item.optString("SubDownloadLink")
-                val lang = item.optString("SubLanguageID", "eng")
-                if (subUrl.isNotEmpty()) callback.invoke(SubtitleFile(lang, subUrl))
+                    val arr = JSONArray(res)
+                    for (i in 0 until minOf(arr.length(), 5)) {
+                        val item = arr.getJSONObject(i)
+                        val subUrl = item.optString("SubDownloadLink")
+                        val subLang = item.optString("SubLanguageID", lang)
+                        if (subUrl.isNotEmpty()) {
+                            callback.invoke(SubtitleFile(subLang, subUrl))
+                        }
+                    }
+                } catch (e: Exception) {
+                    ClipboardLogger.logAndCopy("Sub Error ($lang)", e.message ?: "")
+                }
             }
         } catch (e: Exception) {
-            ClipboardLogger.logAndCopy("Sub Error", e.message ?: "")
+            ClipboardLogger.logAndCopy("Sub Fatal Error", e.message ?: "")
         }
     }
 }
@@ -199,7 +208,7 @@ class VidapiProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // WEBVIEW SNIFFER (Đã sửa lỗi chặn nhầm Navigation)
+    // WEBVIEW SNIFFER (Tự động click, chặn quảng cáo & trả về Object)
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): SniffResult? {
@@ -250,11 +259,15 @@ class VidapiProvider : MainAPI() {
                         override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
                     }
                     
-                    val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
-                    val clickJs = "(function(){function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
+                    // Script phá popup, chặn alert và tự động click Play
+                    val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};alert=function(){};}catch(e){}"
+                    val clickJs = "(function(){" +
+                        "function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
                         "fire(document.getElementById('bigPlay'));" +
-                        "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
-                        "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();"
+                        "fire(document.querySelector('.jw-icon-display,.jw-bigplay,[aria-label=Play],.play-btn,.vjs-big-play-button'));" +
+                        "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}" +
+                        "fire(document.body);" +
+                        "})();"
                     
                     var taps = 0
                     fun tap() {
@@ -269,7 +282,7 @@ class VidapiProvider : MainAPI() {
                             wv.dispatchTouchEvent(u)
                             d.recycle(); u.recycle()
                         } catch (_: Exception) {}
-                        if (taps < 40) handler.postDelayed({ tap() }, 1500)
+                        if (taps < 60) handler.postDelayed({ tap() }, 1500)
                     }
                     
                     wv.webViewClient = object : WebViewClient() {
@@ -295,15 +308,10 @@ class VidapiProvider : MainAPI() {
                             return null
                         }
 
-                        // ⭐ SỬA LỖI: Chỉ chặn quảng cáo, cho phép mọi chuyển hướng player tự do
+                        // Chỉ chặn quảng cáo, cho phép player tự do chuyển hướng
                         override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                             val u = request?.url?.toString() ?: return false
-                            val isAd = AD_DOMAINS.any { u.contains(it, true) }
-                            if (isAd) {
-                                seen.add("BLOCKED AD NAV: " + u.take(160))
-                                return true
-                            }
-                            return false // Cho phép chuyển hướng
+                            return AD_DOMAINS.any { u.contains(it, true) }
                         }
 
                         override fun onPageFinished(view: WebView?, url: String?) {
@@ -316,7 +324,7 @@ class VidapiProvider : MainAPI() {
                     wv.translationX = -4000f
                     try { CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
                     
-                    handler.postDelayed({ finish(null) }, 120_000L) 
+                    handler.postDelayed({ finish(null) }, 180_000L) 
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                     
                 } catch (e: Exception) {
@@ -328,7 +336,7 @@ class VidapiProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // LOAD LINKS
+    // LOAD LINKS (Xử lý lấy link & Phụ đề)
     // =====================================================================================
     override suspend fun loadLinks(
         data: String,
@@ -349,16 +357,18 @@ class VidapiProvider : MainAPI() {
             ApiServices.fetchSubtitles(imdbId, subtitleCallback)
 
             val seen = mutableListOf<String>()
-            val result = sniffStream(embedUrl, "$BASE_URL/", ua, seen)
+            
+            // ⭐ Referer là vaplayer.ru để không bị Cloudflare chặn
+            val result = sniffStream(embedUrl, "$EMBED_BASE_URL/", ua, seen)
 
             if (result == null || result.url.isBlank()) {
-                ClipboardLogger.logAndCopy("Error", "WebView không bắt được link.")
+                ClipboardLogger.logAndCopy("Error", "WebView không bắt được link.\nRequests Seen (${seen.size}):\n" + seen.takeLast(15).joinToString("\n"))
                 return false
             }
 
             result.subtitles.forEach { subtitleCallback.invoke(it) }
 
-            val reqHeaders = mapOf("User-Agent" to ua, "Referer" to "$BASE_URL/", "Origin" to BASE_URL)
+            val reqHeaders = mapOf("User-Agent" to ua, "Referer" to "$EMBED_BASE_URL/", "Origin" to EMBED_BASE_URL)
             val m3u8Content = runBlocking { try { app.get(result.url, headers = reqHeaders).text } catch (_: Exception) { "" } }
 
             val qualityRegex = Regex("""#EXT-X-STREAM-INF:.*RESOLUTION=(\d+)x(\d+).*\n(.*)""")
@@ -386,7 +396,7 @@ class VidapiProvider : MainAPI() {
                             url = fullSubUrl,
                             type = ExtractorLinkType.M3U8
                         ) {
-                            this.referer = "$BASE_URL/"
+                            this.referer = "$EMBED_BASE_URL/"
                             this.quality = q
                             this.headers = reqHeaders
                         }
@@ -400,7 +410,7 @@ class VidapiProvider : MainAPI() {
                         url = result.url,
                         type = ExtractorLinkType.M3U8
                     ) {
-                        this.referer = "$BASE_URL/"
+                        this.referer = "$EMBED_BASE_URL/"
                         this.quality = Qualities.Unknown.value
                         this.headers = reqHeaders
                     }
