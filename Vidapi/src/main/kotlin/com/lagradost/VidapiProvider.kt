@@ -77,6 +77,13 @@ object ApiServices {
             val url = "https://rest.opensubtitles.org/search/imdbid-$cleanId/sublanguageid-eng,vie"
             val headers = mapOf("User-Agent" to "trailers.to-UA", "X-User-Agent" to "trailers.to-UA")
             val res = app.get(url, headers = headers).text
+            
+            // ⭐ Sửa lỗi: Kiểm tra xem dữ liệu trả về có phải là mảng JSON không
+            if (!res.trim().startsWith("[")) {
+                ClipboardLogger.logAndCopy("Sub Error", "OpenSubtitles trả về dữ liệu lỗi: ${res.take(50)}")
+                return
+            }
+
             val arr = JSONArray(res)
             for (i in 0 until minOf(arr.length(), 10)) {
                 val item = arr.getJSONObject(i)
@@ -192,7 +199,7 @@ class VidapiProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // WEBVIEW SNIFFER (Đã sửa để trả về SniffResult chứa URL và Phụ đề)
+    // WEBVIEW SNIFFER (Đã sửa lỗi chặn nhầm Navigation)
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
     private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>): SniffResult? {
@@ -211,8 +218,6 @@ class VidapiProvider : MainAPI() {
                     val h = 1920
                     val wv = WebView(ctx)
                     var finished = false
-                    
-                    // ⭐ Khai báo danh sách phụ đề
                     val collectedSubtitles = mutableListOf<SubtitleFile>()
 
                     fun finish(res: SniffResult?) {
@@ -264,26 +269,23 @@ class VidapiProvider : MainAPI() {
                             wv.dispatchTouchEvent(u)
                             d.recycle(); u.recycle()
                         } catch (_: Exception) {}
-                        if (taps < 25) handler.postDelayed({ tap() }, 1500)
+                        if (taps < 40) handler.postDelayed({ tap() }, 1500)
                     }
                     
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                             val u = request?.url?.toString() ?: return null
                             
-                            // Chặn quảng cáo
                             if (AD_DOMAINS.any { u.contains(it, true) }) {
                                 return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream("".toByteArray()))
                             }
                             
                             if (!junkRegex.containsMatchIn(u) && seen.size < 150) seen.add(u.take(220))
                             
-                            // Bắt phụ đề
                             if (subRegex.containsMatchIn(u)) {
                                 collectedSubtitles.add(SubtitleFile(u.substringAfterLast("/").take(20), u))
                             }
 
-                            // Bắt stream và trả về Object SniffResult
                             if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
                                 val reqHeaders = request?.requestHeaders ?: emptyMap()
                                 val hit = SniffResult(u, reqHeaders, collectedSubtitles)
@@ -293,11 +295,15 @@ class VidapiProvider : MainAPI() {
                             return null
                         }
 
+                        // ⭐ SỬA LỖI: Chỉ chặn quảng cáo, cho phép mọi chuyển hướng player tự do
                         override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                             val u = request?.url?.toString() ?: return false
-                            val ok = u.startsWith(pageUrl.substringBefore("?"))
-                            if (!ok) seen.add("BLOCKED NAV: " + u.take(160))
-                            return !ok
+                            val isAd = AD_DOMAINS.any { u.contains(it, true) }
+                            if (isAd) {
+                                seen.add("BLOCKED AD NAV: " + u.take(160))
+                                return true
+                            }
+                            return false // Cho phép chuyển hướng
                         }
 
                         override fun onPageFinished(view: WebView?, url: String?) {
@@ -310,7 +316,7 @@ class VidapiProvider : MainAPI() {
                     wv.translationX = -4000f
                     try { CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
                     
-                    handler.postDelayed({ finish(null) }, 120_000L) // Tăng thời gian chờ lên 2 phút
+                    handler.postDelayed({ finish(null) }, 120_000L) 
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                     
                 } catch (e: Exception) {
@@ -343,8 +349,6 @@ class VidapiProvider : MainAPI() {
             ApiServices.fetchSubtitles(imdbId, subtitleCallback)
 
             val seen = mutableListOf<String>()
-            
-            // ⭐ result bây giờ là SniffResult?
             val result = sniffStream(embedUrl, "$BASE_URL/", ua, seen)
 
             if (result == null || result.url.isBlank()) {
@@ -352,12 +356,9 @@ class VidapiProvider : MainAPI() {
                 return false
             }
 
-            // ⭐ Phát phụ đề bắt được từ WebView
             result.subtitles.forEach { subtitleCallback.invoke(it) }
 
             val reqHeaders = mapOf("User-Agent" to ua, "Referer" to "$BASE_URL/", "Origin" to BASE_URL)
-            
-            // ⭐ Xử lý đa chất lượng từ URL gốc
             val m3u8Content = runBlocking { try { app.get(result.url, headers = reqHeaders).text } catch (_: Exception) { "" } }
 
             val qualityRegex = Regex("""#EXT-X-STREAM-INF:.*RESOLUTION=(\d+)x(\d+).*\n(.*)""")
