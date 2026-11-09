@@ -33,10 +33,8 @@ private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
 private const val TRAKT_ACCESS_TOKEN = ""
 
-// Proxy hình ảnh để vượt chặn DNS tại VN
 private const val IMG_PROXY = "https://wsrv.nl/?url="
 
-// Định danh nội bộ: "vidsrcme:movie:<id>" / "vidsrcme:tv:<id>" / "vidsrcme:tv:<id>:<s>:<e>".
 private val ID_REGEX = Regex("""(movie|tv):(\d+)(?::(\d+):(\d+))?""")
 
 private class Ref(val type: String, val id: Int, val season: Int?, val episode: Int?)
@@ -229,13 +227,15 @@ class VidsrcmeProvider : MainAPI() {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
-                val appCtx: Context? = CloudStreamApp.context
-                val act = CommonActivity.activity
-                val ctx: Context? = act ?: appCtx
+                // ⭐ SỬA LỖI CONTEXT: Chỉ dùng CommonActivity, bỏ CloudStreamApp
+                val ctx: Context? = CommonActivity.activity
                 if (ctx == null) {
                     ClipboardLogger.logAndCopy("Sniff", "Không có Context để tạo WebView")
                     cont.resume(null)
-                } else try {
+                    return@post
+                }
+                
+                try {
                     val w = 1080
                     val h = 1920
                     val wv = WebView(ctx)
@@ -308,7 +308,7 @@ class VidsrcmeProvider : MainAPI() {
                     wv.layout(0, 0, w, h)
                     wv.translationX = -4000f
                     try {
-                        act?.addContentView(wv, ViewGroup.LayoutParams(w, h))
+                        CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h))
                     } catch (_: Exception) {}
                     handler.postDelayed({ finish(null) }, 45_000L)
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
@@ -333,6 +333,7 @@ class VidsrcmeProvider : MainAPI() {
     }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        ClipboardLogger.reset() // ⭐ Thêm reset để xoá log cũ
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         val ref = parseRef(data)
         if (ref == null) {
@@ -362,8 +363,6 @@ class VidsrcmeProvider : MainAPI() {
             val shEmbed = if (type == "movie") "https://vidsrc.sh/embed/movie/$tmdbId/" else "https://vidsrc.sh/embed/tv/$tmdbId/$season/$episode/"
             ClipboardLogger.logAndCopy("Step1", "Embed vidsrc.sh: $shEmbed")
 
-            // vidsrc.me có thể sử dụng API tương tự vidsrc.sh hoặc có endpoint riêng.
-            // Thử nghiệm với vs_src.php của vidsrc.sh (thường dùng chung backend).
             val srcApi = if (type == "movie") "https://vidsrc.sh/vs_src.php?type=movie&id=$tmdbId"
             else "https://vidsrc.sh/vs_src.php?type=tv&id=$tmdbId&season=$season&episode=$episode"
             val r2 = app.get(srcApi, headers = mapOf("User-Agent" to ua, "Accept" to "application/json", "Referer" to shEmbed, "Origin" to "https://vidsrc.sh"))
