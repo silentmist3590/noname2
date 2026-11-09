@@ -229,13 +229,15 @@ class VidsrcsuProvider : MainAPI() {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
-                val appCtx: Context? = CloudStreamApp.context
-                val act = CommonActivity.activity
-                val ctx: Context? = act ?: appCtx
+                // ⭐ SỬA LỖI CONTEXT: Chỉ dùng CommonActivity, bỏ CloudStreamApp
+                val ctx: Context? = CommonActivity.activity
                 if (ctx == null) {
                     ClipboardLogger.logAndCopy("Sniff", "Không có Context để tạo WebView")
                     cont.resume(null)
-                } else try {
+                    return@post
+                }
+                
+                try {
                     val w = 1080
                     val h = 1920
                     val wv = WebView(ctx)
@@ -308,7 +310,7 @@ class VidsrcsuProvider : MainAPI() {
                     wv.layout(0, 0, w, h)
                     wv.translationX = -4000f
                     try {
-                        act?.addContentView(wv, ViewGroup.LayoutParams(w, h))
+                        CommonActivity.activity?.addContentView(wv, ViewGroup.LayoutParams(w, h))
                     } catch (_: Exception) {}
                     handler.postDelayed({ finish(null) }, 45_000L)
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
