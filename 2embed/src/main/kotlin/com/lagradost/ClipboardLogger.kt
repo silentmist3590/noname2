@@ -6,26 +6,72 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import com.lagradost.cloudstream3.CloudStreamApp
+import android.widget.Toast
+import com.lagradost.cloudstream3.CommonActivity
+import com.lagradost.cloudstream3.AcraApplication
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 object ClipboardLogger {
     private const val TAG = "PluginLogger"
+    private var appContextRef: Context? = null
+    private val logs = StringBuilder()
+    private val dateFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.getDefault())
 
-    fun logAndCopy(title: String, message: String) {
-        val logMessage = "=== [$title] ===\n$message\n==================="
-        Log.d(TAG, logMessage)
+    fun init(context: Context) {
+        appContextRef = context.applicationContext ?: context
+    }
 
+    private fun getContext(): Context? {
+        return appContextRef 
+            ?: CommonActivity.activity?.applicationContext 
+            ?: CommonActivity.activity 
+            ?: try { AcraApplication.context } catch (_: Throwable) { null }
+    }
+
+    fun log(tag: String, message: String) {
+        val time = dateFormat.format(Date())
+        val line = "[$time][$tag] $message"
+        Log.d(TAG, line)
+        synchronized(logs) {
+            logs.append(line).append("\n")
+        }
+    }
+
+    fun logAndCopy(tag: String, message: String) {
+        log(tag, message)
+        copyToClipboard(tag, "=== [2embed Report: $tag] ===\n$message\n\n--- Toàn Bộ Lịch Sử Chi Tiết ---\n${getAllLogs()}")
+    }
+
+    fun copyToClipboard(label: String, text: String) {
+        val ctx = getContext() ?: return
         try {
-            // Sử dụng CloudStreamApp.context thay vì APIHolder.context
-            val context = CloudStreamApp.context ?: return
-            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-
             Handler(Looper.getMainLooper()).post {
-                val clip = ClipData.newPlainText("Plugin Log", logMessage)
-                clipboard.setPrimaryClip(clip)
+                try {
+                    val clipboard = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    if (clipboard != null) {
+                        val clip = ClipData.newPlainText(label, text)
+                        clipboard.setPrimaryClip(clip)
+                        Toast.makeText(ctx, "📋 [2embed] Đã copy nhật ký vào Clipboard!", Toast.LENGTH_SHORT).show()
+                    }
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Lỗi ClipboardManager: ${e.message}")
+                }
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to copy to clipboard", e)
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun getAllLogs(): String {
+        synchronized(logs) {
+            return logs.toString().takeLast(4000)
+        }
+    }
+
+    fun clear() {
+        synchronized(logs) {
+            logs.setLength(0)
         }
     }
 }
