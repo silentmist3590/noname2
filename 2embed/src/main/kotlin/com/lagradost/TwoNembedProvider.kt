@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
 import java.net.URLEncoder
 import kotlin.io.encoding.Base64
@@ -220,84 +221,6 @@ class TwoNembedProvider : MainAPI() {
         }
     }
 
-    /**
-     * Khởi tạo ExtractorLink an toàn chống lỗi NoSuchMethodError / No direct method <init>
-     */
-    private fun buildExtractorLink(
-        source: String,
-        name: String,
-        url: String,
-        referer: String,
-        quality: Int = Qualities.P1080.value,
-        headers: Map<String, String> = emptyMap()
-    ): ExtractorLink {
-        return try {
-            newExtractorLink(
-                source = source,
-                name = name,
-                url = url,
-                type = ExtractorLinkType.M3U8
-            ) {
-                this.referer = referer
-                this.quality = quality
-                this.headers = headers
-            }
-        } catch (_: Throwable) {
-            tryInstantiateExtractorLink(source, name, url, referer, quality, headers)
-        }
-    }
-
-    private fun tryInstantiateExtractorLink(
-        source: String,
-        name: String,
-        url: String,
-        referer: String,
-        quality: Int,
-        headers: Map<String, String>
-    ): ExtractorLink {
-        val clazz = ExtractorLink::class.java
-        for (ctor in clazz.constructors) {
-            val pTypes = ctor.parameterTypes
-            val args = arrayOfNulls<Any>(pTypes.size)
-            var strIdx = 0
-            for (i in pTypes.indices) {
-                val pt = pTypes[i]
-                when {
-                    pt == String::class.java -> {
-                        args[i] = when (strIdx) {
-                            0 -> source
-                            1 -> name
-                            2 -> url
-                            3 -> referer
-                            else -> null
-                        }
-                        strIdx++
-                    }
-                    pt == Int::class.javaPrimitiveType || pt == java.lang.Integer::class.java -> {
-                        args[i] = quality
-                    }
-                    Map::class.java.isAssignableFrom(pt) -> {
-                        args[i] = headers
-                    }
-                    pt == ExtractorLinkType::class.java -> {
-                        args[i] = ExtractorLinkType.M3U8
-                    }
-                    pt == Boolean::class.javaPrimitiveType || pt == java.lang.Boolean::class.java -> {
-                        args[i] = true
-                    }
-                    List::class.java.isAssignableFrom(pt) -> {
-                        args[i] = emptyList<Any>()
-                    }
-                    else -> args[i] = null
-                }
-            }
-            try {
-                return ctor.newInstance(*args) as ExtractorLink
-            } catch (_: Throwable) {}
-        }
-        throw IllegalStateException("Không thể khởi tạo ExtractorLink trên thiết bị")
-    }
-
     // =====================================================================================
     // 4. LOAD LINKS: BẮT LINK VÀ GẮN BROWSER HEADERS CHỐNG LỖI 2004/2001
     // =====================================================================================
@@ -446,15 +369,18 @@ class TwoNembedProvider : MainAPI() {
 
                         ClipboardLogger.log("8. Thành công", "$sName -> $streamUrl")
 
-                        val link = buildExtractorLink(
-                            source = this.name,
-                            name = "2embed - $sName",
-                            url = streamUrl,
-                            referer = "$pDomain/",
-                            quality = Qualities.P1080.value,
-                            headers = streamHeaders
+                        callback.invoke(
+                            newExtractorLink(
+                                source = this.name,
+                                name = "2embed - $sName",
+                                url = streamUrl,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = "$pDomain/"
+                                this.quality = Qualities.P1080.value
+                                this.headers = streamHeaders
+                            }
                         )
-                        callback.invoke(link)
                         linkCount++
                     } catch (t: Throwable) {
                         ClipboardLogger.log("Lỗi Server", t.message ?: "")
@@ -488,18 +414,21 @@ class TwoNembedProvider : MainAPI() {
                             val sName = s.optString("name", "NontonGo Server")
                             val sUrl = if (type == "movie") s.optString("movie_url") else s.optString("tv_url")
                             if (sUrl.isNotEmpty()) {
-                                val link = buildExtractorLink(
-                                    source = this.name,
-                                    name = "2embed - $sName (Mirror)",
-                                    url = sUrl,
-                                    referer = "https://www.nontongo.win/",
-                                    quality = Qualities.P1080.value,
-                                    headers = mapOf(
-                                        "User-Agent" to browserUa,
-                                        "Referer" to "https://www.nontongo.win/"
-                                    )
+                                callback.invoke(
+                                    newExtractorLink(
+                                        source = this.name,
+                                        name = "2embed - $sName (Mirror)",
+                                        url = sUrl,
+                                        type = ExtractorLinkType.M3U8
+                                    ) {
+                                        this.referer = "https://www.nontongo.win/"
+                                        this.quality = Qualities.P1080.value
+                                        this.headers = mapOf(
+                                            "User-Agent" to browserUa,
+                                            "Referer" to "https://www.nontongo.win/"
+                                        )
+                                    }
                                 )
-                                callback.invoke(link)
                                 linkCount++
                             }
                         }
