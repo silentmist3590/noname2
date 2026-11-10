@@ -1,4 +1,3 @@
-@file:Suppress("DEPRECATION", "UNUSED_VARIABLE")
 package com.lagradost
 
 import com.lagradost.cloudstream3.*
@@ -6,15 +5,19 @@ import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import okhttp3.Interceptor
+import okhttp3.MediaType
+import okhttp3.ResponseBody
 import org.json.JSONObject
 import java.net.URLEncoder
-import kotlin.io.encoding.Base64
-import kotlin.io.encoding.ExperimentalEncodingApi
+import java.util.Base64
 
 // =====================================================================================
-// 1. CẤU HÌNH API VÀ ĐỊNH DANH
+// 1. CẤU HÌNH API KEY VÀ ĐỊNH DANH
 // =====================================================================================
+private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
+private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
 private const val TRAKT_ACCESS_TOKEN = ""
 
@@ -29,17 +32,27 @@ private fun parseRef(s: String): MediaRef? {
 }
 
 // =====================================================================================
-// 2. DỊCH VỤ HỖ TRỢ (Trakt Scrobble)
+// 2. CÁC HÀM GỌI API HỖ TRỢ (OMDb, Trakt)
 // =====================================================================================
 object TwoNembedApiServices {
+    suspend fun getOmdbData(imdbId: String): String? {
+        return try {
+            val res = app.get("https://www.omdbapi.com/?apikey=$OMDB_API_KEY&i=$imdbId").text
+            val json = JSONObject(res)
+            val rating = json.optString("imdbRating")
+            if (rating.isNotEmpty() && rating != "N/A") rating else null
+        } catch (e: Exception) {
+            ClipboardLogger.logAndCopy("OMDb Error", e.message ?: "Unknown")
+            null
+        }
+    }
+
     suspend fun sendTraktScrobble(action: String, type: String, tmdbId: Int, progress: Float, season: Int? = null, episode: Int? = null) {
         if (TRAKT_ACCESS_TOKEN.isEmpty()) return
         val url = "https://api.trakt.tv/scrobble/$action"
         val headers = mapOf(
-            "Content-Type" to "application/json",
-            "trakt-api-version" to "2",
-            "trakt-api-key" to TRAKT_CLIENT_ID,
-            "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
+            "Content-Type" to "application/json", "trakt-api-version" to "2",
+            "trakt-api-key" to TRAKT_CLIENT_ID, "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
         )
         val body = JSONObject()
         body.put("progress", progress)
@@ -57,14 +70,14 @@ object TwoNembedApiServices {
         }
         try {
             app.post(url, headers = headers, json = body).text
-        } catch (t: Throwable) {
-            ClipboardLogger.log("Trakt Error", t.message ?: "Unknown")
+        } catch (e: Exception) {
+            ClipboardLogger.logAndCopy("Trakt Scrobble Error", e.message ?: "Unknown")
         }
     }
 }
 
 // =====================================================================================
-// 3. PROVIDER CHÍNH (TwoNembedProvider)
+// 3. LỚP PROVIDER CHÍNH (TwoNembedProvider)
 // =====================================================================================
 class TwoNembedProvider : MainAPI() {
     override var mainUrl = "https://www.2embed.cc"
@@ -84,29 +97,30 @@ class TwoNembedProvider : MainAPI() {
 
     private fun poster(path: String?) = img(path, "w500")
 
-    private val tmdbHosts = listOf("https://api.themoviedb.org/3", "https://api.tmdb.org/3")
+    private val tmdbHosts = listOf(TMDB_BASE_URL, "https://api.tmdb.org/3", "https://api.themoviedb.org/3")
 
     private suspend fun tmdbGet(path: String): String {
-        var last: Throwable? = null
+        var last: Exception? = null
         val sep = if (path.contains("?")) "&" else "?"
         for (host in tmdbHosts) {
             try {
                 val r = app.get("$host$path${sep}api_key=$TMDB_API_KEY")
                 if (r.code == 200 && r.text.trimStart().startsWith("{")) return r.text
                 last = Exception("HTTP ${r.code} @ $host")
-            } catch (t: Throwable) {
-                if (t is java.util.concurrent.CancellationException) throw t
-                last = t
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                last = e
             }
+            ClipboardLogger.logAndCopy("TMDB fallback", "${last?.message} (path=$path)")
         }
-        throw last ?: Exception("TMDB kết nối thất bại")
+        throw last ?: Exception("TMDB failed")
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         return try {
             val response = tmdbGet("${request.data}?page=$page")
             val json = JSONObject(response)
-            val results = json.optJSONArray("results") ?: throw Exception("TMDB không có kết quả")
+            val results = json.optJSONArray("results") ?: throw Exception(json.optString("status_message", "TMDB không trả results"))
             val home = mutableListOf<SearchResponse>()
             for (i in 0 until results.length()) {
                 val item = results.getJSONObject(i)
@@ -120,19 +134,19 @@ class TwoNembedProvider : MainAPI() {
                 })
             }
             newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
-        } catch (t: Throwable) {
-            if (t is java.util.concurrent.CancellationException) throw t
-            ClipboardLogger.logAndCopy("getMainPage Error", t.message ?: "Unknown")
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("getMainPage Error", e.message ?: "Unknown")
             newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         return try {
-            val encodedQuery = URLEncoder.encode(query, "UTF-8")
-            val response = tmdbGet("/search/multi?query=$encodedQuery")
-            val results = JSONObject(response).optJSONArray("results") ?: return emptyList()
-            val list = mutableListOf<SearchResponse>()
+            val q = URLEncoder.encode(query, "UTF-8")
+            val json = JSONObject(tmdbGet("/search/multi?query=$q"))
+            val results = json.optJSONArray("results") ?: return emptyList()
+            val out = mutableListOf<SearchResponse>()
             for (i in 0 until results.length()) {
                 val item = results.getJSONObject(i)
                 val mediaType = item.optString("media_type")
@@ -140,89 +154,215 @@ class TwoNembedProvider : MainAPI() {
                 val id = item.optInt("id", 0)
                 if (id == 0) continue
                 val title = item.optString("title", item.optString("name"))
-                list.add(newMovieSearchResponse(title, "2embed:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
+                out.add(newMovieSearchResponse(title, "2embed:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
                     this.posterUrl = poster(item.optString("poster_path"))
                 })
             }
-            list
-        } catch (t: Throwable) {
-            if (t is java.util.concurrent.CancellationException) throw t
-            ClipboardLogger.logAndCopy("search Error", t.message ?: "Unknown")
+            out
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("Search Error", e.message ?: "Unknown")
             emptyList()
         }
     }
 
-    override suspend fun load(url: String): LoadResponse {
-        ClipboardLogger.log("Load Start", "Đang nạp chi tiết: $url")
-        val ref = parseRef(url) ?: throw Exception("URL 2embed không đúng định dạng: $url")
-        val type = ref.type
-        val tmdbId = ref.id
+    override suspend fun load(url: String): LoadResponse? {
+        val ref = parseRef(url)
+        if (ref == null) {
+            ClipboardLogger.logAndCopy("load Error", "Không đọc được id từ url: $url")
+            return null
+        }
+        val mediaType = ref.type
+        val tmdbIdInt = ref.id
 
-        val detailsJson = JSONObject(tmdbGet("/$type/$tmdbId?append_to_response=external_ids,credits"))
-        val title = detailsJson.optString("title", detailsJson.optString("name", "Unknown"))
-        val posterPath = poster(detailsJson.optString("poster_path"))
-        val plot = detailsJson.optString("overview")
-        val year = detailsJson.optString("release_date", detailsJson.optString("first_air_date")).take(4).toIntOrNull()
+        try {
+            val response = app.get("$TMDB_BASE_URL/$mediaType/$tmdbIdInt?api_key=$TMDB_API_KEY").text
+            val json = JSONObject(response)
+            if (json.has("status_code")) throw Exception("TMDB: ${json.optString("status_message")}")
+            
+            val title = json.optString("title", json.optString("name"))
+            val description = json.optString("overview")
+            val posterUrl = poster(json.optString("poster_path"))
+            val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
+            
+            val canonical = "2embed:$mediaType:$tmdbIdInt"
 
-        return if (type == "movie") {
-            newMovieLoadResponse(title, url, TvType.Movie, "2embed:movie:$tmdbId") {
-                this.posterUrl = posterPath
-                this.plot = plot
-                this.year = year
-            }
-        } else {
-            val episodes = mutableListOf<Episode>()
-            val seasonsCount = detailsJson.optInt("number_of_seasons", 1)
-            for (s in 1..seasonsCount) {
-                try {
-                    val sJson = JSONObject(tmdbGet("/tv/$tmdbId/season/$s"))
-                    val eps = sJson.optJSONArray("episodes") ?: continue
-                    for (e in 0 until eps.length()) {
-                        val ep = eps.getJSONObject(e)
-                        val eNum = ep.optInt("episode_number")
-                        val epName = ep.optString("name", "Episode $eNum")
-                        episodes.add(
-                            newEpisode("2embed:tv:$tmdbId:$s:$eNum") {
-                                this.name = epName
-                                this.season = s
-                                this.episode = eNum
-                                this.posterUrl = poster(ep.optString("still_path"))
+            if (mediaType == "tv") {
+                val episodes = mutableListOf<Episode>()
+                val seasonsCount = json.optInt("number_of_seasons", 1)
+                for (s in 1..seasonsCount) {
+                    try {
+                        val seasonJson = JSONObject(app.get("$TMDB_BASE_URL/tv/$tmdbIdInt/season/$s?api_key=$TMDB_API_KEY").text)
+                        val eps = seasonJson.optJSONArray("episodes") ?: continue
+                        for (e in 0 until eps.length()) {
+                            val ep = eps.getJSONObject(e)
+                            val sn = ep.optInt("season_number", s)
+                            val en = ep.optInt("episode_number", e + 1)
+                            episodes.add(newEpisode("2embed:tv:$tmdbIdInt:$sn:$en") {
+                                this.name = ep.optString("name")
+                                this.episode = en
+                                this.season = sn
                                 this.description = ep.optString("overview")
-                            }
-                        )
+                                this.posterUrl = poster(ep.optString("still_path"))
+                            })
+                        }
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
                     }
-                } catch (t: Throwable) {
-                    ClipboardLogger.log("Season $s Error", t.message ?: "")
+                }
+                return newTvSeriesLoadResponse(title, canonical, TvType.TvSeries, episodes) {
+                    this.posterUrl = posterUrl
+                    this.plot = description
+                    this.year = year
+                }
+            } else {
+                return newMovieLoadResponse(title, canonical, TvType.Movie, canonical) {
+                    this.posterUrl = posterUrl
+                    this.plot = description
+                    this.year = year
                 }
             }
-            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
-                this.posterUrl = posterPath
-                this.plot = plot
-                this.year = year
-            }
-        }
-    }
-
-    @OptIn(ExperimentalEncodingApi::class)
-    private fun extractDirectSubtitleUrl(refToken: String): String? {
-        return try {
-            val parts = refToken.split(".")
-            if (parts.isNotEmpty()) {
-                var payload = parts[0]
-                val rem = payload.length % 4
-                if (rem > 0) payload += "=".repeat(4 - rem)
-                val jsonStr = String(Base64.decode(payload))
-                val json = JSONObject(jsonStr)
-                val u = json.optString("u")
-                if (u.isNotEmpty() && u.startsWith("http")) u else null
-            } else null
-        } catch (_: Throwable) {
-            null
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("load Error", "$url -> ${e.message}")
+            return null
         }
     }
 
     // =====================================================================================
-    // 4. LOAD LINKS: BẮT LINK VÀ GẮN BROWSER HEADERS CHỐNG LỖI 2004/2001
+    // 4. BỘ TẠO LINK AN TOÀN TƯƠNG THÍCH CẢ CLOUDSTREAM 4.5.2 VÀ 4.8 PRE
+    // =====================================================================================
+    private fun safeCreateExtractorLink(
+        source: String,
+        name: String,
+        url: String,
+        referer: String,
+        quality: Int = Qualities.P1080.value,
+        isM3u8: Boolean = true,
+        headers: Map<String, String> = emptyMap()
+    ): ExtractorLink {
+        // ĐẢM BẢO QUAN TRỌNG: Trên CloudStream 4.5.2, ExoPlayer phân loại MediaSource theo đuôi URL.
+        // Thêm #file.m3u8 giúp ExoPlayer 4.5.2 luôn chọn HlsMediaSource thay vì ProgressiveMediaSource (MP4)!
+        val finalUrl = if (isM3u8 && !url.contains(".m3u8")) "$url#file.m3u8" else url
+
+        // Cách 1: Thử newExtractorLink
+        try {
+            return newExtractorLink(
+                source = source,
+                name = name,
+                url = finalUrl,
+                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            ) {
+                this.referer = referer
+                this.quality = quality
+                this.headers = headers
+            }
+        } catch (_: Throwable) { }
+
+        // Cách 2: Thử constructor trực tiếp
+        try {
+            return ExtractorLink(
+                source = source,
+                name = name,
+                url = finalUrl,
+                referer = referer,
+                quality = quality,
+                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
+                headers = headers
+            )
+        } catch (_: Throwable) { }
+
+        // Cách 3: Reflection tự động khớp Constructor của phiên bản CloudStream đang chạy (4.5.2 vs 4.8)
+        try {
+            val clazz = ExtractorLink::class.java
+            val ctors = clazz.declaredConstructors.sortedByDescending { it.parameterTypes.size }
+            for (ctor in ctors) {
+                try {
+                    ctor.isAccessible = true
+                    val pts = ctor.parameterTypes
+                    val args = arrayOfNulls<Any>(pts.size)
+                    var ok = true
+                    var strIdx = 0
+                    for (i in pts.indices) {
+                        val p = pts[i]
+                        when {
+                            p == String::class.java -> {
+                                args[i] = when (strIdx++) {
+                                    0 -> source
+                                    1 -> name
+                                    2 -> finalUrl
+                                    3 -> referer
+                                    else -> ""
+                                }
+                            }
+                            p == Int::class.javaPrimitiveType || p == java.lang.Integer::class.java -> args[i] = quality
+                            p == Boolean::class.javaPrimitiveType || p == java.lang.Boolean::class.java -> args[i] = isM3u8
+                            p == Map::class.java -> args[i] = headers
+                            p == ExtractorLinkType::class.java -> args[i] = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                            p == List::class.java -> args[i] = emptyList<Any>()
+                            p.name.contains("DefaultConstructorMarker") -> args[i] = null
+                            else -> {
+                                ok = false
+                            }
+                        }
+                    }
+                    if (ok) {
+                        val res = ctor.newInstance(*args) as? ExtractorLink
+                        if (res != null) return res
+                    }
+                } catch (_: Throwable) { }
+            }
+        } catch (_: Throwable) { }
+
+        // Fallback tối giản cho CloudStream cũ
+        return ExtractorLink(source, name, finalUrl, referer, quality)
+    }
+
+    // =====================================================================================
+    // 5. VIDEO INTERCEPTOR: TỰ ĐỘNG CẮT 70 BYTES HEADER ẢNH PNG GIẢ TRÊN TIKTOK CDN CHO 4.5.2
+    // =====================================================================================
+    override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
+        return Interceptor { chain ->
+            val request = chain.request()
+            val builder = request.newBuilder()
+            if (extractorLink.referer.isNotEmpty()) {
+                builder.header("Referer", extractorLink.referer)
+            }
+            extractorLink.headers.forEach { (k, v) ->
+                builder.header(k, v)
+            }
+
+            val response = chain.proceed(builder.build())
+            val url = request.url.toString()
+
+            // Nếu phân đoạn video chứa header ảnh PNG giả mạo từ TikTok CDN
+            if (url.contains("tiktokcdn.com") || url.contains(".image")) {
+                val body = response.body
+                if (body != null) {
+                    val bytes = body.bytes()
+                    // Nhận dạng chính xác 70 bytes header ảnh PNG (\x89PNG và sync byte 0x47 tại vị trí 70)
+                    if (bytes.size > 70 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() && bytes[70] == 0x47.toByte()) {
+                        val stripped = bytes.copyOfRange(70, bytes.size)
+                        val mediaType = MediaType.parse("video/mp2t")
+                        return@Interceptor response.newBuilder()
+                            .body(ResponseBody.create(mediaType, stripped))
+                            .header("Content-Type", "video/mp2t")
+                            .build()
+                    } else {
+                        val mediaType = body.contentType()
+                        return@Interceptor response.newBuilder()
+                            .body(ResponseBody.create(mediaType, bytes))
+                            .build()
+                    }
+                }
+            }
+            response
+        }
+    }
+
+    // =====================================================================================
+    // 6. LOAD LINKS: BẮT LINK PHÁT SẠCH VÀ PHỤ ĐỀ
     // =====================================================================================
     override suspend fun loadLinks(
         data: String,
@@ -230,230 +370,213 @@ class TwoNembedProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        ClipboardLogger.clear()
-        ClipboardLogger.log("1. Khởi động", "Bắt đầu lấy link cho data: $data")
-
+        ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         val ref = parseRef(data)
         if (ref == null) {
-            ClipboardLogger.logAndCopy("Lỗi", "Không thể phân tích ID: $data")
+            ClipboardLogger.logAndCopy("Error", "Invalid data format: $data")
             return false
         }
-
         val type = ref.type
         val tmdbId = ref.id
         val season = ref.season
         val episode = ref.episode
 
-        val browserUa = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        var linkCount = 0
-        var subCount = 0
+        TwoNembedApiServices.sendTraktScrobble("start", type, tmdbId, 0f, season, episode)
 
-        // =================================================================================
-        // NGUỒN 1 & 2: vidsrc.buzz và videm.buzz
-        // =================================================================================
-        val embedDomains = listOf("https://vidsrc.buzz", "https://videm.buzz")
+        val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+        var foundLink = false
+        val registeredSubs = mutableSetOf<String>()
 
-        for ((index, pDomain) in embedDomains.withIndex()) {
-            val playerUrl = if (type == "movie") {
-                "$pDomain/embed/movie/$tmdbId"
-            } else {
-                "$pDomain/embed/tv/$tmdbId/$season/$episode"
+        // ---------------------------------------------------------------------------------
+        // NGUỒN 1 (ƯU TIÊN TUYỆT ĐỐI - CHUẨN HD SẠCH): NontonGo Direct Player (svsoapp)
+        // ---------------------------------------------------------------------------------
+        val nontongoPlayerUrl = if (type == "movie") {
+            "https://nontongo.win/01aus/player.php?id=$tmdbId&type=movie&autoplay=true"
+        } else {
+            "https://nontongo.win/01aus/player.php?id=$tmdbId&season=${season ?: 1}&episode=${episode ?: 1}&type=tv&autoplay=true"
+        }
+
+        try {
+            ClipboardLogger.logAndCopy("NontonGo Player", "Fetching: $nontongoPlayerUrl")
+            val playerHtml = app.get(
+                nontongoPlayerUrl,
+                headers = mapOf("User-Agent" to ua, "Referer" to "https://nontongo.win/")
+            ).text
+
+            // 1. Trích xuất phụ đề sạch từ các thẻ <track>
+            val trackRegex = Regex(
+                """<track[^>]+(?:data-src|src)=["']([^"']+)["'][^>]*label=["']([^"']+)["']|<track[^>]+label=["']([^"']+)["'][^>]+(?:data-src|src)=["']([^"']+)["']""",
+                RegexOption.IGNORE_CASE
+            )
+            trackRegex.findAll(playerHtml).forEach { match ->
+                val subUrl = match.groupValues[1].ifEmpty { match.groupValues[4] }
+                val label = match.groupValues[2].ifEmpty { match.groupValues[3] }
+                if (subUrl.isNotEmpty() && !registeredSubs.contains(subUrl)) {
+                    registeredSubs.add(subUrl)
+                    subtitleCallback.invoke(SubtitleFile(label, subUrl))
+                    ClipboardLogger.logAndCopy("Sub Added", "$label -> $subUrl")
+                }
             }
 
-            ClipboardLogger.log("2. Kết nối nguồn [${index + 1}/${embedDomains.size}]", "Đang tải: $playerUrl")
+            // 2. Trích xuất luồng phát video trực tiếp từ các nút dropdown-item
+            val buttonRegex = Regex("""<button[^>]*data-url=["']([^"']+)["'][^>]*>(.*?)</button>""", RegexOption.DOTALL)
+            buttonRegex.findAll(playerHtml).forEach { match ->
+                val rawUrl = match.groupValues[1].replace("&amp;", "&")
+                val labelHtml = match.groupValues[2]
+                val serverName = labelHtml.replace(Regex("<[^>]+>"), "").trim().ifEmpty { "Fast Server" }
 
-            try {
-                val playerDoc = app.get(
-                    playerUrl,
-                    headers = mapOf(
-                        "User-Agent" to browserUa,
-                        "Referer" to "https://www.2embed.cc/",
-                        "Origin" to "https://www.2embed.cc"
+                if (rawUrl.contains("svsoapp") && rawUrl.contains(".m3u8")) {
+                    val link = safeCreateExtractorLink(
+                        source = this.name,
+                        name = "2embed - $serverName",
+                        url = rawUrl,
+                        referer = "https://nontongo.win/",
+                        quality = if (serverName.contains("HD", true)) Qualities.P1080.value else Qualities.P720.value,
+                        isM3u8 = true,
+                        headers = mapOf(
+                            "User-Agent" to ua,
+                            "Referer" to "https://nontongo.win/",
+                            "Origin" to "https://nontongo.win"
+                        )
                     )
-                )
-
-                if (playerDoc.code != 200 || playerDoc.text.isEmpty()) {
-                    ClipboardLogger.log("3. Bỏ qua", "$playerUrl trả về mã: ${playerDoc.code}")
-                    continue
+                    callback.invoke(link)
+                    foundLink = true
+                    ClipboardLogger.logAndCopy("Stream Added", "Server: $serverName (svsoapp)")
                 }
+            }
+        } catch (e: Exception) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("NontonGo Error", e.message ?: "")
+        }
 
-                val html = playerDoc.text
-                val qMatch = Regex("""var\s+Q\s*=\s*(\{.*?\});""", RegexOption.DOT_MATCHES_ALL).find(html)
-                if (qMatch == null) {
-                    ClipboardLogger.log("4. Không tìm thấy Q", "Không thể trích xuất token Q từ $playerUrl")
-                    continue
-                }
+        // ---------------------------------------------------------------------------------
+        // NGUỒN 2: Bổ sung phụ đề OpenSubtitles & các luồng từ vidsrc.buzz / videm.buzz
+        // ---------------------------------------------------------------------------------
+        val embedCandidates = mutableListOf<String>()
+        if (type == "movie") {
+            embedCandidates.add("https://vidsrc.buzz/embed/movie/$tmdbId")
+            embedCandidates.add("https://videm.buzz/embed/movie/$tmdbId")
+        } else {
+            embedCandidates.add("https://vidsrc.buzz/embed/tv/$tmdbId/${season ?: 1}/${episode ?: 1}")
+            embedCandidates.add("https://videm.buzz/embed/tv/$tmdbId/${season ?: 1}/${episode ?: 1}")
+        }
 
+        for (playerUrl in embedCandidates) {
+            try {
+                val pDomain = Regex("""^(https?://[^/]+)""").find(playerUrl)?.groupValues?.get(1) ?: "https://vidsrc.buzz"
+                val pHtml = app.get(playerUrl, headers = mapOf("User-Agent" to ua, "Referer" to "https://www.2embed.cc/")).text
+
+                val qMatch = Regex("""var Q\s*=\s*(\{.*?\});""").find(pHtml) ?: continue
                 val qJson = JSONObject(qMatch.groupValues[1])
                 val token = qJson.optString("t")
-                val ssr = qJson.optJSONObject("ssr")
-                val servers = ssr?.optJSONArray("servers") ?: continue
+                val qType = qJson.optString("type", type)
+                val qId = qJson.optString("id", tmdbId.toString())
+                val qS = qJson.optInt("s", season ?: 0)
+                val qE = qJson.optInt("e", episode ?: 0)
 
-                if (servers.length() == 0) continue
-
-                val serverNames = (0 until servers.length()).map { servers.getJSONObject(it).optString("name", "Server $it") }
-                ClipboardLogger.log("5. Cấu hình Server", "Tìm thấy ${servers.length()} máy chủ: $serverNames")
-
-                // Lấy phụ đề
+                // Lấy phụ đề OpenSubtitles từ vidsrc.buzz
                 try {
-                    val qs = if (type == "movie") "type=movie&id=${qJson.optString("id")}" else "type=tv&id=${qJson.optString("id")}&s=$season&e=$episode"
-                    val subsRes = app.get(
-                        "$pDomain/pl/api.php?a=subs&$qs",
-                        headers = mapOf(
-                            "User-Agent" to browserUa,
-                            "Referer" to playerUrl,
-                            "Origin" to pDomain
-                        )
-                    ).text
+                    val subsUrl = "$pDomain/pl/api.php?a=subs&type=$qType&id=$qId&s=$qS&e=$qE&t=${URLEncoder.encode(token, "UTF-8")}"
+                    val subsRes = app.get(subsUrl, headers = mapOf(
+                        "User-Agent" to ua,
+                        "Referer" to playerUrl,
+                        "Origin" to pDomain,
+                        "Accept" to "application/json"
+                    )).text
 
                     if (subsRes.trimStart().startsWith("{")) {
-                        val subsArray = JSONObject(subsRes).optJSONArray("subtitles") ?: JSONObject(subsRes).optJSONArray("subs")
+                        val subsJson = JSONObject(subsRes)
+                        val subsArray = subsJson.optJSONArray("subtitles") ?: subsJson.optJSONArray("subs")
                         if (subsArray != null) {
                             for (i in 0 until subsArray.length()) {
                                 val sub = subsArray.getJSONObject(i)
-                                val label = sub.optString("label", sub.optString("lang", "Phụ đề"))
+                                val label = sub.optString("label", sub.optString("lang", "Subtitle"))
                                 val subRef = sub.optString("ref")
-                                val directUrl = extractDirectSubtitleUrl(subRef)
-                                val finalSubUrl = directUrl ?: sub.optString("url").takeIf { it.isNotEmpty() }
-                                ?: "$pDomain/pl/api.php?a=sub&ref=${URLEncoder.encode(subRef, "UTF-8")}"
-                                subtitleCallback.invoke(SubtitleFile(label, finalSubUrl))
-                                subCount++
+                                var directUrl = sub.optString("url")
+
+                                // Giải mã token Base64 JWT để lấy trực tiếp URL OpenSubtitles .vtt
+                                if (directUrl.isEmpty() && subRef.isNotEmpty()) {
+                                    try {
+                                        val payload = subRef.substringBefore(".")
+                                        val padded = payload + "=".repeat((4 - payload.length % 4) % 4)
+                                        val decodedBytes = Base64.getUrlDecoder().decode(padded)
+                                        val decodedJson = JSONObject(String(decodedBytes))
+                                        directUrl = decodedJson.optString("u")
+                                    } catch (_: Exception) { }
+                                }
+
+                                val finalSubUrl = if (directUrl.isNotEmpty()) directUrl else "$pDomain/pl/api.php?a=sub&ref=${URLEncoder.encode(subRef, "UTF-8")}"
+                                if (!registeredSubs.contains(finalSubUrl)) {
+                                    registeredSubs.add(finalSubUrl)
+                                    subtitleCallback.invoke(SubtitleFile("$label (OpenSubs)", finalSubUrl))
+                                }
                             }
-                            ClipboardLogger.log("6. Phụ đề", "Đã nạp $subCount phụ đề từ $pDomain")
                         }
                     }
-                } catch (t: Throwable) {
-                    ClipboardLogger.log("Lỗi phụ đề", t.message ?: "")
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    ClipboardLogger.logAndCopy("Vidsrc Subs Error", e.message ?: "")
                 }
 
-                // Gắn đầy đủ browser headers - CHỐNG TRIỆT ĐỂ LỖI 2004 (403 Forbidden)
-                val streamHeaders = mapOf(
-                    "User-Agent" to browserUa,
-                    "Origin" to pDomain,
-                    "Referer" to "$pDomain/",
-                    "Accept" to "*/*"
-                )
+                // Nạp các luồng máy chủ vidsrc.buzz (được tự động strip PNG header qua getVideoInterceptor)
+                val servers = qJson.optJSONObject("ssr")?.optJSONArray("servers")
+                if (servers != null) {
+                    for (i in 0 until servers.length()) {
+                        try {
+                            val serverObj = servers.getJSONObject(i)
+                            val sName = serverObj.optString("name", "Server ${i + 1}")
+                            val sRef = serverObj.optString("ref")
 
-                // Lấy stream từng server
-                for (i in 0 until servers.length()) {
-                    try {
-                        val serverObj = servers.getJSONObject(i)
-                        val sName = serverObj.optString("name", "Server ${i + 1}")
-                        val sRef = serverObj.optString("ref")
-
-                        val playApiUrl = "$pDomain/pl/api.php?a=play&ref=${URLEncoder.encode(sRef, "UTF-8")}&t=${URLEncoder.encode(token, "UTF-8")}"
-                        val playRes = app.get(
-                            playApiUrl,
-                            headers = mapOf(
-                                "User-Agent" to browserUa,
+                            val playApiUrl = "$pDomain/pl/api.php?a=play&ref=${URLEncoder.encode(sRef, "UTF-8")}&t=${URLEncoder.encode(token, "UTF-8")}"
+                            val playRes = app.get(playApiUrl, headers = mapOf(
+                                "User-Agent" to ua,
                                 "Referer" to playerUrl,
                                 "Origin" to pDomain,
                                 "Accept" to "application/json"
-                            )
-                        ).text
+                            )).text
 
-                        if (!playRes.trimStart().startsWith("{")) {
-                            continue
-                        }
+                            val playJson = JSONObject(playRes)
+                            var streamUrl = playJson.optString("url")
+                            if (streamUrl.isEmpty()) continue
 
-                        val playJson = JSONObject(playRes)
-                        var streamUrl = playJson.optString("url")
-                        if (streamUrl.isEmpty()) {
-                            ClipboardLogger.log("7. Trống", "$sName trả về url rỗng: $playRes")
-                            continue
-                        }
+                            if (streamUrl.startsWith("/")) {
+                                streamUrl = if (streamUrl.startsWith("/pl/")) "$pDomain$streamUrl" else "$pDomain/pl$streamUrl"
+                            }
 
-                        if (streamUrl.startsWith("/")) {
-                            streamUrl = "$pDomain$streamUrl"
-                        }
-
-                        ClipboardLogger.log("8. Thành công", "$sName -> $streamUrl")
-
-                        callback.invoke(
-                            newExtractorLink(
+                            val link = safeCreateExtractorLink(
                                 source = this.name,
                                 name = "2embed - $sName",
                                 url = streamUrl,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = "$pDomain/"
-                                this.quality = Qualities.P1080.value
-                                this.headers = streamHeaders
-                            }
-                        )
-                        linkCount++
-                    } catch (t: Throwable) {
-                        ClipboardLogger.log("Lỗi Server", t.message ?: "")
-                    }
-                }
-            } catch (t: Throwable) {
-                ClipboardLogger.log("Lỗi Nguồn $pDomain", t.message ?: "")
-            }
-        }
-
-        // =================================================================================
-        // NGUỒN 3: NontonGo Mirror (Dự phòng trực tiếp)
-        // =================================================================================
-        try {
-            val nontonEmbed = if (type == "movie") {
-                "https://www.nontongo.win/embed/movie/$tmdbId"
-            } else {
-                "https://www.nontongo.win/embed/tv/$tmdbId/$season/$episode"
-            }
-            ClipboardLogger.log("9. Dự phòng NontonGo", "Đang nạp: $nontonEmbed")
-
-            val nontonDoc = app.get(nontonEmbed, headers = mapOf("User-Agent" to browserUa, "Referer" to "https://www.nontongo.win/"))
-            if (nontonDoc.code == 200 && nontonDoc.text.isNotEmpty()) {
-                val cfgMatch = Regex("""const\s+cfg\s*=\s*(\{.*?\});""", RegexOption.DOT_MATCHES_ALL).find(nontonDoc.text)
-                if (cfgMatch != null) {
-                    val cfgJson = JSONObject(cfgMatch.groupValues[1])
-                    val nServers = cfgJson.optJSONArray("servers")
-                    if (nServers != null) {
-                        for (i in 0 until nServers.length()) {
-                            val s = nServers.getJSONObject(i)
-                            val sName = s.optString("name", "NontonGo Server")
-                            val sUrl = if (type == "movie") s.optString("movie_url") else s.optString("tv_url")
-                            if (sUrl.isNotEmpty()) {
-                                callback.invoke(
-                                    newExtractorLink(
-                                        source = this.name,
-                                        name = "2embed - $sName (Mirror)",
-                                        url = sUrl,
-                                        type = ExtractorLinkType.M3U8
-                                    ) {
-                                        this.referer = "https://www.nontongo.win/"
-                                        this.quality = Qualities.P1080.value
-                                        this.headers = mapOf(
-                                            "User-Agent" to browserUa,
-                                            "Referer" to "https://www.nontongo.win/"
-                                        )
-                                    }
+                                referer = "$pDomain/",
+                                quality = Qualities.P1080.value,
+                                isM3u8 = true,
+                                headers = mapOf(
+                                    "Origin" to pDomain,
+                                    "Referer" to "$pDomain/",
+                                    "User-Agent" to ua
                                 )
-                                linkCount++
-                            }
+                            )
+                            callback.invoke(link)
+                            foundLink = true
+                            ClipboardLogger.logAndCopy("Stream Added", "Server: $sName (vidsrc)")
+                        } catch (e: Exception) {
+                            if (e is java.util.concurrent.CancellationException) throw e
+                            ClipboardLogger.logAndCopy("Server Play Error", e.message ?: "")
                         }
                     }
                 }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                ClipboardLogger.logAndCopy("Player Scraping Error", e.message ?: "")
             }
-        } catch (t: Throwable) {
-            ClipboardLogger.log("Lỗi NontonGo Mirror", t.message ?: "")
         }
 
-        val success = linkCount > 0
-        ClipboardLogger.logAndCopy(
-            if (success) "THÀNH CÔNG" else "THẤT BẠI",
-            """
-            Phim TMDB ID: $tmdbId
-            Đã bắt được: $linkCount luồng phát video (Đã kèm headers chống 2004/2001)
-            Số phụ đề: $subCount
-            """.trimIndent()
-        )
-
-        if (success) {
+        if (foundLink) {
             TwoNembedApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
         }
-        return success
+        return foundLink
     }
 }
 
+// Typealias để tương thích cả 2 cách gọi
 typealias TwoEmbedProvider = TwoNembedProvider
