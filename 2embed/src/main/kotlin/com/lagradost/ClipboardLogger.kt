@@ -13,6 +13,12 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+object ClipboardLogger {
+    private const val TAG = "TwoNembed"
+    private const val MAX_LOG_LENGTH = 4000
+    private val buffer = StringBuilder()
+    private val lock = Any()
+    private var appContextRef: Context? = null
 
     /**
      * Khởi tạo context khi CloudStream tải plugin
