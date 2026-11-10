@@ -1,16 +1,18 @@
 package com.lagradost
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
 import java.net.URLEncoder
 
 // =====================================================================================
 // 1. CẤU HÌNH API KEY VÀ ĐỊNH DANH
 // =====================================================================================
-private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
 private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
@@ -92,22 +94,28 @@ class TwoNembedProvider : MainAPI() {
 
     private fun poster(path: String?) = img(path, "w500")
 
-    private val tmdbHosts = listOf(TMDB_BASE_URL, "https://api.tmdb.org/3", "https://api.themoviedb.org/3")
+    // Đưa api.tmdb.org lên hàng đầu, loại bỏ proxy worker bị 403
+    private val tmdbHosts = listOf(
+        "https://api.tmdb.org/3",
+        "https://api.themoviedb.org/3",
+        "https://tmdb-proxy.silentmist3590.workers.dev/3"
+    )
 
     private suspend fun tmdbGet(path: String): String {
         var last: Exception? = null
-        val sep = if (path.contains("?")) "&" else "?"
+        val cleanPath = if (path.startsWith("/")) path else "/$path"
+        val sep = if (cleanPath.contains("?")) "&" else "?"
         for (host in tmdbHosts) {
             try {
-                val r = app.get("$host$path${sep}api_key=$TMDB_API_KEY")
+                val r = app.get("$host$cleanPath${sep}api_key=$TMDB_API_KEY")
                 if (r.code == 200 && r.text.trimStart().startsWith("{")) return r.text
                 last = Exception("HTTP ${r.code} @ $host")
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
                 last = e
             }
-            ClipboardLogger.logAndCopy("TMDB fallback", "${last?.message} (path=$path)")
         }
+        ClipboardLogger.logAndCopy("TMDB fallback failed", "${last?.message} (path=$path)")
         throw last ?: Exception("TMDB failed")
     }
 
@@ -161,7 +169,7 @@ class TwoNembedProvider : MainAPI() {
         }
     }
 
-        override suspend fun load(url: String): LoadResponse? {
+    override suspend fun load(url: String): LoadResponse? {
         val ref = parseRef(url)
         if (ref == null) {
             ClipboardLogger.logAndCopy("load Error", "Không đọc được id từ url: $url")
@@ -171,16 +179,16 @@ class TwoNembedProvider : MainAPI() {
         val tmdbIdInt = ref.id
 
         try {
-            val response = app.get("$TMDB_BASE_URL/$mediaType/$tmdbIdInt?api_key=$TMDB_API_KEY").text
+            // SỬA LỖI 403: Sử dụng tmdbGet thay vì gọi thẳng proxy worker bị chặn
+            val response = tmdbGet("/$mediaType/$tmdbIdInt")
             val json = JSONObject(response)
             if (json.has("status_code")) throw Exception("TMDB: ${json.optString("status_message")}")
-            
+
             val title = json.optString("title", json.optString("name"))
             val description = json.optString("overview")
             val posterUrl = poster(json.optString("poster_path"))
             val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
-            
-            // Đã xóa hoàn toàn phần Score ở đây
+
             val canonical = "2embed:$mediaType:$tmdbIdInt"
 
             if (mediaType == "tv") {
@@ -188,7 +196,7 @@ class TwoNembedProvider : MainAPI() {
                 val seasonsCount = json.optInt("number_of_seasons", 1)
                 for (s in 1..seasonsCount) {
                     try {
-                        val seasonJson = JSONObject(app.get("$TMDB_BASE_URL/tv/$tmdbIdInt/season/$s?api_key=$TMDB_API_KEY").text)
+                        val seasonJson = JSONObject(tmdbGet("/tv/$tmdbIdInt/season/$s"))
                         val eps = seasonJson.optJSONArray("episodes") ?: continue
                         for (e in 0 until eps.length()) {
                             val ep = eps.getJSONObject(e)
@@ -211,14 +219,12 @@ class TwoNembedProvider : MainAPI() {
                     this.posterUrl = posterUrl
                     this.plot = description
                     this.year = year
-                    // Đã xóa this.score
                 }
             } else {
                 return newMovieLoadResponse(title, canonical, TvType.Movie, canonical) {
                     this.posterUrl = posterUrl
                     this.plot = description
                     this.year = year
-                    // Đã xóa this.score
                 }
             }
         } catch (e: Exception) {
@@ -229,7 +235,7 @@ class TwoNembedProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // 4. LOAD LINKS: BẮT LINK TRỰC TIẾP TỪ 2EMBED & VIDSRC.BUZZ
+    // 4. LOAD LINKS: BẮT LINK TRỰC TIẾP TỪ 2EMBED & VIDSRC.BUZZ (ĐÃ FIX ĐƯỜNG DẪN 404)
     // =====================================================================================
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
@@ -293,7 +299,7 @@ class TwoNembedProvider : MainAPI() {
 
                     val servers = qJson.optJSONObject("ssr")?.optJSONArray("servers") ?: continue
 
-                    // Tải danh sách phụ đề
+                    // 1. TẢI VÀ GIẢI MÃ PHỤ ĐỀ TRỰC TIẾP TỪ BASE64 JWT (TRÁNH LỖI 403)
                     try {
                         val subsUrl = "$pDomain/pl/api.php?a=subs&type=$qType&id=$qId&s=$qS&e=$qE&t=${URLEncoder.encode(token, "UTF-8")}"
                         val subsRes = app.get(subsUrl, headers = mapOf("User-Agent" to ua, "Referer" to playerUrl, "Origin" to pDomain)).text
@@ -303,17 +309,31 @@ class TwoNembedProvider : MainAPI() {
                             for (i in 0 until subsArray.length()) {
                                 val sub = subsArray.getJSONObject(i)
                                 val label = sub.optString("label", sub.optString("lang", "Subtitle"))
+                                var finalSubUrl = sub.optString("url")
                                 val subRef = sub.optString("ref")
-                                val subDirect = sub.optString("url")
-                                val finalSubUrl = if (subDirect.isNotEmpty()) subDirect else "$pDomain/pl/api.php?a=sub&ref=${URLEncoder.encode(subRef, "UTF-8")}"
-                                subtitleCallback.invoke(SubtitleFile(label, finalSubUrl))
+
+                                // Giải mã Base64 ref để lấy link trực tiếp
+                                if (finalSubUrl.isEmpty() && subRef.isNotEmpty()) {
+                                    try {
+                                        val payload = subRef.substringBefore(".")
+                                        val padded = payload + "=".repeat((4 - payload.length % 4) % 4)
+                                        val decodedBytes = Base64.decode(padded, Base64.DEFAULT)
+                                        val subObj = JSONObject(String(decodedBytes, Charsets.UTF_8))
+                                        finalSubUrl = subObj.optString("u")
+                                    } catch (_: Exception) {
+                                    }
+                                }
+
+                                if (finalSubUrl.isNotEmpty()) {
+                                    subtitleCallback.invoke(SubtitleFile(label, finalSubUrl))
+                                }
                             }
                         }
                     } catch (e: Exception) {
                         ClipboardLogger.logAndCopy("Subs Error", e.message ?: "")
                     }
 
-                    // Tải luồng phát từ các server
+                    // 2. TẢI VÀ PHÁT LUỒNG STREAM ĐA ĐỘ PHÂN GIẢI
                     for (i in 0 until servers.length()) {
                         try {
                             val serverObj = servers.getJSONObject(i)
@@ -329,25 +349,51 @@ class TwoNembedProvider : MainAPI() {
                             )).text
 
                             val playJson = JSONObject(playRes)
-                            var streamUrl = playJson.optString("url")
-                            if (streamUrl.isEmpty()) continue
+                            var rawStreamUrl = playJson.optString("url")
+                            if (rawStreamUrl.isEmpty()) continue
 
-                            if (streamUrl.startsWith("/")) {
-                                streamUrl = if (streamUrl.startsWith("/pl/")) "$pDomain$streamUrl" else "$pDomain/pl$streamUrl"
+                            // SỬA LỖI 404 TẠI ĐÂY:
+                            // Link trả về dạng "/_stream?id=...", chỉ nối thẳng domain gốc pDomain (KHÔNG được chèn thêm /pl)
+                            val streamUrl = if (rawStreamUrl.startsWith("/")) "$pDomain$rawStreamUrl" else rawStreamUrl
+
+                            val headers = mapOf(
+                                "Origin" to pDomain,
+                                "Referer" to "$pDomain/",
+                                "User-Agent" to ua
+                            )
+
+                            // Tự động phân giải các chất lượng (1080p, 720p, 480p...)
+                            val m3u8Links = try {
+                                M3u8Helper.generateM3u8(
+                                    source = this.name,
+                                    streamUrl = streamUrl,
+                                    referer = "$pDomain/",
+                                    headers = headers
+                                )
+                            } catch (_: Exception) {
+                                emptyList()
                             }
 
-                            callback.invoke(
-                                ExtractorLink(
-                                    source = this.name,
-                                    name = "2embed - $sName",
-                                    url = streamUrl,
-                                    referer = "$pDomain/",
-                                    quality = Qualities.P1080.value,
-                                    type = ExtractorLinkType.M3U8,
-                                    headers = mapOf("Origin" to pDomain, "Referer" to "$pDomain/", "User-Agent" to ua)
+                            if (m3u8Links.isNotEmpty()) {
+                                m3u8Links.forEach { link ->
+                                    callback.invoke(link)
+                                }
+                                foundLink = true
+                            } else {
+                                callback.invoke(
+                                    newExtractorLink(
+                                        source = this.name,
+                                        name = "2embed - $sName",
+                                        url = streamUrl,
+                                        type = ExtractorLinkType.M3U8
+                                    ) {
+                                        this.referer = "$pDomain/"
+                                        this.headers = headers
+                                        this.quality = Qualities.P1080.value
+                                    }
                                 )
-                            )
-                            foundLink = true
+                                foundLink = true
+                            }
                         } catch (e: Exception) {
                             ClipboardLogger.logAndCopy("Server Play Error", e.message ?: "")
                         }
@@ -358,6 +404,37 @@ class TwoNembedProvider : MainAPI() {
             }
         } catch (e: Exception) {
             ClipboardLogger.logAndCopy("LoadLinks Error", e.message ?: "")
+        }
+
+        // DỰ PHÒNG NGUỒN PHÁT: Nếu 2embed bị nghẽn, tự động kích hoạt máy chủ dự phòng HD
+        if (!foundLink) {
+            try {
+                val backupUrl = if (type == "tv") {
+                    "https://nontongo.win/01aus/player.php?id=$tmdbId&type=tv&season=${season ?: 1}&episode=${episode ?: 1}&autoplay=true"
+                } else {
+                    "https://nontongo.win/01aus/player.php?id=$tmdbId&type=movie&autoplay=true"
+                }
+                val pHtml = app.get(backupUrl, referer = "https://nontongo.win/", headers = mapOf("User-Agent" to ua)).text
+                val streamUrlRegex = Regex("""data-url=["']([^"']+)["']""")
+                for (m in streamUrlRegex.findAll(pHtml)) {
+                    val sUrl = m.groupValues[1].substringBefore("#")
+                    if (sUrl.startsWith("http")) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = this.name,
+                                name = "2embed - Backup HD",
+                                url = sUrl,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = "https://nontongo.win/"
+                                this.quality = Qualities.P1080.value
+                            }
+                        )
+                        foundLink = true
+                    }
+                }
+            } catch (_: Exception) {
+            }
         }
 
         if (foundLink) {
