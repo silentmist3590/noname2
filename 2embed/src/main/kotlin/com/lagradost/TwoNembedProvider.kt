@@ -1,17 +1,26 @@
-vpackage com.lagradost
+package com.lagradost
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import kotlin.text.RegexOption          // ← THÊM DÒNG NÀY (explicit import, thắng wildcard)
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Base64
+import java.util.regex.Pattern
+
+// =====================================================================================
+// STUB LOGGER (nếu project đã có ClipboardLogger ở file khác → XÓA object này đi)
+// =====================================================================================
+object ClipboardLogger {
+    fun logAndCopy(tag: String, message: String) {
+        android.util.Log.d("2embed", "[$tag] $message")
+    }
+}
 
 // =====================================================================================
 // 1. CẤU HÌNH API KEY VÀ ĐỊNH DANH
@@ -22,14 +31,20 @@ private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
 private const val TRAKT_ACCESS_TOKEN = ""
 
-private val ID_REGEX = Regex("""(movie|tv):(\d+)(?::(\d+):(\d+))?""")
+private val ID_REGEX = Pattern.compile("""(movie|tv):(\d+)(?::(\d+):(\d+))?""")
 
 private class MediaRef(val type: String, val id: Int, val season: Int?, val episode: Int?)
 
 private fun parseRef(s: String): MediaRef? {
-    val m = ID_REGEX.find(s) ?: return null
-    val id = m.groupValues[2].toIntOrNull() ?: return null
-    return MediaRef(m.groupValues[1], id, m.groupValues[3].toIntOrNull(), m.groupValues[4].toIntOrNull())
+    val m = ID_REGEX.matcher(s)
+    if (!m.find()) return null
+    val id = m.group(2)?.toIntOrNull() ?: return null
+    return MediaRef(
+        m.group(1) ?: return null,
+        id,
+        m.group(3)?.toIntOrNull(),
+        m.group(4)?.toIntOrNull()
+    )
 }
 
 // =====================================================================================
@@ -87,7 +102,7 @@ object TwoNembedApiServices {
 }
 
 // =====================================================================================
-// 3. LỚP PROVIDER CHÍNH (TwoNembedProvider)
+// 3. LỚP PROVIDER CHÍNH
 // =====================================================================================
 class TwoNembedProvider : MainAPI() {
     override var mainUrl = "https://www.2embed.cc"
@@ -265,7 +280,7 @@ class TwoNembedProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // 4. BỘ TẠO LINK AN TOÀN — DÙNG newExtractorLink (SUSPEND)
+    // 4. BỘ TẠO LINK AN TOÀN — newExtractorLink (SUSPEND)
     // =====================================================================================
     private suspend fun safeCreateExtractorLink(
         source: String,
@@ -291,7 +306,7 @@ class TwoNembedProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // 5. VIDEO INTERCEPTOR: CẮT 70 BYTES HEADER PNG GIẢ TRÊN TIKTOK CDN
+    // 5. VIDEO INTERCEPTOR
     // =====================================================================================
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
         return Interceptor { chain ->
@@ -378,14 +393,15 @@ class TwoNembedProvider : MainAPI() {
                 headers = mapOf("User-Agent" to ua, "Referer" to "https://nontongo.win/")
             ).text
 
-            // 1. Phụ đề từ <track>
-            val trackRegex = Regex(
+            // 1. Phụ đề từ <track> — dùng Pattern.CASE_INSENSITIVE (không thể shadow)
+            val trackPattern = Pattern.compile(
                 """<track[^>]+(?:data-src|src)=["']([^"']+)["'][^>]*label=["']([^"']+)["']|<track[^>]+label=["']([^"']+)["'][^>]+(?:data-src|src)=["']([^"']+)["']""",
-                kotlin.text.RegexOption.IGNORE_CASE   // ← fully qualify để chắc chắn
+                Pattern.CASE_INSENSITIVE
             )
-            trackRegex.findAll(playerHtml).forEach { match ->
-                val subUrl = match.groupValues[1].ifEmpty { match.groupValues[4] }
-                val label = match.groupValues[2].ifEmpty { match.groupValues[3] }
+            val trackMatcher = trackPattern.matcher(playerHtml)
+            while (trackMatcher.find()) {
+                val subUrl = (trackMatcher.group(1) ?: "").ifEmpty { trackMatcher.group(4) ?: "" }
+                val label = (trackMatcher.group(2) ?: "").ifEmpty { trackMatcher.group(3) ?: "" }
                 if (subUrl.isNotEmpty() && !registeredSubs.contains(subUrl)) {
                     registeredSubs.add(subUrl)
                     subtitleCallback.invoke(SubtitleFile(label, subUrl))
@@ -393,14 +409,15 @@ class TwoNembedProvider : MainAPI() {
                 }
             }
 
-            // 2. Stream từ nút button — for loop vì có suspend
-            val buttonRegex = Regex(
+            // 2. Stream từ nút button — dùng Pattern.DOTALL (không thể shadow)
+            val buttonPattern = Pattern.compile(
                 """<button[^>]*data-url=["']([^"']+)["'][^>]*>(.*?)</button>""",
-                kotlin.text.RegexOption.DOTALL        // ← fully qualify
+                Pattern.DOTALL
             )
-            for (match in buttonRegex.findAll(playerHtml)) {
-                val rawUrl = match.groupValues[1].replace("&amp;", "&")
-                val labelHtml = match.groupValues[2]
+            val buttonMatcher = buttonPattern.matcher(playerHtml)
+            while (buttonMatcher.find()) {
+                val rawUrl = (buttonMatcher.group(1) ?: "").replace("&amp;", "&")
+                val labelHtml = buttonMatcher.group(2) ?: ""
                 val serverName = labelHtml.replace(Regex("<[^>]+>"), "").trim()
                     .ifEmpty { "Fast Server" }
 
@@ -443,8 +460,8 @@ class TwoNembedProvider : MainAPI() {
 
         for (playerUrl in embedCandidates) {
             try {
-                val pDomain = Regex("""^(https?://[^/]+)""").find(playerUrl)
-                    ?.groupValues?.get(1) ?: "https://vidsrc.buzz"
+                val pDomainMatch = Pattern.compile("""^(https?://[^/]+)""").matcher(playerUrl)
+                val pDomain = if (pDomainMatch.find()) pDomainMatch.group(1) else "https://vidsrc.buzz"
                 val pHtml = app.get(
                     playerUrl,
                     headers = mapOf(
@@ -453,12 +470,11 @@ class TwoNembedProvider : MainAPI() {
                     )
                 ).text
 
-                // Regex DOTALL — fully qualify
-                val qMatch = Regex(
-                    """var Q\s*=\s*(\{.*?\});""",
-                    kotlin.text.RegexOption.DOTALL
-                ).find(pHtml) ?: continue
-                val qJson = JSONObject(qMatch.groupValues[1])
+                // Pattern.DOTALL — không thể shadow
+                val qPattern = Pattern.compile("""var Q\s*=\s*(\{.*?\});""", Pattern.DOTALL)
+                val qMatcher = qPattern.matcher(pHtml)
+                if (!qMatcher.find()) continue
+                val qJson = JSONObject(qMatcher.group(1))
                 val token = qJson.optString("t")
                 val qType = qJson.optString("type", type)
                 val qId = qJson.optString("id", tmdbId.toString())
