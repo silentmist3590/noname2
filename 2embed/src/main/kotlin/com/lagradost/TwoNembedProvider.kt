@@ -11,7 +11,7 @@ import org.json.JSONObject
 import java.net.URLEncoder
 
 // =====================================================================================
-// 1. CẤU HÌNH API KEY VÀ ĐỊNH DANH (ĐÃ LOẠI BỎ PROXY WORKER BỊ CHẾT)
+// 1. CẤU HÌNH API KEY VÀ ĐỊNH DANH
 // =====================================================================================
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
 private const val OMDB_API_KEY = "a116862a"
@@ -38,7 +38,7 @@ object TwoNembedApiServices {
             val json = JSONObject(res)
             val rating = json.optString("imdbRating")
             if (rating.isNotEmpty() && rating != "N/A") rating else null
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             null
         }
     }
@@ -66,7 +66,7 @@ object TwoNembedApiServices {
         }
         try {
             app.post(url, headers = headers, json = body).text
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
     }
 }
@@ -92,28 +92,27 @@ class TwoNembedProvider : MainAPI() {
 
     private fun poster(path: String?) = img(path, "w500")
 
-    // Dùng trực tiếp TMDB chuẩn, không đi qua proxy bị timeout
     private val tmdbHosts = listOf(
         "https://api.tmdb.org/3",
         "https://api.themoviedb.org/3"
     )
 
     private suspend fun tmdbGet(path: String): String {
-        var last: Exception? = null
+        var last: Throwable? = null
         val cleanPath = if (path.startsWith("/")) path else "/$path"
         val sep = if (cleanPath.contains("?")) "&" else "?"
         for (host in tmdbHosts) {
             try {
-                val r = app.get("$host$cleanPath${sep}api_key=$TMDB_API_KEY", timeout = 10)
+                val r = app.get("$host$cleanPath${sep}api_key=$TMDB_API_KEY")
                 if (r.code == 200 && r.text.trimStart().startsWith("{")) return r.text
                 last = Exception("HTTP ${r.code} @ $host")
-            } catch (e: Exception) {
-                if (e is java.util.concurrent.CancellationException) throw e
-                last = e
+            } catch (t: Throwable) {
+                if (t is java.util.concurrent.CancellationException) throw t
+                last = t
             }
         }
         ClipboardLogger.logAndCopy("TMDB Error", "${last?.message} (path=$path)")
-        throw last ?: Exception("TMDB failed")
+        throw (last ?: Exception("TMDB failed"))
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
@@ -134,9 +133,9 @@ class TwoNembedProvider : MainAPI() {
                 })
             }
             newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            ClipboardLogger.logAndCopy("getMainPage Error", e.message ?: "Unknown")
+        } catch (t: Throwable) {
+            if (t is java.util.concurrent.CancellationException) throw t
+            ClipboardLogger.logAndCopy("getMainPage Error", t.message ?: "Unknown")
             newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
     }
@@ -159,9 +158,9 @@ class TwoNembedProvider : MainAPI() {
                 })
             }
             out
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            ClipboardLogger.logAndCopy("Search Error", e.message ?: "Unknown")
+        } catch (t: Throwable) {
+            if (t is java.util.concurrent.CancellationException) throw t
+            ClipboardLogger.logAndCopy("Search Error", t.message ?: "Unknown")
             emptyList()
         }
     }
@@ -176,7 +175,6 @@ class TwoNembedProvider : MainAPI() {
         val tmdbIdInt = ref.id
 
         try {
-            // SỬA LỖI TIMEOUT: Gọi tmdbGet có fallback an toàn, không gọi worker chết
             val response = tmdbGet("/$mediaType/$tmdbIdInt")
             val json = JSONObject(response)
             if (json.has("status_code")) throw Exception("TMDB: ${json.optString("status_message")}")
@@ -207,9 +205,9 @@ class TwoNembedProvider : MainAPI() {
                                 this.posterUrl = poster(ep.optString("still_path"))
                             })
                         }
-                    } catch (e: Exception) {
-                        if (e is java.util.concurrent.CancellationException) throw e
-                        ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${e.message}")
+                    } catch (t: Throwable) {
+                        if (t is java.util.concurrent.CancellationException) throw t
+                        ClipboardLogger.logAndCopy("Season Load Error", "Season $s: ${t.message}")
                     }
                 }
                 return newTvSeriesLoadResponse(title, canonical, TvType.TvSeries, episodes) {
@@ -224,15 +222,15 @@ class TwoNembedProvider : MainAPI() {
                     this.year = year
                 }
             }
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            ClipboardLogger.logAndCopy("load Error", "$url -> ${e.message}")
+        } catch (t: Throwable) {
+            if (t is java.util.concurrent.CancellationException) throw t
+            ClipboardLogger.logAndCopy("load Error", "$url -> ${t.message}")
             return null
         }
     }
 
     // =====================================================================================
-    // 4. LOAD LINKS: LẤY TRỰC TIẾP TỪ VIDSRC & VIDEM (KHÔNG CHỜ 2EMBED.CC LÀM NGHẼN)
+    // 4. LOAD LINKS: AN TOÀN TUYỆT ĐỐI, LOẠI BỎ THAM SỐ TIMEOUT GÂY NOSUCHMETHODERROR
     // =====================================================================================
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
@@ -251,7 +249,7 @@ class TwoNembedProvider : MainAPI() {
         val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
         var foundLink = false
 
-        // KHẮC PHỤC TREO MẠNG: Thêm trực tiếp các server video gốc, không phụ thuộc vào 2embed.cc
+        // Danh sách server trực tiếp
         val playerUrls = mutableListOf<String>()
         if (type == "movie") {
             playerUrls.add("https://vidsrc.buzz/embed/movie/$tmdbId")
@@ -266,7 +264,7 @@ class TwoNembedProvider : MainAPI() {
         for (playerUrl in playerUrls) {
             try {
                 val pDomain = Regex("""^(https?://[^/]+)""").find(playerUrl)?.groupValues?.get(1) ?: "https://vidsrc.buzz"
-                val res = app.get(playerUrl, headers = mapOf("User-Agent" to ua, "Referer" to "https://www.2embed.cc/"), timeout = 10)
+                val res = app.get(playerUrl, headers = mapOf("User-Agent" to ua, "Referer" to "https://www.2embed.cc/"))
                 val pHtml = res.text
 
                 // Nếu là trang 2embed.cc, lấy tiếp các server bên trong nếu có
@@ -278,7 +276,6 @@ class TwoNembedProvider : MainAPI() {
                     continue
                 }
 
-                // Trích xuất cấu hình Q từ vidsrc/videm
                 val qMatch = Regex("""var Q\s*=\s*(\{.*?\});""").find(pHtml) ?: continue
                 val qJson = JSONObject(qMatch.groupValues[1])
                 val token = qJson.optString("t")
@@ -288,10 +285,10 @@ class TwoNembedProvider : MainAPI() {
                 val qE = qJson.optInt("e", episode)
                 val servers = qJson.optJSONObject("ssr")?.optJSONArray("servers") ?: continue
 
-                // 1. TẢI VÀ GIẢI MÃ PHỤ ĐỀ (TỰ ĐỘNG GIẢI MÃ BASE64)
+                // 1. TẢI VÀ GIẢI MÃ PHỤ ĐỀ TRỰC TIẾP TỪ BASE64
                 try {
                     val subsUrl = "$pDomain/pl/api.php?a=subs&type=$qType&id=$qId&s=$qS&e=$qE&t=${URLEncoder.encode(token, "UTF-8")}"
-                    val subsRes = app.get(subsUrl, headers = mapOf("User-Agent" to ua, "Referer" to playerUrl, "Origin" to pDomain), timeout = 8).text
+                    val subsRes = app.get(subsUrl, headers = mapOf("User-Agent" to ua, "Referer" to playerUrl, "Origin" to pDomain)).text
                     val subsJson = JSONObject(subsRes)
                     val subsArray = subsJson.optJSONArray("subtitles") ?: subsJson.optJSONArray("subs")
                     if (subsArray != null) {
@@ -308,7 +305,7 @@ class TwoNembedProvider : MainAPI() {
                                     val decodedBytes = Base64.decode(padded, Base64.DEFAULT)
                                     val subObj = JSONObject(String(decodedBytes, Charsets.UTF_8))
                                     finalSubUrl = subObj.optString("u")
-                                } catch (_: Exception) {
+                                } catch (_: Throwable) {
                                 }
                             }
 
@@ -317,10 +314,10 @@ class TwoNembedProvider : MainAPI() {
                             }
                         }
                     }
-                } catch (_: Exception) {
+                } catch (_: Throwable) {
                 }
 
-                // 2. TẢI VÀ PHÁT LUỒNG STREAM ĐA CHẤT LƯỢNG
+                // 2. TẢI VÀ PHÂN GIẢI STREAM
                 for (i in 0 until servers.length()) {
                     try {
                         val serverObj = servers.getJSONObject(i)
@@ -333,13 +330,13 @@ class TwoNembedProvider : MainAPI() {
                             "Referer" to playerUrl,
                             "Origin" to pDomain,
                             "Accept" to "application/json"
-                        ), timeout = 10).text
+                        )).text
 
                         val playJson = JSONObject(playRes)
                         val rawStreamUrl = playJson.optString("url")
                         if (rawStreamUrl.isEmpty()) continue
 
-                        // SỬA LỖI 404: Nối thẳng domain gốc pDomain (KHÔNG được chèn /pl)
+                        // Đường dẫn chính xác: Nối thẳng domain gốc
                         val streamUrl = if (rawStreamUrl.startsWith("/")) "$pDomain$rawStreamUrl" else rawStreamUrl
 
                         val headers = mapOf(
@@ -348,7 +345,6 @@ class TwoNembedProvider : MainAPI() {
                             "User-Agent" to ua
                         )
 
-                        // Phân tách đa chất lượng (1080p, 720p, 480p...)
                         val m3u8Links = try {
                             M3u8Helper.generateM3u8(
                                 source = this.name,
@@ -356,14 +352,12 @@ class TwoNembedProvider : MainAPI() {
                                 referer = "$pDomain/",
                                 headers = headers
                             )
-                        } catch (_: Exception) {
+                        } catch (_: Throwable) {
                             emptyList()
                         }
 
                         if (m3u8Links.isNotEmpty()) {
-                            m3u8Links.forEach { link ->
-                                callback.invoke(link)
-                            }
+                            m3u8Links.forEach { link -> callback.invoke(link) }
                             foundLink = true
                         } else {
                             callback.invoke(
@@ -380,18 +374,18 @@ class TwoNembedProvider : MainAPI() {
                             )
                             foundLink = true
                         }
-                    } catch (e: Exception) {
-                        ClipboardLogger.logAndCopy("Play API Error", e.message ?: "")
+                    } catch (t: Throwable) {
+                        ClipboardLogger.logAndCopy("Play API Error", t.message ?: "")
                     }
                 }
 
-                if (foundLink) break // Đã lấy được link tốt từ server này thì dừng lại
-            } catch (e: Exception) {
-                ClipboardLogger.logAndCopy("Scrape Error", "$playerUrl: ${e.message}")
+                if (foundLink) break
+            } catch (t: Throwable) {
+                ClipboardLogger.logAndCopy("Scrape Error", "$playerUrl: ${t.message}")
             }
         }
 
-        // 3. MÁY CHỦ DỰ PHÒNG SIÊU TỐC NẾU 2EMBED BỊ NGHẼN MẠNG
+        // 3. MÁY CHỦ DỰ PHÒNG CHẤT LƯỢNG CAO (NẾU 2EMBED BỊ NGHẼN)
         if (!foundLink) {
             try {
                 val backupUrl = if (type == "tv") {
@@ -399,26 +393,50 @@ class TwoNembedProvider : MainAPI() {
                 } else {
                     "https://nontongo.win/01aus/player.php?id=$tmdbId&type=movie&autoplay=true"
                 }
-                val pHtml = app.get(backupUrl, referer = "https://nontongo.win/", headers = mapOf("User-Agent" to ua), timeout = 8).text
+                val pHtml = app.get(backupUrl, referer = "https://nontongo.win/", headers = mapOf("User-Agent" to ua)).text
+                
+                // Trích xuất phụ đề dự phòng
+                val subRegex = Regex("""data-src=["']([^"']+\.(?:vtt|srt)[^"']*)["']\s+label=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+                for (m in subRegex.findAll(pHtml)) {
+                    subtitleCallback.invoke(SubtitleFile(m.groupValues[2], m.groupValues[1]))
+                }
+
                 val streamUrlRegex = Regex("""data-url=["']([^"']+)["']""")
                 for (m in streamUrlRegex.findAll(pHtml)) {
-                    val sUrl = m.groupValues[1].substringBefore("#")
+                    val sUrl = m.groupValues[1].substringBefore("#").trim()
                     if (sUrl.startsWith("http")) {
-                        callback.invoke(
-                            newExtractorLink(
+                        val m3u8 = try {
+                            M3u8Helper.generateM3u8(
                                 source = this.name,
-                                name = "2embed - Server Dự Phòng HD",
-                                url = sUrl,
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.referer = "https://nontongo.win/"
-                                this.quality = Qualities.P1080.value
-                            }
-                        )
-                        foundLink = true
+                                streamUrl = sUrl,
+                                referer = "https://nontongo.win/",
+                                headers = mapOf("Referer" to "https://nontongo.win/", "User-Agent" to ua)
+                            )
+                        } catch (_: Throwable) {
+                            emptyList()
+                        }
+
+                        if (m3u8.isNotEmpty()) {
+                            m3u8.forEach { link -> callback.invoke(link) }
+                            foundLink = true
+                        } else {
+                            callback.invoke(
+                                newExtractorLink(
+                                    source = this.name,
+                                    name = "2embed - Server Dự Phòng HD",
+                                    url = sUrl,
+                                    type = ExtractorLinkType.M3U8
+                                ) {
+                                    this.referer = "https://nontongo.win/"
+                                    this.quality = Qualities.P1080.value
+                                }
+                            )
+                            foundLink = true
+                        }
                     }
                 }
-            } catch (_: Exception) {
+            } catch (t: Throwable) {
+                ClipboardLogger.logAndCopy("Backup Error", t.message ?: "")
             }
         }
 
