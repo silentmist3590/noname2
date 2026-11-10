@@ -47,12 +47,21 @@ object TwoNembedApiServices {
         }
     }
 
-    suspend fun sendTraktScrobble(action: String, type: String, tmdbId: Int, progress: Float, season: Int? = null, episode: Int? = null) {
+    suspend fun sendTraktScrobble(
+        action: String,
+        type: String,
+        tmdbId: Int,
+        progress: Float,
+        season: Int? = null,
+        episode: Int? = null
+    ) {
         if (TRAKT_ACCESS_TOKEN.isEmpty()) return
         val url = "https://api.trakt.tv/scrobble/$action"
         val headers = mapOf(
-            "Content-Type" to "application/json", "trakt-api-version" to "2",
-            "trakt-api-key" to TRAKT_CLIENT_ID, "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
+            "Content-Type" to "application/json",
+            "trakt-api-version" to "2",
+            "trakt-api-key" to TRAKT_CLIENT_ID,
+            "Authorization" to "Bearer $TRAKT_ACCESS_TOKEN"
         )
         val body = JSONObject()
         body.put("progress", progress)
@@ -93,11 +102,16 @@ class TwoNembedProvider : MainAPI() {
     )
 
     private fun img(path: String?, size: String = "w500") =
-        path?.takeIf { it.isNotEmpty() && it != "null" }?.let { "https://wsrv.nl/?url=image.tmdb.org/t/p/$size$it" }
+        path?.takeIf { it.isNotEmpty() && it != "null" }
+            ?.let { "https://wsrv.nl/?url=image.tmdb.org/t/p/$size$it" }
 
     private fun poster(path: String?) = img(path, "w500")
 
-    private val tmdbHosts = listOf(TMDB_BASE_URL, "https://api.tmdb.org/3", "https://api.themoviedb.org/3")
+    private val tmdbHosts = listOf(
+        TMDB_BASE_URL,
+        "https://api.tmdb.org/3",
+        "https://api.themoviedb.org/3"
+    )
 
     private suspend fun tmdbGet(path: String): String {
         var last: Exception? = null
@@ -120,18 +134,28 @@ class TwoNembedProvider : MainAPI() {
         return try {
             val response = tmdbGet("${request.data}?page=$page")
             val json = JSONObject(response)
-            val results = json.optJSONArray("results") ?: throw Exception(json.optString("status_message", "TMDB không trả results"))
+            val results = json.optJSONArray("results")
+                ?: throw Exception(json.optString("status_message", "TMDB không trả results"))
             val home = mutableListOf<SearchResponse>()
             for (i in 0 until results.length()) {
                 val item = results.getJSONObject(i)
-                val mediaType = item.optString("media_type", if (request.name.contains("TV")) "tv" else "movie")
+                val mediaType = item.optString(
+                    "media_type",
+                    if (request.name.contains("TV")) "tv" else "movie"
+                )
                 if (mediaType != "movie" && mediaType != "tv") continue
                 val id = item.optInt("id", 0)
                 if (id == 0) continue
                 val title = item.optString("title", item.optString("name"))
-                home.add(newMovieSearchResponse(title, "2embed:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
-                    this.posterUrl = poster(item.optString("poster_path"))
-                })
+                home.add(
+                    newMovieSearchResponse(
+                        title,
+                        "2embed:$mediaType:$id",
+                        if (mediaType == "tv") TvType.TvSeries else TvType.Movie
+                    ) {
+                        this.posterUrl = poster(item.optString("poster_path"))
+                    }
+                )
             }
             newHomePageResponse(request.name, home, hasNext = page < json.optInt("total_pages", 1))
         } catch (e: Exception) {
@@ -154,9 +178,15 @@ class TwoNembedProvider : MainAPI() {
                 val id = item.optInt("id", 0)
                 if (id == 0) continue
                 val title = item.optString("title", item.optString("name"))
-                out.add(newMovieSearchResponse(title, "2embed:$mediaType:$id", if (mediaType == "tv") TvType.TvSeries else TvType.Movie) {
-                    this.posterUrl = poster(item.optString("poster_path"))
-                })
+                out.add(
+                    newMovieSearchResponse(
+                        title,
+                        "2embed:$mediaType:$id",
+                        if (mediaType == "tv") TvType.TvSeries else TvType.Movie
+                    ) {
+                        this.posterUrl = poster(item.optString("poster_path"))
+                    }
+                )
             }
             out
         } catch (e: Exception) {
@@ -183,7 +213,8 @@ class TwoNembedProvider : MainAPI() {
             val title = json.optString("title", json.optString("name"))
             val description = json.optString("overview")
             val posterUrl = poster(json.optString("poster_path"))
-            val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
+            val year = json.optString("release_date", json.optString("first_air_date"))
+                .take(4).toIntOrNull()
 
             val canonical = "2embed:$mediaType:$tmdbIdInt"
 
@@ -192,7 +223,9 @@ class TwoNembedProvider : MainAPI() {
                 val seasonsCount = json.optInt("number_of_seasons", 1)
                 for (s in 1..seasonsCount) {
                     try {
-                        val seasonJson = JSONObject(app.get("$TMDB_BASE_URL/tv/$tmdbIdInt/season/$s?api_key=$TMDB_API_KEY").text)
+                        val seasonJson = JSONObject(
+                            app.get("$TMDB_BASE_URL/tv/$tmdbIdInt/season/$s?api_key=$TMDB_API_KEY").text
+                        )
                         val eps = seasonJson.optJSONArray("episodes") ?: continue
                         for (e in 0 until eps.length()) {
                             val ep = eps.getJSONObject(e)
@@ -242,8 +275,8 @@ class TwoNembedProvider : MainAPI() {
         isM3u8: Boolean = true,
         headers: Map<String, String> = emptyMap()
     ): ExtractorLink {
-        // Trên CloudStream 4.5.2, ExoPlayer phân loại MediaSource theo đuôi URL.
-        // Thêm #file.m3u8 giúp ExoPlayer luôn chọn HlsMediaSource thay vì ProgressiveMediaSource.
+        // CloudStream 4.5.2: ExoPlayer phân loại MediaSource theo đuôi URL.
+        // Thêm #file.m3u8 để buộc chọn HlsMediaSource thay vì ProgressiveMediaSource.
         val finalUrl = if (isM3u8 && !url.contains(".m3u8")) "$url#file.m3u8" else url
 
         return newExtractorLink(
@@ -259,7 +292,7 @@ class TwoNembedProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // 5. VIDEO INTERCEPTOR: TỰ ĐỘNG CẮT 70 BYTES HEADER ẢNH PNG GIẢ TRÊN TIKTOK CDN
+    // 5. VIDEO INTERCEPTOR: CẮT 70 BYTES HEADER PNG GIẢ TRÊN TIKTOK CDN
     // =====================================================================================
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
         return Interceptor { chain ->
@@ -279,8 +312,12 @@ class TwoNembedProvider : MainAPI() {
                 val body = response.body
                 if (body != null) {
                     val bytes = body.bytes()
-                    // 70 bytes header ảnh PNG giả + sync byte 0x47 (MPEG-TS) tại vị trí 70
-                    if (bytes.size > 70 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() && bytes[70] == 0x47.toByte()) {
+                    // 70 bytes header PNG giả + sync byte 0x47 (MPEG-TS) tại vị trí 70
+                    if (bytes.size > 70 &&
+                        bytes[0] == 0x89.toByte() &&
+                        bytes[1] == 0x50.toByte() &&
+                        bytes[70] == 0x47.toByte()
+                    ) {
                         val stripped = bytes.copyOfRange(70, bytes.size)
                         val mediaType = "video/mp2t".toMediaType()
                         return@Interceptor response.newBuilder()
@@ -321,7 +358,8 @@ class TwoNembedProvider : MainAPI() {
 
         TwoNembedApiServices.sendTraktScrobble("start", type, tmdbId, 0f, season, episode)
 
-        val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+        val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
         var foundLink = false
         val registeredSubs = mutableSetOf<String>()
 
@@ -331,7 +369,8 @@ class TwoNembedProvider : MainAPI() {
         val nontongoPlayerUrl = if (type == "movie") {
             "https://nontongo.win/01aus/player.php?id=$tmdbId&type=movie&autoplay=true"
         } else {
-            "https://nontongo.win/01aus/player.php?id=$tmdbId&season=${season ?: 1}&episode=${episode ?: 1}&type=tv&autoplay=true"
+            "https://nontongo.win/01aus/player.php?id=$tmdbId" +
+                    "&season=${season ?: 1}&episode=${episode ?: 1}&type=tv&autoplay=true"
         }
 
         try {
@@ -341,7 +380,7 @@ class TwoNembedProvider : MainAPI() {
                 headers = mapOf("User-Agent" to ua, "Referer" to "https://nontongo.win/")
             ).text
 
-            // 1. Trích xuất phụ đề sạch từ các thẻ <track>
+            // 1. Trích xuất phụ đề từ <track> (forEach OK vì không có suspend)
             val trackRegex = Regex(
                 """<track[^>]+(?:data-src|src)=["']([^"']+)["'][^>]*label=["']([^"']+)["']|<track[^>]+label=["']([^"']+)["'][^>]+(?:data-src|src)=["']([^"']+)["']""",
                 RegexOption.IGNORE_CASE
@@ -356,12 +395,16 @@ class TwoNembedProvider : MainAPI() {
                 }
             }
 
-            // 2. Trích xuất luồng phát video trực tiếp từ các nút dropdown-item
-            val buttonRegex = Regex("""<button[^>]*data-url=["']([^"']+)["'][^>]*>(.*?)</button>""", RegexOption.DOTALL)
-            buttonRegex.findAll(playerHtml).forEach { match ->
+            // 2. Trích xuất luồng phát video — DÙNG for LOOP vì có suspend bên trong
+            val buttonRegex = Regex(
+                """<button[^>]*data-url=["']([^"']+)["'][^>]*>(.*?)</button>""",
+                RegexOption.DOTALL
+            )
+            for (match in buttonRegex.findAll(playerHtml)) {
                 val rawUrl = match.groupValues[1].replace("&amp;", "&")
                 val labelHtml = match.groupValues[2]
-                val serverName = labelHtml.replace(Regex("<[^>]+>"), "").trim().ifEmpty { "Fast Server" }
+                val serverName = labelHtml.replace(Regex("<[^>]+>"), "").trim()
+                    .ifEmpty { "Fast Server" }
 
                 if (rawUrl.contains("svsoapp") && rawUrl.contains(".m3u8")) {
                     val link = safeCreateExtractorLink(
@@ -369,7 +412,8 @@ class TwoNembedProvider : MainAPI() {
                         name = "2embed - $serverName",
                         url = rawUrl,
                         referer = "https://nontongo.win/",
-                        quality = if (serverName.contains("HD", true)) Qualities.P1080.value else Qualities.P720.value,
+                        quality = if (serverName.contains("HD", true))
+                            Qualities.P1080.value else Qualities.P720.value,
                         isM3u8 = true,
                         headers = mapOf(
                             "User-Agent" to ua,
@@ -401,10 +445,19 @@ class TwoNembedProvider : MainAPI() {
 
         for (playerUrl in embedCandidates) {
             try {
-                val pDomain = Regex("""^(https?://[^/]+)""").find(playerUrl)?.groupValues?.get(1) ?: "https://vidsrc.buzz"
-                val pHtml = app.get(playerUrl, headers = mapOf("User-Agent" to ua, "Referer" to "https://www.2embed.cc/")).text
+                val pDomain = Regex("""^(https?://[^/]+)""").find(playerUrl)
+                    ?.groupValues?.get(1) ?: "https://vidsrc.buzz"
+                val pHtml = app.get(
+                    playerUrl,
+                    headers = mapOf(
+                        "User-Agent" to ua,
+                        "Referer" to "https://www.2embed.cc/"
+                    )
+                ).text
 
-                val qMatch = Regex("""var Q\s*=\s*(\{.*?\});""", RegexOption.DOTALL).find(pHtml) ?: continue
+                // RegexOption.DOTALL BẮT BUỘC vì Q object trải qua nhiều dòng
+                val qMatch = Regex("""var Q\s*=\s*(\{.*?\});""", RegexOption.DOTALL)
+                    .find(pHtml) ?: continue
                 val qJson = JSONObject(qMatch.groupValues[1])
                 val token = qJson.optString("t")
                 val qType = qJson.optString("type", type)
@@ -414,25 +467,33 @@ class TwoNembedProvider : MainAPI() {
 
                 // Lấy phụ đề OpenSubtitles
                 try {
-                    val subsUrl = "$pDomain/pl/api.php?a=subs&type=$qType&id=$qId&s=$qS&e=$qE&t=${URLEncoder.encode(token, "UTF-8")}"
-                    val subsRes = app.get(subsUrl, headers = mapOf(
-                        "User-Agent" to ua,
-                        "Referer" to playerUrl,
-                        "Origin" to pDomain,
-                        "Accept" to "application/json"
-                    )).text
+                    val subsUrl = "$pDomain/pl/api.php?a=subs&type=$qType&id=$qId&s=$qS&e=$qE" +
+                            "&t=${URLEncoder.encode(token, "UTF-8")}"
+                    val subsRes = app.get(
+                        subsUrl,
+                        headers = mapOf(
+                            "User-Agent" to ua,
+                            "Referer" to playerUrl,
+                            "Origin" to pDomain,
+                            "Accept" to "application/json"
+                        )
+                    ).text
 
                     if (subsRes.trimStart().startsWith("{")) {
                         val subsJson = JSONObject(subsRes)
-                        val subsArray = subsJson.optJSONArray("subtitles") ?: subsJson.optJSONArray("subs")
+                        val subsArray = subsJson.optJSONArray("subtitles")
+                            ?: subsJson.optJSONArray("subs")
                         if (subsArray != null) {
                             for (i in 0 until subsArray.length()) {
                                 val sub = subsArray.getJSONObject(i)
-                                val label = sub.optString("label", sub.optString("lang", "Subtitle"))
+                                val label = sub.optString(
+                                    "label",
+                                    sub.optString("lang", "Subtitle")
+                                )
                                 val subRef = sub.optString("ref")
                                 var directUrl = sub.optString("url")
 
-                                // Giải mã token Base64 JWT để lấy trực tiếp URL OpenSubtitles .vtt
+                                // Giải mã token Base64 JWT để lấy URL OpenSubtitles .vtt
                                 if (directUrl.isEmpty() && subRef.isNotEmpty()) {
                                     try {
                                         val payload = subRef.substringBefore(".")
@@ -443,10 +504,14 @@ class TwoNembedProvider : MainAPI() {
                                     } catch (_: Exception) { }
                                 }
 
-                                val finalSubUrl = if (directUrl.isNotEmpty()) directUrl else "$pDomain/pl/api.php?a=sub&ref=${URLEncoder.encode(subRef, "UTF-8")}"
+                                val finalSubUrl = if (directUrl.isNotEmpty()) directUrl
+                                else "$pDomain/pl/api.php?a=sub&ref=${URLEncoder.encode(subRef, "UTF-8")}"
+
                                 if (!registeredSubs.contains(finalSubUrl)) {
                                     registeredSubs.add(finalSubUrl)
-                                    subtitleCallback.invoke(SubtitleFile("$label (OpenSubs)", finalSubUrl))
+                                    subtitleCallback.invoke(
+                                        SubtitleFile("$label (OpenSubs)", finalSubUrl)
+                                    )
                                 }
                             }
                         }
@@ -465,20 +530,27 @@ class TwoNembedProvider : MainAPI() {
                             val sName = serverObj.optString("name", "Server ${i + 1}")
                             val sRef = serverObj.optString("ref")
 
-                            val playApiUrl = "$pDomain/pl/api.php?a=play&ref=${URLEncoder.encode(sRef, "UTF-8")}&t=${URLEncoder.encode(token, "UTF-8")}"
-                            val playRes = app.get(playApiUrl, headers = mapOf(
-                                "User-Agent" to ua,
-                                "Referer" to playerUrl,
-                                "Origin" to pDomain,
-                                "Accept" to "application/json"
-                            )).text
+                            val playApiUrl = "$pDomain/pl/api.php?a=play" +
+                                    "&ref=${URLEncoder.encode(sRef, "UTF-8")}" +
+                                    "&t=${URLEncoder.encode(token, "UTF-8")}"
+                            val playRes = app.get(
+                                playApiUrl,
+                                headers = mapOf(
+                                    "User-Agent" to ua,
+                                    "Referer" to playerUrl,
+                                    "Origin" to pDomain,
+                                    "Accept" to "application/json"
+                                )
+                            ).text
 
                             val playJson = JSONObject(playRes)
                             var streamUrl = playJson.optString("url")
                             if (streamUrl.isEmpty()) continue
 
                             if (streamUrl.startsWith("/")) {
-                                streamUrl = if (streamUrl.startsWith("/pl/")) "$pDomain$streamUrl" else "$pDomain/pl$streamUrl"
+                                streamUrl = if (streamUrl.startsWith("/pl/"))
+                                    "$pDomain$streamUrl"
+                                else "$pDomain/pl$streamUrl"
                             }
 
                             val link = safeCreateExtractorLink(
