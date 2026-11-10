@@ -4,7 +4,6 @@ package com.lagradost
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import org.json.JSONObject
 import java.net.URLEncoder
@@ -15,7 +14,6 @@ import kotlin.io.encoding.ExperimentalEncodingApi
 // 1. CẤU HÌNH API VÀ ĐỊNH DANH
 // =====================================================================================
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
-private const val OMDB_API_KEY = "a116862a"
 private const val TRAKT_CLIENT_ID = "gMysuKTAakLkXGoR9aMnwJLcffCwNWvKLM8MNNBs9m0"
 private const val TRAKT_ACCESS_TOKEN = ""
 
@@ -30,21 +28,9 @@ private fun parseRef(s: String): MediaRef? {
 }
 
 // =====================================================================================
-// 2. DỊCH VỤ HỖ TRỢ (OMDb, Trakt)
+// 2. DỊCH VỤ HỖ TRỢ (Trakt Scrobble)
 // =====================================================================================
 object TwoNembedApiServices {
-    suspend fun getOmdbData(imdbId: String): String? {
-        return try {
-            val res = app.get("https://www.omdbapi.com/?apikey=$OMDB_API_KEY&i=$imdbId").text
-            val json = JSONObject(res)
-            val rating = json.optString("imdbRating")
-            if (rating.isNotEmpty() && rating != "N/A") rating else null
-        } catch (t: Throwable) {
-            ClipboardLogger.log("OMDb Error", t.message ?: "Unknown")
-            null
-        }
-    }
-
     suspend fun sendTraktScrobble(action: String, type: String, tmdbId: Int, progress: Float, season: Int? = null, episode: Int? = null) {
         if (TRAKT_ACCESS_TOKEN.isEmpty()) return
         val url = "https://api.trakt.tv/scrobble/$action"
@@ -177,18 +163,11 @@ class TwoNembedProvider : MainAPI() {
         val plot = detailsJson.optString("overview")
         val year = detailsJson.optString("release_date", detailsJson.optString("first_air_date")).take(4).toIntOrNull()
 
-        var rating = detailsJson.optDouble("vote_average", 0.0).toString()
-        val imdbId = detailsJson.optJSONObject("external_ids")?.optString("imdb_id")
-        if (!imdbId.isNullOrEmpty()) {
-            TwoNembedApiServices.getOmdbData(imdbId)?.let { rating = it }
-        }
-
         return if (type == "movie") {
             newMovieLoadResponse(title, url, TvType.Movie, "2embed:movie:$tmdbId") {
                 this.posterUrl = posterPath
                 this.plot = plot
                 this.year = year
-                this.rating = rating.toIntOrNull()
             }
         } else {
             val episodes = mutableListOf<Episode>()
@@ -219,7 +198,6 @@ class TwoNembedProvider : MainAPI() {
                 this.posterUrl = posterPath
                 this.plot = plot
                 this.year = year
-                this.rating = rating.toIntOrNull()
             }
         }
     }
@@ -243,7 +221,7 @@ class TwoNembedProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // 4. LOAD LINKS: BẮT LINK VÀ KHẮC PHỤC LỖI 2004/2001 TRÊN EXOPLAYER
+    // 4. LOAD LINKS: BẮT LINK VÀ GẮN BROWSER HEADERS CHỐNG LỖI 2004/2001
     // =====================================================================================
     override suspend fun loadLinks(
         data: String,
@@ -345,7 +323,7 @@ class TwoNembedProvider : MainAPI() {
                     ClipboardLogger.log("Lỗi phụ đề", t.message ?: "")
                 }
 
-                // Bộ headers chuẩn trình duyệt - BẮT BUỘC ĐỂ KHÔNG BỊ EXOPLAYER LỖI 2004 (403 Forbidden)
+                // Gắn đầy đủ browser headers - CHỐNG TRIỆT ĐỂ LỖI 2004 (403 Forbidden)
                 val streamHeaders = mapOf(
                     "User-Agent" to browserUa,
                     "Origin" to pDomain,
@@ -384,11 +362,11 @@ class TwoNembedProvider : MainAPI() {
 
                         ClipboardLogger.log("8. Thành công", "$sName -> $streamUrl")
 
-                        // 1. Luôn thêm Master HLS link đầy đủ headers
+                        // Giao Master HLS cho ExoPlayer xử lý tự động đa độ phân giải
                         callback.invoke(
                             ExtractorLink(
                                 source = this.name,
-                                name = "2embed - $sName (Auto HLS)",
+                                name = "2embed - $sName",
                                 url = streamUrl,
                                 referer = "$pDomain/",
                                 quality = Qualities.P1080.value,
@@ -397,35 +375,6 @@ class TwoNembedProvider : MainAPI() {
                             )
                         )
                         linkCount++
-
-                        // 2. Phân tách đa chất lượng qua M3u8Helper và bắt buộc gắn lại streamHeaders
-                        try {
-                            val subStreams = M3u8Helper.m3u8Generation(
-                                M3u8Helper.M3u8Stream(
-                                    streamUrl = streamUrl,
-                                    headers = streamHeaders,
-                                    referer = "$pDomain/"
-                                ),
-                                returnOnError = true
-                            )
-                            if (!subStreams.isNullOrEmpty()) {
-                                for (st in subStreams) {
-                                    callback.invoke(
-                                        ExtractorLink(
-                                            source = this.name,
-                                            name = "2embed - $sName ${st.name}",
-                                            url = st.url,
-                                            referer = "$pDomain/",
-                                            quality = st.quality,
-                                            type = ExtractorLinkType.M3U8,
-                                            headers = streamHeaders
-                                        )
-                                    )
-                                    linkCount++
-                                }
-                                ClipboardLogger.log("9. Đa chất lượng", "$sName: Nạp thêm ${subStreams.size} chất lượng stream")
-                            }
-                        } catch (_: Throwable) {}
                     } catch (t: Throwable) {
                         ClipboardLogger.log("Lỗi Server", t.message ?: "")
                     }
@@ -436,7 +385,7 @@ class TwoNembedProvider : MainAPI() {
         }
 
         // =================================================================================
-        // NGUỒN 3: NontonGo Mirror (Dự phòng trực tiếp, không qua vidsrc.buzz)
+        // NGUỒN 3: NontonGo Mirror (Dự phòng trực tiếp)
         // =================================================================================
         try {
             val nontonEmbed = if (type == "movie") {
@@ -444,7 +393,7 @@ class TwoNembedProvider : MainAPI() {
             } else {
                 "https://www.nontongo.win/embed/tv/$tmdbId/$season/$episode"
             }
-            ClipboardLogger.log("10. Dự phòng NontonGo", "Đang nạp: $nontonEmbed")
+            ClipboardLogger.log("9. Dự phòng NontonGo", "Đang nạp: $nontonEmbed")
 
             val nontonDoc = app.get(nontonEmbed, headers = mapOf("User-Agent" to browserUa, "Referer" to "https://www.nontongo.win/"))
             if (nontonDoc.code == 200 && nontonDoc.text.isNotEmpty()) {
