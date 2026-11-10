@@ -6,8 +6,8 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import okhttp3.Interceptor
-import okhttp3.MediaType
-import okhttp3.ResponseBody
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.Base64
@@ -179,12 +179,12 @@ class TwoNembedProvider : MainAPI() {
             val response = app.get("$TMDB_BASE_URL/$mediaType/$tmdbIdInt?api_key=$TMDB_API_KEY").text
             val json = JSONObject(response)
             if (json.has("status_code")) throw Exception("TMDB: ${json.optString("status_message")}")
-            
+
             val title = json.optString("title", json.optString("name"))
             val description = json.optString("overview")
             val posterUrl = poster(json.optString("poster_path"))
             val year = json.optString("release_date", json.optString("first_air_date")).take(4).toIntOrNull()
-            
+
             val canonical = "2embed:$mediaType:$tmdbIdInt"
 
             if (mediaType == "tv") {
@@ -231,9 +231,9 @@ class TwoNembedProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // 4. BỘ TẠO LINK AN TOÀN TƯƠNG THÍCH CẢ CLOUDSTREAM 4.5.2 VÀ 4.8 PRE
+    // 4. BỘ TẠO LINK AN TOÀN — DÙNG newExtractorLink (SUSPEND)
     // =====================================================================================
-    private fun safeCreateExtractorLink(
+    private suspend fun safeCreateExtractorLink(
         source: String,
         name: String,
         url: String,
@@ -242,85 +242,24 @@ class TwoNembedProvider : MainAPI() {
         isM3u8: Boolean = true,
         headers: Map<String, String> = emptyMap()
     ): ExtractorLink {
-        // ĐẢM BẢO QUAN TRỌNG: Trên CloudStream 4.5.2, ExoPlayer phân loại MediaSource theo đuôi URL.
-        // Thêm #file.m3u8 giúp ExoPlayer 4.5.2 luôn chọn HlsMediaSource thay vì ProgressiveMediaSource (MP4)!
+        // Trên CloudStream 4.5.2, ExoPlayer phân loại MediaSource theo đuôi URL.
+        // Thêm #file.m3u8 giúp ExoPlayer luôn chọn HlsMediaSource thay vì ProgressiveMediaSource.
         val finalUrl = if (isM3u8 && !url.contains(".m3u8")) "$url#file.m3u8" else url
 
-        // Cách 1: Thử newExtractorLink
-        try {
-            return newExtractorLink(
-                source = source,
-                name = name,
-                url = finalUrl,
-                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-            ) {
-                this.referer = referer
-                this.quality = quality
-                this.headers = headers
-            }
-        } catch (_: Throwable) { }
-
-        // Cách 2: Thử constructor trực tiếp
-        try {
-            return ExtractorLink(
-                source = source,
-                name = name,
-                url = finalUrl,
-                referer = referer,
-                quality = quality,
-                type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO,
-                headers = headers
-            )
-        } catch (_: Throwable) { }
-
-        // Cách 3: Reflection tự động khớp Constructor của phiên bản CloudStream đang chạy (4.5.2 vs 4.8)
-        try {
-            val clazz = ExtractorLink::class.java
-            val ctors = clazz.declaredConstructors.sortedByDescending { it.parameterTypes.size }
-            for (ctor in ctors) {
-                try {
-                    ctor.isAccessible = true
-                    val pts = ctor.parameterTypes
-                    val args = arrayOfNulls<Any>(pts.size)
-                    var ok = true
-                    var strIdx = 0
-                    for (i in pts.indices) {
-                        val p = pts[i]
-                        when {
-                            p == String::class.java -> {
-                                args[i] = when (strIdx++) {
-                                    0 -> source
-                                    1 -> name
-                                    2 -> finalUrl
-                                    3 -> referer
-                                    else -> ""
-                                }
-                            }
-                            p == Int::class.javaPrimitiveType || p == java.lang.Integer::class.java -> args[i] = quality
-                            p == Boolean::class.javaPrimitiveType || p == java.lang.Boolean::class.java -> args[i] = isM3u8
-                            p == Map::class.java -> args[i] = headers
-                            p == ExtractorLinkType::class.java -> args[i] = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
-                            p == List::class.java -> args[i] = emptyList<Any>()
-                            p.name.contains("DefaultConstructorMarker") -> args[i] = null
-                            else -> {
-                                ok = false
-                            }
-                        }
-                    }
-                    if (ok) {
-                        val res = ctor.newInstance(*args) as? ExtractorLink
-                        if (res != null) return res
-                    }
-                } catch (_: Throwable) { }
-            }
-        } catch (_: Throwable) { }
-
-        // Fallback tối giản cho CloudStream cũ
-        return ExtractorLink(source, name, finalUrl, referer, quality)
+        return newExtractorLink(
+            source = source,
+            name = name,
+            url = finalUrl,
+            type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+        ) {
+            this.referer = referer
+            this.quality = quality
+            this.headers = headers
+        }
     }
 
     // =====================================================================================
-    // 5. VIDEO INTERCEPTOR: TỰ ĐỘNG CẮT 70 BYTES HEADER ẢNH PNG GIẢ TRÊN TIKTOK CDN CHO 4.5.2
+    // 5. VIDEO INTERCEPTOR: TỰ ĐỘNG CẮT 70 BYTES HEADER ẢNH PNG GIẢ TRÊN TIKTOK CDN
     // =====================================================================================
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
         return Interceptor { chain ->
@@ -336,23 +275,22 @@ class TwoNembedProvider : MainAPI() {
             val response = chain.proceed(builder.build())
             val url = request.url.toString()
 
-            // Nếu phân đoạn video chứa header ảnh PNG giả mạo từ TikTok CDN
             if (url.contains("tiktokcdn.com") || url.contains(".image")) {
                 val body = response.body
                 if (body != null) {
                     val bytes = body.bytes()
-                    // Nhận dạng chính xác 70 bytes header ảnh PNG (\x89PNG và sync byte 0x47 tại vị trí 70)
+                    // 70 bytes header ảnh PNG giả + sync byte 0x47 (MPEG-TS) tại vị trí 70
                     if (bytes.size > 70 && bytes[0] == 0x89.toByte() && bytes[1] == 0x50.toByte() && bytes[70] == 0x47.toByte()) {
                         val stripped = bytes.copyOfRange(70, bytes.size)
-                        val mediaType = MediaType.parse("video/mp2t")
+                        val mediaType = "video/mp2t".toMediaType()
                         return@Interceptor response.newBuilder()
-                            .body(ResponseBody.create(mediaType, stripped))
+                            .body(stripped.toResponseBody(mediaType))
                             .header("Content-Type", "video/mp2t")
                             .build()
                     } else {
                         val mediaType = body.contentType()
                         return@Interceptor response.newBuilder()
-                            .body(ResponseBody.create(mediaType, bytes))
+                            .body(bytes.toResponseBody(mediaType))
                             .build()
                     }
                 }
@@ -388,7 +326,7 @@ class TwoNembedProvider : MainAPI() {
         val registeredSubs = mutableSetOf<String>()
 
         // ---------------------------------------------------------------------------------
-        // NGUỒN 1 (ƯU TIÊN TUYỆT ĐỐI - CHUẨN HD SẠCH): NontonGo Direct Player (svsoapp)
+        // NGUỒN 1: NontonGo Direct Player (svsoapp)
         // ---------------------------------------------------------------------------------
         val nontongoPlayerUrl = if (type == "movie") {
             "https://nontongo.win/01aus/player.php?id=$tmdbId&type=movie&autoplay=true"
@@ -450,7 +388,7 @@ class TwoNembedProvider : MainAPI() {
         }
 
         // ---------------------------------------------------------------------------------
-        // NGUỒN 2: Bổ sung phụ đề OpenSubtitles & các luồng từ vidsrc.buzz / videm.buzz
+        // NGUỒN 2: vidsrc.buzz / videm.buzz (phụ đề OpenSubtitles + máy chủ stream)
         // ---------------------------------------------------------------------------------
         val embedCandidates = mutableListOf<String>()
         if (type == "movie") {
@@ -466,7 +404,7 @@ class TwoNembedProvider : MainAPI() {
                 val pDomain = Regex("""^(https?://[^/]+)""").find(playerUrl)?.groupValues?.get(1) ?: "https://vidsrc.buzz"
                 val pHtml = app.get(playerUrl, headers = mapOf("User-Agent" to ua, "Referer" to "https://www.2embed.cc/")).text
 
-                val qMatch = Regex("""var Q\s*=\s*(\{.*?\});""").find(pHtml) ?: continue
+                val qMatch = Regex("""var Q\s*=\s*(\{.*?\});""", RegexOption.DOTALL).find(pHtml) ?: continue
                 val qJson = JSONObject(qMatch.groupValues[1])
                 val token = qJson.optString("t")
                 val qType = qJson.optString("type", type)
@@ -474,7 +412,7 @@ class TwoNembedProvider : MainAPI() {
                 val qS = qJson.optInt("s", season ?: 0)
                 val qE = qJson.optInt("e", episode ?: 0)
 
-                // Lấy phụ đề OpenSubtitles từ vidsrc.buzz
+                // Lấy phụ đề OpenSubtitles
                 try {
                     val subsUrl = "$pDomain/pl/api.php?a=subs&type=$qType&id=$qId&s=$qS&e=$qE&t=${URLEncoder.encode(token, "UTF-8")}"
                     val subsRes = app.get(subsUrl, headers = mapOf(
@@ -518,7 +456,7 @@ class TwoNembedProvider : MainAPI() {
                     ClipboardLogger.logAndCopy("Vidsrc Subs Error", e.message ?: "")
                 }
 
-                // Nạp các luồng máy chủ vidsrc.buzz (được tự động strip PNG header qua getVideoInterceptor)
+                // Nạp các luồng máy chủ vidsrc.buzz
                 val servers = qJson.optJSONObject("ssr")?.optJSONArray("servers")
                 if (servers != null) {
                     for (i in 0 until servers.length()) {
