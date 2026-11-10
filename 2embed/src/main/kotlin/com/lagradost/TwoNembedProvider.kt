@@ -16,11 +16,7 @@ import java.util.regex.Pattern
 // =====================================================================================
 // STUB LOGGER (nếu project đã có ClipboardLogger ở file khác → XÓA object này đi)
 // =====================================================================================
-object ClipboardLogger {
-    fun logAndCopy(tag: String, message: String) {
-        android.util.Log.d("2embed", "[$tag] $message")
-    }
-}
+
 
 // =====================================================================================
 // 1. CẤU HÌNH API KEY VÀ ĐỊNH DANH
