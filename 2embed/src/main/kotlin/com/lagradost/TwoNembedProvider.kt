@@ -1,10 +1,11 @@
-package com.lagradost
+vpackage com.lagradost
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlin.text.RegexOption          // ← THÊM DÒNG NÀY (explicit import, thắng wildcard)
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
@@ -275,8 +276,6 @@ class TwoNembedProvider : MainAPI() {
         isM3u8: Boolean = true,
         headers: Map<String, String> = emptyMap()
     ): ExtractorLink {
-        // CloudStream 4.5.2: ExoPlayer phân loại MediaSource theo đuôi URL.
-        // Thêm #file.m3u8 để buộc chọn HlsMediaSource thay vì ProgressiveMediaSource.
         val finalUrl = if (isM3u8 && !url.contains(".m3u8")) "$url#file.m3u8" else url
 
         return newExtractorLink(
@@ -312,7 +311,6 @@ class TwoNembedProvider : MainAPI() {
                 val body = response.body
                 if (body != null) {
                     val bytes = body.bytes()
-                    // 70 bytes header PNG giả + sync byte 0x47 (MPEG-TS) tại vị trí 70
                     if (bytes.size > 70 &&
                         bytes[0] == 0x89.toByte() &&
                         bytes[1] == 0x50.toByte() &&
@@ -337,7 +335,7 @@ class TwoNembedProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // 6. LOAD LINKS: BẮT LINK PHÁT SẠCH VÀ PHỤ ĐỀ
+    // 6. LOAD LINKS
     // =====================================================================================
     override suspend fun loadLinks(
         data: String,
@@ -380,10 +378,10 @@ class TwoNembedProvider : MainAPI() {
                 headers = mapOf("User-Agent" to ua, "Referer" to "https://nontongo.win/")
             ).text
 
-            // 1. Trích xuất phụ đề từ <track> (forEach OK vì không có suspend)
+            // 1. Phụ đề từ <track>
             val trackRegex = Regex(
                 """<track[^>]+(?:data-src|src)=["']([^"']+)["'][^>]*label=["']([^"']+)["']|<track[^>]+label=["']([^"']+)["'][^>]+(?:data-src|src)=["']([^"']+)["']""",
-                RegexOption.IGNORE_CASE
+                kotlin.text.RegexOption.IGNORE_CASE   // ← fully qualify để chắc chắn
             )
             trackRegex.findAll(playerHtml).forEach { match ->
                 val subUrl = match.groupValues[1].ifEmpty { match.groupValues[4] }
@@ -395,10 +393,10 @@ class TwoNembedProvider : MainAPI() {
                 }
             }
 
-            // 2. Trích xuất luồng phát video — DÙNG for LOOP vì có suspend bên trong
+            // 2. Stream từ nút button — for loop vì có suspend
             val buttonRegex = Regex(
                 """<button[^>]*data-url=["']([^"']+)["'][^>]*>(.*?)</button>""",
-                RegexOption.DOTALL
+                kotlin.text.RegexOption.DOTALL        // ← fully qualify
             )
             for (match in buttonRegex.findAll(playerHtml)) {
                 val rawUrl = match.groupValues[1].replace("&amp;", "&")
@@ -432,7 +430,7 @@ class TwoNembedProvider : MainAPI() {
         }
 
         // ---------------------------------------------------------------------------------
-        // NGUỒN 2: vidsrc.buzz / videm.buzz (phụ đề OpenSubtitles + máy chủ stream)
+        // NGUỒN 2: vidsrc.buzz / videm.buzz
         // ---------------------------------------------------------------------------------
         val embedCandidates = mutableListOf<String>()
         if (type == "movie") {
@@ -455,9 +453,11 @@ class TwoNembedProvider : MainAPI() {
                     )
                 ).text
 
-                // RegexOption.DOTALL BẮT BUỘC vì Q object trải qua nhiều dòng
-                val qMatch = Regex("""var Q\s*=\s*(\{.*?\});""", RegexOption.DOTALL)
-                    .find(pHtml) ?: continue
+                // Regex DOTALL — fully qualify
+                val qMatch = Regex(
+                    """var Q\s*=\s*(\{.*?\});""",
+                    kotlin.text.RegexOption.DOTALL
+                ).find(pHtml) ?: continue
                 val qJson = JSONObject(qMatch.groupValues[1])
                 val token = qJson.optString("t")
                 val qType = qJson.optString("type", type)
@@ -465,7 +465,7 @@ class TwoNembedProvider : MainAPI() {
                 val qS = qJson.optInt("s", season ?: 0)
                 val qE = qJson.optInt("e", episode ?: 0)
 
-                // Lấy phụ đề OpenSubtitles
+                // Phụ đề OpenSubtitles
                 try {
                     val subsUrl = "$pDomain/pl/api.php?a=subs&type=$qType&id=$qId&s=$qS&e=$qE" +
                             "&t=${URLEncoder.encode(token, "UTF-8")}"
@@ -493,7 +493,6 @@ class TwoNembedProvider : MainAPI() {
                                 val subRef = sub.optString("ref")
                                 var directUrl = sub.optString("url")
 
-                                // Giải mã token Base64 JWT để lấy URL OpenSubtitles .vtt
                                 if (directUrl.isEmpty() && subRef.isNotEmpty()) {
                                     try {
                                         val payload = subRef.substringBefore(".")
@@ -521,7 +520,7 @@ class TwoNembedProvider : MainAPI() {
                     ClipboardLogger.logAndCopy("Vidsrc Subs Error", e.message ?: "")
                 }
 
-                // Nạp các luồng máy chủ vidsrc.buzz
+                // Các luồng máy chủ vidsrc
                 val servers = qJson.optJSONObject("ssr")?.optJSONArray("servers")
                 if (servers != null) {
                     for (i in 0 until servers.length()) {
@@ -588,5 +587,5 @@ class TwoNembedProvider : MainAPI() {
     }
 }
 
-// Typealias để tương thích cả 2 cách gọi
+// Typealias
 typealias TwoEmbedProvider = TwoNembedProvider
