@@ -194,9 +194,9 @@ class KRX18Provider : MainAPI() {
                     try {
                         var got = false
                         loadExtractor(embed, "$mainUrl/", subtitleCallback) { got = true; callback(it) }
-                        if (!got && !found) {
+                        if (!got) {
                             val seen = mutableListOf<String>()
-                            val hit = sniffStream(embed, "$mainUrl/", ua, seen, Regex("""\.m3u8|\.mp4(\?|$)|\.mpd|/hls/\d{3,4}/""", RegexOption.IGNORE_CASE), 25_000L)
+                            val hit = sniffStream(embed, "$mainUrl/", ua, seen, Regex("""\.m3u8|\.mp4(\?|$)|\.mpd|/hls/\d{3,4}/""", RegexOption.IGNORE_CASE), 30_000L, embed.contains("loadvid"))
                             ClipboardLogger.logAndCopy("Server $n WebView", "hit=$hit\nrequests(${seen.size}):\n" + seen.joinToString("\n"))
                             if (hit != null) {
                                 val o = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: mainUrl
@@ -233,7 +233,7 @@ class KRX18Provider : MainAPI() {
     // và bắt URL .m3u8/.mpd đầu tiên mà trang gọi.
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>, streamRegex: Regex, timeoutMs: Long = 45_000L): String? {
+    private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>, streamRegex: Regex, timeoutMs: Long = 45_000L, hookFetch: Boolean = false): String? {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
@@ -248,11 +248,13 @@ class KRX18Provider : MainAPI() {
                     val h = 1920
                     val wv = WebView(ctx)
                     var finished = false
+                    val popups = ArrayList<WebView>()
                     fun finish(res: String?) {
                         if (finished) return
                         finished = true
                         handler.removeCallbacksAndMessages(null)
                         try {
+                            popups.toList().forEach { pp -> try { pp.destroy() } catch (_: Exception) {} }
                             wv.stopLoading()
                             (wv.parent as? ViewGroup)?.removeView(wv)
                             wv.destroy()
@@ -261,20 +263,61 @@ class KRX18Provider : MainAPI() {
                         cont.resume(res)
                     }
                     val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
+                    val strictPlayerEarly = pageUrl.contains("mov18plus") || pageUrl.contains("loadvid")
                     wv.settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
                         mediaPlaybackRequiresUserGesture = false
-                        javaScriptCanOpenWindowsAutomatically = false
-                        setSupportMultipleWindows(false)
+                        javaScriptCanOpenWindowsAutomatically = strictPlayerEarly
+                        setSupportMultipleWindows(strictPlayerEarly)
                         userAgentString = ua
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
                     // Popup quảng cáo: không mở cửa sổ mới
                     wv.webChromeClient = object : WebChromeClient() {
-                        override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
+                        // mov18plus / loadvid: phải để quảng cáo mở thật và tải xong (giữ 5s) rồi mới đóng, lần bấm Play sau đó mới phát
+                        override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean {
+                            if (!strictPlayerEarly || finished || popups.size >= 3) return false
+                            val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+                            return try {
+                                val pw = WebView(ctx)
+                                pw.settings.javaScriptEnabled = true
+                                pw.settings.domStorageEnabled = true
+                                pw.webViewClient = WebViewClient()
+                                pw.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
+                                pw.layout(0, 0, w, h)
+                                transport.webView = pw
+                                resultMsg.sendToTarget()
+                                popups.add(pw)
+                                ClipboardLogger.logAndCopy("Popup", "mở quảng cáo, đóng sau 5s")
+                                handler.postDelayed({
+                                    try { pw.stopLoading(); pw.destroy() } catch (_: Exception) {}
+                                    popups.remove(pw)
+                                    ClipboardLogger.logAndCopy("Popup", "đã đóng quảng cáo, bấm Play lại")
+                                }, 5000L)
+                                true
+                            } catch (_: Throwable) { false }
+                        }
+
+                        override fun onConsoleMessage(m: android.webkit.ConsoleMessage?): Boolean {
+                            val msg = m?.message() ?: return false
+                            if (msg.startsWith("KRXRT:")) {
+                                val body = msg.removePrefix("KRXRT:").replace("\\/", "/")
+                                ClipboardLogger.logAndCopy("resolve-token", body.take(600))
+                                val u = Regex("""https?://[^"'\s<>\\]+\.(?:m3u8|mp4|mpd)[^"'\s<>\\]*""", RegexOption.IGNORE_CASE).find(body)?.value
+                                    ?: Regex("""https?://[^"'\s<>\\]+(?:/hls/|/stream|/playlist|/manifest)[^"'\s<>\\]*""", RegexOption.IGNORE_CASE).find(body)?.value
+                                if (u != null) handler.post { finish(u) }
+                            }
+                            return true
+                        }
                     }
-                    val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
+                    // mov18plus.cloud và loadvid kiểm tra window.open/fetch/setTimeout có bị ghi đè (coi là tiện ích chặn quảng cáo) -> không ghi đè
+                    val strictPlayer = pageUrl.contains("mov18plus") || pageUrl.contains("loadvid")
+                    val fakePopup = if (strictPlayer) "" else "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
+                    val hookJs = "(function(){if(window.__krxh)return;window.__krxh=1;" +
+                        "var of=window.fetch;window.fetch=function(){var a=arguments,u=typeof a[0]==='string'?a[0]:(a[0]&&a[0].url)||'';" +
+                        "var p=of.apply(this,a);if(u.indexOf('resolve-token')>=0){p.then(function(r){return r.clone().text()}).then(function(t){console.log('KRXRT:'+t)}).catch(function(){})}return p};" +
+                        "var oo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){var x=this;if(u&&String(u).indexOf('resolve-token')>=0){x.addEventListener('load',function(){try{console.log('KRXRT:'+x.responseText)}catch(e){}})}return oo.apply(this,arguments)}})();"
                     val clickJs = "(function(){function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
                         "fire(document.getElementById('bigPlay'));" +
                         "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
@@ -282,6 +325,7 @@ class KRX18Provider : MainAPI() {
                     var taps = 0
                     fun tap() {
                         if (finished) return
+                        if (popups.isNotEmpty()) { handler.postDelayed({ tap() }, 1000); return }
                         taps++
                         try {
                             wv.evaluateJavascript(fakePopup + clickJs, null)
@@ -293,9 +337,13 @@ class KRX18Provider : MainAPI() {
                             d.recycle(); u.recycle()
                         } catch (_: Exception) {
                         }
-                        if (taps < 25) handler.postDelayed({ tap() }, 1500)
+                        if (taps < 40) handler.postDelayed({ tap() }, 1500)
                     }
                     wv.webViewClient = object : WebViewClient() {
+                        override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                            if (hookFetch) view?.evaluateJavascript(hookJs, null)
+                        }
+
                         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                             val u = request?.url?.toString() ?: return null
                             if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
