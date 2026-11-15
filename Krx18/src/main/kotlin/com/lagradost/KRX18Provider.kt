@@ -196,7 +196,7 @@ class KRX18Provider : MainAPI() {
                         loadExtractor(embed, "$mainUrl/", subtitleCallback) { got = true; callback(it) }
                         if (!got) {
                             val seen = mutableListOf<String>()
-                            val hit = sniffStream(embed, "$mainUrl/", ua, seen, Regex("""\.m3u8|\.mp4(\?|$)|\.mpd|/hls/\d{3,4}/""", RegexOption.IGNORE_CASE), 30_000L, embed.contains("loadvid"))
+                            val hit = sniffStream(embed, "$mainUrl/", ua, seen, Regex("""\.m3u8|\.mp4(\?|$)|\.mpd|/hls/\d{3,4}/""", RegexOption.IGNORE_CASE), (if (embed.contains("mov18plus") || embed.contains("loadvid")) 60_000L else 30_000L), embed.contains("loadvid"))
                             ClipboardLogger.logAndCopy("Server $n WebView", "hit=$hit\nrequests(${seen.size}):\n" + seen.joinToString("\n"))
                             if (hit != null) {
                                 val o = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: mainUrl
@@ -304,6 +304,17 @@ class KRX18Provider : MainAPI() {
 
                         override fun onConsoleMessage(m: android.webkit.ConsoleMessage?): Boolean {
                             val msg = m?.message() ?: return false
+                            if (msg.startsWith("KRXJW:")) {
+                                val urls = msg.removePrefix("KRXJW:").trim().split(" ").map { it.replace("\\/", "/") }.filter { it.startsWith("http") }
+                                ClipboardLogger.logAndCopy("jwplayer sources", urls.joinToString("\n").take(600))
+                                val u = urls.firstOrNull { Regex("""\.(m3u8|mp4|mpd)""", RegexOption.IGNORE_CASE).containsMatchIn(it) } ?: urls.firstOrNull()
+                                if (u != null) handler.post { finish(u) }
+                                return true
+                            }
+                            if (msg.startsWith("KRXDIAG:")) {
+                                ClipboardLogger.logAndCopy("Diag", msg.removePrefix("KRXDIAG:").take(900))
+                                return true
+                            }
                             if (msg.startsWith("KRXRT:")) {
                                 val body = msg.removePrefix("KRXRT:").replace("\\/", "/")
                                 ClipboardLogger.logAndCopy("resolve-token", body.take(600))
@@ -329,12 +340,18 @@ class KRX18Provider : MainAPI() {
                         "fire(document.getElementById('bigPlay'));" +
                         "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
                         "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();"
+                    val jwJs = "(function(){try{if(window.jwplayer){var j=jwplayer();var pl=j.getPlaylist&&j.getPlaylist();if(pl&&pl.length){var f=[];pl.forEach(function(it){(it.sources||[]).forEach(function(s){if(s.file)f.push(s.file)});if(it.file)f.push(it.file)});if(f.length)console.log('KRXJW:'+f.join(' '))}}}catch(e){}})();"
+                    val diagJs = "(function(){try{var e=document.elementFromPoint(innerWidth/2,innerHeight/2);var v=document.querySelector('video');" +
+                        "var jw='';try{jw=window.jwplayer?jwplayer().getState():'nojw'}catch(x){jw='jwerr'}" +
+                        "console.log('KRXDIAG:center='+(e?e.tagName+'#'+e.id+'.'+(typeof e.className==='string'?e.className:'')+' '+(e.outerHTML||'').slice(0,200):'null')+' | video='+(v?('src='+(v.currentSrc||v.src)+' rs='+v.readyState+' paused='+v.paused):'none')+' | jw='+jw+' | iframes='+document.querySelectorAll('iframe').length)}catch(x){console.log('KRXDIAG:err '+x)}})();"
                     var taps = 0
                     fun tap() {
                         if (finished) return
                         if (popups.isNotEmpty()) { handler.postDelayed({ tap() }, 1000); return }
                         taps++
                         try {
+                            wv.evaluateJavascript(jwJs, null)
+                            if (strictPlayerEarly && (taps == 2 || taps == 8 || taps == 16)) wv.evaluateJavascript(diagJs, null)
                             wv.evaluateJavascript(fakePopup + clickJs, null)
                             val t = SystemClock.uptimeMillis()
                             val d = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, w / 2f, h / 2f, 0)
