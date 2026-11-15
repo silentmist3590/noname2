@@ -200,12 +200,15 @@ class KRX18Provider : MainAPI() {
                             ClipboardLogger.logAndCopy("Server $n WebView", "hit=$hit\nrequests(${seen.size}):\n" + seen.joinToString("\n"))
                             if (hit != null) {
                                 val o = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: mainUrl
-                                val isM3u8 = !hit.contains(".mp4")
+                                val inline = hit.trimStart().startsWith("#EXTM3U")
+                                val playUrl = if (inline) PlaylistProxy.register(hit, "$o/", "$o/", ua) else hit
+                                if (inline) ClipboardLogger.logAndCopy("Server $n inline", "playlist -> $playUrl (${hit.lines().count { !it.startsWith("#") && it.isNotBlank() }} phân đoạn)")
+                                val isM3u8 = inline || !hit.contains(".mp4")
                                 callback.invoke(
-                                    newExtractorLink(this.name, "KRX18 S$n", hit, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
+                                    newExtractorLink(this.name, "KRX18 S$n", playUrl, if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO) {
                                         this.referer = "$o/"
                                         this.quality = Qualities.Unknown.value
-                                        this.headers = mapOf("User-Agent" to ua, "Origin" to o, "Referer" to "$o/")
+                                        this.headers = if (inline) emptyMap() else mapOf("User-Agent" to ua, "Origin" to o, "Referer" to "$o/")
                                     }
                                 )
                                 got = true
@@ -304,8 +307,12 @@ class KRX18Provider : MainAPI() {
                             if (msg.startsWith("KRXRT:")) {
                                 val body = msg.removePrefix("KRXRT:").replace("\\/", "/")
                                 ClipboardLogger.logAndCopy("resolve-token", body.take(600))
+                                if (body.trimStart().startsWith("#EXTM3U")) {
+                                    // loadvid trả thẳng nội dung playlist (phân đoạn ngụy trang .png) -> trả nguyên văn, loadLinks sẽ phát qua proxy cục bộ
+                                    handler.post { finish(body) }
+                                    return true
+                                }
                                 val u = Regex("""https?://[^"'\s<>\\]+\.(?:m3u8|mp4|mpd)[^"'\s<>\\]*""", RegexOption.IGNORE_CASE).find(body)?.value
-                                    ?: Regex("""https?://[^"'\s<>\\]+(?:/hls/|/stream|/playlist|/manifest)[^"'\s<>\\]*""", RegexOption.IGNORE_CASE).find(body)?.value
                                 if (u != null) handler.post { finish(u) }
                             }
                             return true
@@ -357,7 +364,27 @@ class KRX18Provider : MainAPI() {
                         override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
                             val u = request?.url?.toString() ?: return false
                             val ok = u.startsWith(pageUrl.substringBefore("?")) || u.startsWith(Regex("^https?://[^/]+").find(pageUrl)?.value ?: pageUrl)
-                            if (!ok) seen.add("BLOCKED NAV: " + u.take(160))
+                            if (!ok) {
+                                seen.add("BLOCKED NAV: " + u.take(160))
+                                if (strictPlayerEarly && !finished && popups.size < 3 && u.startsWith("http")) {
+                                    try {
+                                        val pw = WebView(ctx)
+                                        pw.settings.javaScriptEnabled = true
+                                        pw.settings.domStorageEnabled = true
+                                        pw.webViewClient = WebViewClient()
+                                        pw.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
+                                        pw.layout(0, 0, w, h)
+                                        popups.add(pw)
+                                        pw.loadUrl(u)
+                                        ClipboardLogger.logAndCopy("Popup", "quảng cáo điều hướng ${u.take(60)} -> mở nền, đóng sau 5s")
+                                        handler.postDelayed({
+                                            try { pw.stopLoading(); pw.destroy() } catch (_: Exception) {}
+                                            popups.remove(pw)
+                                            ClipboardLogger.logAndCopy("Popup", "đã đóng quảng cáo, bấm Play lại")
+                                        }, 5000L)
+                                    } catch (_: Throwable) {}
+                                }
+                            }
                             return !ok
                         }
 
