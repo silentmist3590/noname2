@@ -195,8 +195,40 @@ class KRX18Provider : MainAPI() {
                         var got = false
                         loadExtractor(embed, "$mainUrl/", subtitleCallback) { got = true; callback(it) }
                         if (!got) {
+                            val o0 = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: mainUrl
+                            val cands = LinkedHashSet<String>()
+                            cands.add(embed)
+                            // Thăm dò: lấy trạng thái HTTP, nội dung và iframe/script của trang embed
+                            try {
+                                val pr = app.get(embed, referer = "$mainUrl/", headers = mapOf("User-Agent" to ua, "Origin" to mainUrl))
+                                val body = pr.text
+                                ClipboardLogger.logAndCopy("Server $n Probe", "HTTP ${pr.code} len=${body.length}\nfinal=${pr.url}\n" + body.take(1500))
+                                Regex("""<iframe[^>]+src=["']([^"']+)["']""", RegexOption.IGNORE_CASE).findAll(body).forEach {
+                                    var u = it.groupValues[1].replace("&amp;", "&")
+                                    if (u.startsWith("//")) u = "https:$u" else if (u.startsWith("/")) u = o0 + u
+                                    if (u.startsWith("http")) cands.add(u)
+                                }
+                                Regex("""https?:[^"'\s<>\\]+\.(?:m3u8|mp4)[^"'\s<>\\]*""", RegexOption.IGNORE_CASE).find(body)?.let { cands.add(it.value) }
+                            } catch (e: Exception) {
+                                if (e is java.util.concurrent.CancellationException) throw e
+                                ClipboardLogger.logAndCopy("Server $n Probe", "lỗi: ${e.message}")
+                            }
+                            // Biến thể URL của mov18plus (dạng cũ ?v=ID từng hoạt động)
+                            Regex("""mov18plus\.cloud/v/([^/?#]+)""").find(embed)?.groupValues?.get(1)?.let { id ->
+                                cands.add("https://mov18plus.cloud/?v=$id")
+                                cands.add("https://mov18plus.cloud/v/$id")
+                                cands.add("https://mov18plus.cloud/e/$id")
+                            }
                             val seen = mutableListOf<String>()
-                            val hit = sniffStream(embed, "$mainUrl/", ua, seen, Regex("""\.m3u8|\.mp4(\?|$)|\.mpd|/hls/\d{3,4}/""", RegexOption.IGNORE_CASE), (if (embed.contains("mov18plus") || embed.contains("loadvid")) 60_000L else 30_000L), embed.contains("loadvid"))
+                            var hit: String? = null
+                            var idx = 0
+                            for (cu in cands.take(5)) {
+                                idx++
+                                val strict = cu.contains("mov18plus") || cu.contains("loadvid") || cu.contains("helvid")
+                                seen.add("--- thử #$idx: $cu")
+                                hit = sniffStream(cu, "$mainUrl/", ua, seen, Regex("""\.m3u8|\.mp4(\?|$)|\.mpd|/hls/\d{3,4}/""", RegexOption.IGNORE_CASE), (if (strict) (if (idx == 1) 60_000L else 35_000L) else 30_000L), cu.contains("loadvid"))
+                                if (hit != null) break
+                            }
                             ClipboardLogger.logAndCopy("Server $n WebView", "hit=$hit\nrequests(${seen.size}):\n" + seen.joinToString("\n"))
                             if (hit != null) {
                                 val o = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: mainUrl
@@ -266,7 +298,7 @@ class KRX18Provider : MainAPI() {
                         cont.resume(res)
                     }
                     val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
-                    val strictPlayerEarly = pageUrl.contains("mov18plus") || pageUrl.contains("loadvid")
+                    val strictPlayerEarly = pageUrl.contains("mov18plus") || pageUrl.contains("loadvid") || pageUrl.contains("helvid")
                     wv.settings.apply {
                         javaScriptEnabled = true
                         domStorageEnabled = true
@@ -330,7 +362,7 @@ class KRX18Provider : MainAPI() {
                         }
                     }
                     // mov18plus.cloud và loadvid kiểm tra window.open/fetch/setTimeout có bị ghi đè (coi là tiện ích chặn quảng cáo) -> không ghi đè
-                    val strictPlayer = pageUrl.contains("mov18plus") || pageUrl.contains("loadvid")
+                    val strictPlayer = pageUrl.contains("mov18plus") || pageUrl.contains("loadvid") || pageUrl.contains("helvid")
                     val fakePopup = if (strictPlayer) "" else "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
                     val hookJs = "(function(){if(window.__krxh)return;window.__krxh=1;" +
                         "var of=window.fetch;window.fetch=function(){var a=arguments,u=typeof a[0]==='string'?a[0]:(a[0]&&a[0].url)||'';" +
