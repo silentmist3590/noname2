@@ -292,16 +292,33 @@ class KRX18Provider : MainAPI() {
             cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), javax.crypto.spec.IvParameterSpec(key.copyOfRange(0, 16)))
             val plain = String(cipher.doFinal(j.getString("media").toByteArray(Charsets.ISO_8859_1)), Charsets.UTF_8)
             val mp4 = JSONObject(plain).optJSONObject("mp4")
-            ClipboardLogger.logAndCopy("Server $n mov18", "giải mã OK: ${plain.take(1500)}")
+            ClipboardLogger.logAndCopy("Server $n mov18", "giải mã OK (${plain.length} ký tự)")
             if (mp4 == null) return false
-            val arr = mp4.optJSONArray("fristDatas") ?: return false
+            val srcs = mp4.optJSONArray("sources") ?: return false
+            val domains = mp4.optJSONArray("domains")
+            val domList = (0 until (domains?.length() ?: 0)).map { domains!!.getString(it) }
+            val mid = j.optLong("md5_id")
+            val slug = j.optString("slug")
             var any = false
-            for (i in 0 until arr.length()) {
-                val it = arr.getJSONObject(i)
-                val url = it.optString("url")
-                if (url.isEmpty()) continue
-                val q = when (it.optInt("res_id")) { 3 -> 480; 4 -> 720; 5 -> 1080; else -> 0 }
-                // thăm dò 32 byte đầu: file mp4 hợp lệ có 'ftyp' ở byte 4..8
+            for (i in 0 until srcs.length()) {
+                val sc = srcs.getJSONObject(i)
+                if (!sc.optBoolean("status", true)) continue
+                val size = sc.optLong("size")
+                val res = sc.optInt("res_id")
+                val sub = sc.optString("sub")
+                val dom = domList.firstOrNull { it.contains(sub) } ?: continue
+                val q = when (res) { 3 -> 480; 4 -> 720; 5 -> 1080; else -> 0 }
+                // token = btoa(btoa(AES-CTR("/mp4/<md5_id>/<res_id>/<size>?v=<slug>")) bỏ '=') bỏ '='; key = md5 của các CHỮ SỐ của size (giá trị 0..9)
+                val token = try {
+                    val k = java.security.MessageDigest.getInstance("MD5").digest(size.toString().map { (it - '0').toByte() }.toByteArray())
+                        .joinToString("") { b -> "%02x".format(b) }.toByteArray(Charsets.ISO_8859_1)
+                    val c = Cipher.getInstance("AES/CTR/NoPadding")
+                    c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(k, "AES"), javax.crypto.spec.IvParameterSpec(k.copyOfRange(0, 16)))
+                    val enc = c.doFinal("/mp4/$mid/$res/$size?v=$slug".toByteArray(Charsets.ISO_8859_1))
+                    val b1 = Base64.encodeToString(enc, Base64.NO_WRAP).replace("=", "")
+                    Base64.encodeToString(b1.toByteArray(Charsets.ISO_8859_1), Base64.NO_WRAP).replace("=", "")
+                } catch (e: Exception) { continue }
+                val url = "https://$dom/sora/$size/$token"
                 var okFile = false
                 try {
                     val req = okhttp3.Request.Builder().url(url).header("User-Agent", ua).header("Referer", "$o/").header("Origin", o).header("Range", "bytes=0-31").build()
