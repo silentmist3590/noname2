@@ -189,7 +189,7 @@ class KRX18Provider : MainAPI() {
                 ClipboardLogger.logAndCopy("Server $n", "API HTTP ${r.code}\nembed=$embed")
                 if (embed.isEmpty()) continue
                 val directOk = if (embed.contains("mov18plus.cloud")) mov18Direct(embed, n, callback) else false
-                val ok = if (directOk) true else if (embed.contains("playkrx18.site")) {
+                val ok = if (directOk) true else if (embed.contains("mov18plus.cloud") && mov18Decrypted) false else if (embed.contains("playkrx18.site")) {
                     stream9(embed, "KRX18 S$n", subtitleCallback, callback)
                 } else {
                     try {
@@ -278,6 +278,7 @@ class KRX18Provider : MainAPI() {
     // =====================================================================================
     private suspend fun mov18Direct(embed: String, n: String, callback: (ExtractorLink) -> Unit): Boolean {
         try {
+            mov18Decrypted = false
             val o = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return false
             val html = app.get(embed, referer = "$mainUrl/", headers = mapOf("User-Agent" to ua, "Origin" to mainUrl)).text
             val b64 = Regex("""datas\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)?.groupValues?.get(1)
@@ -294,12 +295,15 @@ class KRX18Provider : MainAPI() {
             val mp4 = JSONObject(plain).optJSONObject("mp4")
             ClipboardLogger.logAndCopy("Server $n mov18", "giải mã OK (${plain.length} ký tự)")
             if (mp4 == null) return false
+            mov18Decrypted = true
             val srcs = mp4.optJSONArray("sources") ?: return false
             val domains = mp4.optJSONArray("domains")
             val domList = (0 until (domains?.length() ?: 0)).map { domains!!.getString(it) }
             val mid = j.optLong("md5_id")
             val slug = j.optString("slug")
             var any = false
+            var handshakeLogged = false
+            val ucUa = "Mozilla/5.0 (Linux; U; Android 11; en-US; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/78.0.3904.108 UCBrowser/13.4.0.1306 Mobile Safari/537.36"
             for (i in 0 until srcs.length()) {
                 val sc = srcs.getJSONObject(i)
                 if (!sc.optBoolean("status", true)) continue
@@ -320,26 +324,43 @@ class KRX18Provider : MainAPI() {
                 } catch (e: Exception) { continue }
                 val url = "https://$dom/sora/$size/$token"
                 var okFile = false
-                try {
-                    val req = okhttp3.Request.Builder().url(url).header("User-Agent", ua).header("Referer", "$o/").header("Origin", o).header("Range", "bytes=0-31").build()
-                    app.baseClient.newCall(req).execute().use { r ->
-                        val bytes = r.body?.bytes() ?: ByteArray(0)
-                        val head = bytes.take(32).joinToString("") { b -> "%02x".format(b) }
-                        val ftyp = bytes.size >= 8 && String(bytes, 4, 4, Charsets.ISO_8859_1) == "ftyp"
-                        val ct = r.header("Content-Type") ?: ""
-                        okFile = (r.code == 200 || r.code == 206) && !ct.contains("text") && !ct.contains("json") && bytes.isNotEmpty()
-                        ClipboardLogger.logAndCopy("Server $n mov18 probe ${q}p", "HTTP ${r.code} ct=$ct range=${r.header("Content-Range")} ftyp=$ftyp\nhead=$head\n$url")
+                var useUa = ucUa
+                if (!handshakeLogged) {
+                    handshakeLogged = true
+                    try {
+                        val hreq = okhttp3.Request.Builder().url("https://$dom/?timestamp=${System.currentTimeMillis()}&id=${java.lang.Long.toString(System.nanoTime(), 36).takeLast(11)}").header("User-Agent", ucUa).header("Referer", "$o/").header("Origin", o).build()
+                        app.baseClient.newCall(hreq).execute().use { r ->
+                            ClipboardLogger.logAndCopy("Server $n mov18 handshake", "HTTP ${r.code} ct=${r.header("Content-Type")} set-cookie=${r.headers("Set-Cookie").size}\n" + (r.body?.string() ?: "").take(300))
+                        }
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        ClipboardLogger.logAndCopy("Server $n mov18 handshake", "lỗi: ${e.message}")
                     }
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    ClipboardLogger.logAndCopy("Server $n mov18 probe ${q}p", "lỗi: ${e.message}")
+                }
+                for ((attempt, tryUa) in listOf(ucUa, ua).withIndex()) {
+                    try {
+                        val req = okhttp3.Request.Builder().url(url).header("User-Agent", tryUa).header("Referer", "$o/").header("Origin", o).header("Range", "bytes=0-31").build()
+                        app.baseClient.newCall(req).execute().use { r ->
+                            val bytes = r.body?.bytes() ?: ByteArray(0)
+                            val head = bytes.take(32).joinToString("") { b -> "%02x".format(b) }
+                            val ftyp = bytes.size >= 8 && String(bytes, 4, 4, Charsets.ISO_8859_1) == "ftyp"
+                            val ct = r.header("Content-Type") ?: ""
+                            okFile = (r.code == 200 || r.code == 206) && !ct.contains("text") && !ct.contains("json") && bytes.isNotEmpty()
+                            ClipboardLogger.logAndCopy("Server $n mov18 probe ${q}p #${attempt + 1}", "HTTP ${r.code} ct=$ct range=${r.header("Content-Range")} ftyp=$ftyp\nhead=$head\n$url")
+                            if (okFile) useUa = tryUa
+                        }
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        ClipboardLogger.logAndCopy("Server $n mov18 probe ${q}p #${attempt + 1}", "lỗi: ${e.message}")
+                    }
+                    if (okFile) break
                 }
                 if (!okFile) continue
                 callback.invoke(
                     newExtractorLink(this.name, "KRX18 S$n ${if (q > 0) "${q}p" else ""}".trim(), url, ExtractorLinkType.VIDEO) {
                         this.referer = "$o/"
                         this.quality = if (q > 0) q else Qualities.Unknown.value
-                        this.headers = mapOf("User-Agent" to ua, "Origin" to o, "Referer" to "$o/")
+                        this.headers = mapOf("User-Agent" to useUa, "Origin" to o, "Referer" to "$o/")
                     }
                 )
                 any = true
@@ -351,6 +372,8 @@ class KRX18Provider : MainAPI() {
             return false
         }
     }
+
+    @Volatile private var mov18Decrypted = false
 
     private fun md5Hex(s: String): String =
         java.security.MessageDigest.getInstance("MD5").digest(s.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
