@@ -225,8 +225,15 @@ class KRX18Provider : MainAPI() {
                             for (cu in cands.take(5)) {
                                 idx++
                                 val strict = cu.contains("mov18plus") || cu.contains("loadvid") || cu.contains("helvid")
-                                seen.add("--- thử #$idx: $cu")
-                                hit = sniffStream(cu, "$mainUrl/", ua, seen, Regex("""\.m3u8|\.mp4(\?|$)|\.mpd|/hls/\d{3,4}/""", RegexOption.IGNORE_CASE), (if (strict) (if (idx == 1) 60_000L else 35_000L) else 30_000L), cu.contains("loadvid"))
+                                val rx = Regex("""\.m3u8|\.mp4(\?|$)|\.mpd|/hls/\d{3,4}/""", RegexOption.IGNORE_CASE)
+                                // player mov18plus/helvid: thử bọc trong iframe trước, rồi mới mở trực tiếp
+                                val modes = if (cu.contains("mov18plus") || cu.contains("helvid")) listOf(true, false) else listOf(false)
+                                for (wrap in modes) {
+                                    if (!wrap && idx > 1 && modes.size > 1) continue
+                                    seen.add("--- thử #$idx${if (wrap) " (iframe)" else ""}: $cu")
+                                    hit = sniffStream(cu, "$mainUrl/", ua, seen, rx, (if (strict) (if (idx == 1) 50_000L else 30_000L) else 30_000L), cu.contains("loadvid"), wrap)
+                                    if (hit != null) break
+                                }
                                 if (hit != null) break
                             }
                             ClipboardLogger.logAndCopy("Server $n WebView", "hit=$hit\nrequests(${seen.size}):\n" + seen.joinToString("\n"))
@@ -268,7 +275,7 @@ class KRX18Provider : MainAPI() {
     // và bắt URL .m3u8/.mpd đầu tiên mà trang gọi.
     // =====================================================================================
     @SuppressLint("SetJavaScriptEnabled")
-    private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>, streamRegex: Regex, timeoutMs: Long = 45_000L, hookFetch: Boolean = false): String? {
+    private suspend fun sniffStream(pageUrl: String, referer: String, ua: String, seen: MutableList<String>, streamRegex: Regex, timeoutMs: Long = 45_000L, hookFetch: Boolean = false, wrapInFrame: Boolean = false): String? {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
@@ -450,7 +457,13 @@ class KRX18Provider : MainAPI() {
                     } catch (_: Exception) {
                     }
                     handler.postDelayed({ finish(null) }, timeoutMs)
-                    wv.loadUrl(pageUrl, mapOf("Referer" to referer))
+                    if (wrapInFrame) {
+                        // Trang player kiểm tra "mở trực tiếp" (không nằm trong iframe / không có referrer) -> bọc trong iframe của trang krx18
+                        val base = referer.trimEnd('/') + "/"
+                        wv.loadDataWithBaseURL(base, "<html><body style=\"margin:0;background:#000\"><iframe src=\"$pageUrl\" allow=\"autoplay; fullscreen; encrypted-media\" style=\"border:0;width:100%;height:100vh\"></iframe></body></html>", "text/html", "utf-8", null)
+                    } else {
+                        wv.loadUrl(pageUrl, mapOf("Referer" to referer))
+                    }
                 } catch (e: Exception) {
                     ClipboardLogger.logAndCopy("Sniff Exception", e.stackTraceToString().take(800))
                     cont.resume(null)
