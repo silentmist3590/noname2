@@ -188,7 +188,8 @@ class KRX18Provider : MainAPI() {
                 val embed = JSONObject(r.text).optString("embed_url")
                 ClipboardLogger.logAndCopy("Server $n", "API HTTP ${r.code}\nembed=$embed")
                 if (embed.isEmpty()) continue
-                val ok = if (embed.contains("playkrx18.site")) {
+                val directOk = if (embed.contains("mov18plus.cloud")) mov18Direct(embed, n, callback) else false
+                val ok = if (directOk) true else if (embed.contains("playkrx18.site")) {
                     stream9(embed, "KRX18 S$n", subtitleCallback, callback)
                 } else {
                     try {
@@ -269,6 +270,73 @@ class KRX18Provider : MainAPI() {
         if (!found) ClipboardLogger.logAndCopy("Error", "Không có server nào phát được.")
         return found
     }
+
+
+    // =====================================================================================
+    // mov18plus.cloud: dữ liệu nguồn nằm trong biến `datas` (base64 -> JSON), trường `media` mã hoá AES-CTR.
+    // key = md5("user_id:slug:md5_id") dạng chuỗi hex ASCII (32 byte), counter = 16 byte đầu của key.
+    // =====================================================================================
+    private suspend fun mov18Direct(embed: String, n: String, callback: (ExtractorLink) -> Unit): Boolean {
+        try {
+            val o = Regex("""^(https?://[^/]+)""").find(embed)?.groupValues?.get(1) ?: return false
+            val html = app.get(embed, referer = "$mainUrl/", headers = mapOf("User-Agent" to ua, "Origin" to mainUrl)).text
+            val b64 = Regex("""datas\s*=\s*["']([A-Za-z0-9+/=]+)["']""").find(html)?.groupValues?.get(1)
+            if (b64 == null) {
+                ClipboardLogger.logAndCopy("Server $n mov18", "không thấy biến datas (len=${html.length})")
+                return false
+            }
+            val j = JSONObject(String(Base64.decode(b64, Base64.DEFAULT), Charsets.ISO_8859_1))
+            val keyStr = md5Hex("${j.optLong("user_id")}:${j.optString("slug")}:${j.optLong("md5_id")}")
+            val key = keyStr.toByteArray(Charsets.ISO_8859_1)
+            val cipher = Cipher.getInstance("AES/CTR/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), javax.crypto.spec.IvParameterSpec(key.copyOfRange(0, 16)))
+            val plain = String(cipher.doFinal(j.getString("media").toByteArray(Charsets.ISO_8859_1)), Charsets.UTF_8)
+            val mp4 = JSONObject(plain).optJSONObject("mp4")
+            ClipboardLogger.logAndCopy("Server $n mov18", "giải mã OK: ${plain.take(1500)}")
+            if (mp4 == null) return false
+            val arr = mp4.optJSONArray("fristDatas") ?: return false
+            var any = false
+            for (i in 0 until arr.length()) {
+                val it = arr.getJSONObject(i)
+                val url = it.optString("url")
+                if (url.isEmpty()) continue
+                val q = when (it.optInt("res_id")) { 3 -> 480; 4 -> 720; 5 -> 1080; else -> 0 }
+                // thăm dò 32 byte đầu: file mp4 hợp lệ có 'ftyp' ở byte 4..8
+                var okFile = false
+                try {
+                    val req = okhttp3.Request.Builder().url(url).header("User-Agent", ua).header("Referer", "$o/").header("Origin", o).header("Range", "bytes=0-31").build()
+                    app.baseClient.newCall(req).execute().use { r ->
+                        val bytes = r.body?.bytes() ?: ByteArray(0)
+                        val head = bytes.take(32).joinToString("") { b -> "%02x".format(b) }
+                        val ftyp = bytes.size >= 8 && String(bytes, 4, 4, Charsets.ISO_8859_1) == "ftyp"
+                        val ct = r.header("Content-Type") ?: ""
+                        okFile = (r.code == 200 || r.code == 206) && !ct.contains("text") && !ct.contains("json") && bytes.isNotEmpty()
+                        ClipboardLogger.logAndCopy("Server $n mov18 probe ${q}p", "HTTP ${r.code} ct=$ct range=${r.header("Content-Range")} ftyp=$ftyp\nhead=$head\n$url")
+                    }
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    ClipboardLogger.logAndCopy("Server $n mov18 probe ${q}p", "lỗi: ${e.message}")
+                }
+                if (!okFile) continue
+                callback.invoke(
+                    newExtractorLink(this.name, "KRX18 S$n ${if (q > 0) "${q}p" else ""}".trim(), url, ExtractorLinkType.VIDEO) {
+                        this.referer = "$o/"
+                        this.quality = if (q > 0) q else Qualities.Unknown.value
+                        this.headers = mapOf("User-Agent" to ua, "Origin" to o, "Referer" to "$o/")
+                    }
+                )
+                any = true
+            }
+            return any
+        } catch (e: Throwable) {
+            if (e is java.util.concurrent.CancellationException) throw e
+            ClipboardLogger.logAndCopy("Server $n mov18 Error", "${e.message}\n${e.stackTraceToString().take(500)}")
+            return false
+        }
+    }
+
+    private fun md5Hex(s: String): String =
+        java.security.MessageDigest.getInstance("MD5").digest(s.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 
     // =====================================================================================
     // WebView riêng: tải trang player, chặn mọi popup, gửi chạm THẬT (MotionEvent) vào giữa màn hình để bấm Play
