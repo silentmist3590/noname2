@@ -300,10 +300,7 @@ class KRX18Provider : MainAPI() {
             val domains = mp4.optJSONArray("domains")
             val domList = (0 until (domains?.length() ?: 0)).map { domains!!.getString(it) }
             val mid = j.optLong("md5_id")
-            val slug = j.optString("slug")
             var any = false
-            var handshakeLogged = false
-            val ucUa = "Mozilla/5.0 (Linux; U; Android 11; en-US; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/78.0.3904.108 UCBrowser/13.4.0.1306 Mobile Safari/537.36"
             for (i in 0 until srcs.length()) {
                 val sc = srcs.getJSONObject(i)
                 if (!sc.optBoolean("status", true)) continue
@@ -312,55 +309,26 @@ class KRX18Provider : MainAPI() {
                 val sub = sc.optString("sub")
                 val dom = domList.firstOrNull { it.contains(sub) } ?: continue
                 val q = when (res) { 3 -> 480; 4 -> 720; 5 -> 1080; else -> 0 }
-                // token = btoa(btoa(AES-CTR("/mp4/<md5_id>/<res_id>/<size>?v=<slug>")) bỏ '=') bỏ '='; key = md5 của các CHỮ SỐ của size (giá trị 0..9)
-                val token = try {
-                    val k = java.security.MessageDigest.getInstance("MD5").digest(size.toString().map { (it - '0').toByte() }.toByteArray())
-                        .joinToString("") { b -> "%02x".format(b) }.toByteArray(Charsets.ISO_8859_1)
-                    val c = Cipher.getInstance("AES/CTR/NoPadding")
-                    c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(k, "AES"), javax.crypto.spec.IvParameterSpec(k.copyOfRange(0, 16)))
-                    val enc = c.doFinal("/mp4/$mid/$res/$size?v=$slug".toByteArray(Charsets.ISO_8859_1))
-                    val b1 = Base64.encodeToString(enc, Base64.NO_WRAP).replace("=", "")
-                    Base64.encodeToString(b1.toByteArray(Charsets.ISO_8859_1), Base64.NO_WRAP).replace("=", "")
-                } catch (e: Exception) { continue }
-                val url = "https://$dom/sora/$size/$token"
+                // Thử tải phần đầu tiên (2MB) qua /sora/<size>/<token> rồi ghi log; file mp4 hợp lệ có 'ftyp' ở byte 4..8
+                val ent = Mov18Proxy.Entry(dom, mid, res, size, "$o/", ua)
                 var okFile = false
-                var useUa = ucUa
-                if (!handshakeLogged) {
-                    handshakeLogged = true
-                    try {
-                        val hreq = okhttp3.Request.Builder().url("https://$dom/?timestamp=${System.currentTimeMillis()}&id=${java.lang.Long.toString(System.nanoTime(), 36).takeLast(11)}").header("User-Agent", ucUa).header("Referer", "$o/").header("Origin", o).build()
-                        app.baseClient.newCall(hreq).execute().use { r ->
-                            ClipboardLogger.logAndCopy("Server $n mov18 handshake", "HTTP ${r.code} ct=${r.header("Content-Type")} set-cookie=${r.headers("Set-Cookie").size}\n" + (r.body?.string() ?: "").take(300))
-                        }
-                    } catch (e: Exception) {
-                        if (e is java.util.concurrent.CancellationException) throw e
-                        ClipboardLogger.logAndCopy("Server $n mov18 handshake", "lỗi: ${e.message}")
-                    }
-                }
-                for ((attempt, tryUa) in listOf(ucUa, ua).withIndex()) {
-                    try {
-                        val req = okhttp3.Request.Builder().url(url).header("User-Agent", tryUa).header("Referer", "$o/").header("Origin", o).header("Range", "bytes=0-31").build()
-                        app.baseClient.newCall(req).execute().use { r ->
-                            val bytes = r.body?.bytes() ?: ByteArray(0)
-                            val head = bytes.take(32).joinToString("") { b -> "%02x".format(b) }
-                            val ftyp = bytes.size >= 8 && String(bytes, 4, 4, Charsets.ISO_8859_1) == "ftyp"
-                            val ct = r.header("Content-Type") ?: ""
-                            okFile = (r.code == 200 || r.code == 206) && !ct.contains("text") && !ct.contains("json") && bytes.isNotEmpty()
-                            ClipboardLogger.logAndCopy("Server $n mov18 probe ${q}p #${attempt + 1}", "HTTP ${r.code} ct=$ct range=${r.header("Content-Range")} ftyp=$ftyp\nhead=$head\n$url")
-                            if (okFile) useUa = tryUa
-                        }
-                    } catch (e: Exception) {
-                        if (e is java.util.concurrent.CancellationException) throw e
-                        ClipboardLogger.logAndCopy("Server $n mov18 probe ${q}p #${attempt + 1}", "lỗi: ${e.message}")
-                    }
-                    if (okFile) break
+                try {
+                    val pr = Mov18Proxy.fetchPart(ent, 0)
+                    val head = pr.bytes.take(32).joinToString("") { b -> "%02x".format(b) }
+                    val ftyp = pr.bytes.size >= 8 && String(pr.bytes, 4, 4, Charsets.ISO_8859_1) == "ftyp"
+                    okFile = pr.code == 200 && ftyp
+                    ClipboardLogger.logAndCopy("Server $n mov18 part0 ${q}p", "HTTP ${pr.code} ct=${pr.ct} len=${pr.bytes.size} ftyp=$ftyp\nhead=$head\n${pr.url}")
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    ClipboardLogger.logAndCopy("Server $n mov18 part0 ${q}p", "lỗi: ${e.message}")
                 }
                 if (!okFile) continue
+                val purl = Mov18Proxy.register(ent)
                 callback.invoke(
-                    newExtractorLink(this.name, "KRX18 S$n ${if (q > 0) "${q}p" else ""}".trim(), url, ExtractorLinkType.VIDEO) {
+                    newExtractorLink(this.name, "KRX18 S$n ${if (q > 0) "${q}p" else ""}".trim(), purl, ExtractorLinkType.VIDEO) {
                         this.referer = "$o/"
                         this.quality = if (q > 0) q else Qualities.Unknown.value
-                        this.headers = mapOf("User-Agent" to useUa, "Origin" to o, "Referer" to "$o/")
+                        this.headers = emptyMap()
                     }
                 )
                 any = true
