@@ -272,6 +272,17 @@ class HnembedProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+            ClipboardLogger.clear()
+
+    ClipboardLogger.logAndCopy(
+        "BUILD MARKER",
+        "HNEMBED-DIAG-2026-11-18-V5"
+    )
+
+    ClipboardLogger.logAndCopy(
+        "loadLinks START",
+        "data=$data; provider=$name"
+    )
         val ref = parseHnRef(data) ?: run {
             ClipboardLogger.logAndCopy("loadLinks", "Invalid data: $data")
             return false
