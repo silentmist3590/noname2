@@ -1,3 +1,4 @@
+
 package com.lagradost
 
 import android.content.ClipData
@@ -6,13 +7,6 @@ import android.content.Context
 import android.util.Log
 import com.lagradost.cloudstream3.CommonActivity
 
-/**
- * CloudStream 4.5.2-compatible diagnostic logger.
- * Does not reference CloudStreamApp, which is not a plugin API.
- *
- * If CommonActivity is not available at the moment of logging, the message
- * is still written to Logcat under the HnembedDiag tag.
- */
 object ClipboardLogger {
     private const val TAG = "HnembedDiag"
     private const val MAX_CHARS = 45000
@@ -20,32 +14,70 @@ object ClipboardLogger {
     private val lock = Any()
     private val buffer = StringBuilder()
 
-    fun logAndCopy(title: String, message: String) {
-        val entry = "=== [$title] ===\n${redact(message)}\n===================\n"
+    fun clear() {
+        synchronized(lock) {
+            buffer.setLength(0)
+        }
+        Log.d(TAG, "Diagnostic buffer cleared")
+    }
 
-        val snapshot = synchronized(lock) {
-            buffer.append(entry)
+    fun logAndCopy(title: String, message: String) {
+        val safeMessage = redact(message).take(9000)
+        val entry = "=== [$title] ===\n" +
+            "$safeMessage\n" +
+            "===================\n"
+
+        synchronized(lock) {
+            buffer.append(entry).append('\n')
+
             if (buffer.length > MAX_CHARS) {
                 buffer.delete(0, buffer.length - MAX_CHARS)
             }
-            buffer.toString()
         }
 
         Log.d(TAG, entry)
 
         val activity = try {
             CommonActivity.activity
-        } catch (_: Throwable) {
+        } catch (e: Throwable) {
+            Log.e(TAG, "Cannot get CommonActivity", e)
             null
-        } ?: return
+        }
+
+        if (activity == null) {
+            Log.w(
+                TAG,
+                "CLIPBOARD SKIPPED: CommonActivity.activity is null"
+            )
+            return
+        }
 
         activity.runOnUiThread {
             try {
+                // Read the latest buffer when the UI task executes.
+                val snapshot = synchronized(lock) {
+                    buffer.toString()
+                }
+
                 val clipboard = activity.getSystemService(
                     Context.CLIPBOARD_SERVICE
-                ) as ClipboardManager
+                ) as? ClipboardManager
+
+                if (clipboard == null) {
+                    Log.e(TAG, "ClipboardManager unavailable")
+                    return@runOnUiThread
+                }
+
                 clipboard.setPrimaryClip(
-                    ClipData.newPlainText("Hnembed diagnostic log", snapshot)
+                    ClipData.newPlainText(
+                        "Hnembed diagnostics",
+                        snapshot
+                    )
+                )
+
+                Log.d(
+                    TAG,
+                    "CLIPBOARD UPDATED: ${snapshot.length} characters"
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Clipboard copy failed", e)
@@ -53,16 +85,12 @@ object ClipboardLogger {
         }
     }
 
-    fun clear() {
-        synchronized(lock) {
-            buffer.setLength(0)
-        }
-    }
-
     private fun redact(input: String): String {
         return input
             .replace(
-                Regex("""(?i)(api_token|token|authorization|cookie|vs)=([^&\s"'<>]+)"""),
+                Regex(
+                    """(?i)(api_token|token|authorization|cookie|vs)=([^&\s"'<>]+)"""
+                ),
                 "$1=<redacted>"
             )
             .replace(
