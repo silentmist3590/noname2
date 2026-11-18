@@ -8,6 +8,7 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
 import java.net.URI
+import java.util.concurrent.CancellationException
 import java.net.URLEncoder
 
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
@@ -77,7 +78,7 @@ class HnembedProvider : MainAPI() {
                 }
                 lastError = IllegalStateException("TMDB HTTP ${response.code}: $host")
             } catch (e: Exception) {
-                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (e is CancellationException) throw e
                 lastError = e
             }
         }
@@ -136,7 +137,7 @@ class HnembedProvider : MainAPI() {
                 hasNext = page < json.optInt("total_pages", 1)
             )
         } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
+            if (e is CancellationException) throw e
             ClipboardLogger.logAndCopy("getMainPage", e.stackTraceToString())
             newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
@@ -155,7 +156,7 @@ class HnembedProvider : MainAPI() {
             }
             output.distinctBy { it.url }
         } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
+            if (e is CancellationException) throw e
             ClipboardLogger.logAndCopy("search", e.stackTraceToString())
             emptyList()
         }
@@ -230,7 +231,7 @@ class HnembedProvider : MainAPI() {
                             )
                         }
                     } catch (e: Exception) {
-                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        if (e is CancellationException) throw e
                         ClipboardLogger.logAndCopy(
                             "Season $seasonNumber",
                             e.message ?: "Unable to load season"
@@ -250,7 +251,7 @@ class HnembedProvider : MainAPI() {
                 }
             }
         } catch (e: Exception) {
-            if (e is kotlinx.coroutines.CancellationException) throw e
+            if (e is CancellationException) throw e
             ClipboardLogger.logAndCopy("load detail", e.stackTraceToString())
             null
         }
@@ -314,7 +315,7 @@ class HnembedProvider : MainAPI() {
                     )
                 }
             } catch (e: Exception) {
-                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (e is CancellationException) throw e
                 ClipboardLogger.logAndCopy(
                     "HNEmbed extractor",
                     "${e.javaClass.simpleName}: ${e.message}"
@@ -409,7 +410,7 @@ class HnembedProvider : MainAPI() {
                             )
                         }
                     } catch (e: Exception) {
-                        if (e is kotlinx.coroutines.CancellationException) throw e
+                        if (e is CancellationException) throw e
                         ClipboardLogger.logAndCopy(
                             "Candidate extractor",
                             "${candidate.take(180)} | ${e.message}"
@@ -417,7 +418,7 @@ class HnembedProvider : MainAPI() {
                     }
                 }
             } catch (e: Exception) {
-                if (e is kotlinx.coroutines.CancellationException) throw e
+                if (e is CancellationException) throw e
                 ClipboardLogger.logAndCopy(
                     "Embed fetch",
                     "${e.javaClass.simpleName}: ${e.message}"
