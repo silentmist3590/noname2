@@ -273,9 +273,18 @@ class HnembedProvider : MainAPI() {
                 }
 
                 try {
-                    val w = 1080
-                    val h = 1920
-                    val wv = WebView(ctx)
+                    // Use the real device orientation and dimensions (TVs are usually landscape).
+                    val metrics = ctx.resources.displayMetrics
+                    val w = metrics.widthPixels.coerceAtLeast(1)
+                    val h = metrics.heightPixels.coerceAtLeast(1)
+                    val wv = WebView(ctx).apply {
+                        // Keep the page in the visible window so visibility checks and simulated
+                        // center taps work, while making the sniffing surface effectively invisible.
+                        alpha = 0.01f
+                        isFocusable = false
+                        isFocusableInTouchMode = false
+                        isClickable = false
+                    }
                     var finished = false
 
                     fun finish(res: String?) {
@@ -502,8 +511,14 @@ class HnembedProvider : MainAPI() {
 
                     wv.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
                     wv.layout(0, 0, w, h)
-                    wv.translationX = -4000f
-                    try { act?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
+                    wv.translationX = 0f
+                    try { act?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (e: Exception) {
+                        ClipboardLogger.logAndCopy("WebView attach", e.message ?: "Could not attach WebView")
+                    }
+                    ClipboardLogger.logAndCopy(
+                        "WebView viewport",
+                        w.toString() + "x" + h + "; orientation=" + (if (w >= h) "landscape" else "portrait")
+                    )
 
                     handler.postDelayed({ finish(null) }, 45_000L)
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
