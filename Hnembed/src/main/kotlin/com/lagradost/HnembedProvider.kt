@@ -355,7 +355,7 @@ class HnembedProvider : MainAPI() {
                                 (b.getAttribute('aria-label')||b.title||b.innerText||'').slice(0,60);
                             }).slice(0,20);
                           var res=performance.getEntriesByType('resource').map(function(x){return x.name;})
-                            .filter(function(x){return /m3u8|mpd|mp4|m4s|\\.ts(?:[?#]|$)|page-\\d+\\.html/i.test(x);})
+                            .filter(function(x){return /m3u8|mpd|mp4|m4s|\.ts(?:[?#]|$)|page-\d+\.html/i.test(x);})
                             .slice(-20);
                           return JSON.stringify({
                             ready:document.readyState,title:document.title,url:location.href,
