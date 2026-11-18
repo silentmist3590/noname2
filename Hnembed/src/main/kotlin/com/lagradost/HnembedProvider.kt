@@ -8,8 +8,8 @@ import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
 import java.net.URI
-import java.util.concurrent.CancellationException
 import java.net.URLEncoder
+import java.util.concurrent.CancellationException
 
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
@@ -24,14 +24,52 @@ private data class HnMediaRef(
 private val HN_REF_REGEX =
     Regex("""^hnembed:(movie|tv):(\d+)(?::(\d+):(\d+))?$""")
 
+private val HN_EMBED_PATH_REGEX =
+    Regex("""^/embed/(movie|tv)/(\d+)(?:/(\d+)/(\d+))?/?$""")
+
+// Compatibility with old SearchResponse URLs that were incorrectly fixed by CloudStream.
+private val HN_LEGACY_PATH_REGEX =
+    Regex("""^/hnembed:(movie|tv):(\d+)(?::(\d+):(\d+))?/?$""")
+
+/**
+ * Accepts all supported data forms:
+ *   hnembed:movie:123
+ *   hnembed:tv:123:1:2
+ *   https://hnembed.cc/embed/movie/123
+ *   https://hnembed.cc/embed/tv/123/1/2
+ *   https://hnembed.cc/hnembed:movie:123 (legacy broken route)
+ */
 private fun parseHnRef(value: String): HnMediaRef? {
-    val match = HN_REF_REGEX.matchEntire(value.trim()) ?: return null
+    val input = value.trim()
+    val path = try {
+        URI(input).path ?: input
+    } catch (_: Exception) {
+        input
+    }
+
+    val match = HN_REF_REGEX.matchEntire(input)
+        ?: HN_EMBED_PATH_REGEX.matchEntire(path)
+        ?: HN_LEGACY_PATH_REGEX.matchEntire(path)
+        ?: return null
+
     return HnMediaRef(
         type = match.groupValues[1],
         id = match.groupValues[2].toIntOrNull() ?: return null,
         season = match.groupValues[3].takeIf { it.isNotBlank() }?.toIntOrNull(),
         episode = match.groupValues[4].takeIf { it.isNotBlank() }?.toIntOrNull()
     )
+}
+
+/** Return an absolute URL for CloudStream's SearchResponse/LoadResponse.url. */
+private fun hnDetailUrl(type: String, id: Int): String {
+    return if (type == "movie") {
+        "https://hnembed.cc/embed/movie/$id"
+    } else {
+        // HNEmbed's documented TV embed format requires season and episode.
+        // This URL is only the stable detail-page identifier; individual
+        // episode playback uses Episode.data below.
+        "https://hnembed.cc/embed/tv/$id/1/1"
+    }
 }
 
 class HnembedProvider : MainAPI() {
@@ -55,7 +93,7 @@ class HnembedProvider : MainAPI() {
 
     private val userAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
     private fun imageUrl(path: String?, size: String = "w500"): String? {
         if (path.isNullOrBlank() || path == "null") return null
@@ -72,20 +110,28 @@ class HnembedProvider : MainAPI() {
                     "$host$path${separator}api_key=$TMDB_API_KEY",
                     headers = mapOf("User-Agent" to userAgent)
                 )
+
                 if (response.code == 200) {
                     val body = response.text
-                    if (body.trimStart().startsWith("{")) return JSONObject(body)
+                    if (body.trimStart().startsWith("{")) {
+                        return JSONObject(body)
+                    }
                 }
+
                 lastError = IllegalStateException("TMDB HTTP ${response.code}: $host")
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 lastError = e
             }
         }
+
         throw lastError ?: IllegalStateException("TMDB request failed")
     }
 
-    private fun searchResponse(item: JSONObject, forcedType: String? = null): SearchResponse? {
+    private fun searchResponse(
+        item: JSONObject,
+        forcedType: String? = null
+    ): SearchResponse? {
         val type = forcedType ?: item.optString("media_type")
         if (type != "movie" && type != "tv") return null
 
@@ -100,9 +146,10 @@ class HnembedProvider : MainAPI() {
 
         if (title.isBlank()) return null
 
+        // IMPORTANT: url is a real absolute HTTP URL, not "hnembed:movie:id".
         return newMovieSearchResponse(
             title,
-            "hnembed:$type:$id",
+            hnDetailUrl(type, id),
             if (type == "tv") TvType.TvSeries else TvType.Movie
         ) {
             posterUrl = imageUrl(item.optString("poster_path"))
@@ -115,9 +162,8 @@ class HnembedProvider : MainAPI() {
     ): HomePageResponse {
         return try {
             val json = tmdbGet("${request.data}?page=$page")
-            val results = json.optJSONArray("results") ?: return newHomePageResponse(
-                request.name, emptyList(), hasNext = false
-            )
+            val results = json.optJSONArray("results")
+                ?: return newHomePageResponse(request.name, emptyList(), hasNext = false)
 
             val fallbackType = when {
                 request.data.startsWith("/movie") -> "movie"
@@ -154,6 +200,7 @@ class HnembedProvider : MainAPI() {
                 val item = results.optJSONObject(i) ?: continue
                 searchResponse(item)?.let(output::add)
             }
+
             output.distinctBy { it.url }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
@@ -164,7 +211,7 @@ class HnembedProvider : MainAPI() {
 
     override suspend fun load(url: String): LoadResponse? {
         val ref = parseHnRef(url) ?: run {
-            ClipboardLogger.logAndCopy("load", "Invalid provider data: $url")
+            ClipboardLogger.logAndCopy("load", "Invalid provider URL/data: $url")
             return null
         }
 
@@ -188,11 +235,12 @@ class HnembedProvider : MainAPI() {
                 json.optString("first_air_date")
             }
             val year = date.take(4).toIntOrNull()
+            val canonicalUrl = hnDetailUrl(ref.type, ref.id)
 
             if (ref.type == "movie") {
                 newMovieLoadResponse(
                     title,
-                    "hnembed:movie:${ref.id}",
+                    canonicalUrl,
                     TvType.Movie,
                     "hnembed:movie:${ref.id}"
                 ) {
@@ -241,7 +289,7 @@ class HnembedProvider : MainAPI() {
 
                 newTvSeriesLoadResponse(
                     title,
-                    "hnembed:tv:${ref.id}",
+                    canonicalUrl,
                     TvType.TvSeries,
                     episodes
                 ) {
@@ -257,14 +305,15 @@ class HnembedProvider : MainAPI() {
         }
     }
 
-    /*
-     * HNEmbed's published integration format is:
-     *   /embed/movie/{IMDB-or-TMDB-ID}
-     *   /embed/tv/{IMDB-or-TMDB-ID}/{season}/{episode}
+    /**
+     * HNEmbed's documented embed URL formats:
+     *   /embed/movie/{IMDb-or-TMDB-ID}
+     *   /embed/tv/{IMDb-or-TMDB-ID}/{season}/{episode}
      *
-     * The public documentation does not promise a direct media URL API.
-     * Therefore this method delegates discovered iframe URLs to CloudStream's
-     * registered extractors. It deliberately does not fabricate a video URL.
+     * The provider first delegates the official embed URL to CloudStream's
+     * registered extractors. If the embed HTML exposes normal iframe/video
+     * URLs, those URLs are passed to the matching extractor as a fallback.
+     * A page URL is never falsely reported as a playable video URL.
      */
     override suspend fun loadLinks(
         data: String,
@@ -272,17 +321,16 @@ class HnembedProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-            ClipboardLogger.clear()
+        ClipboardLogger.clear()
+        ClipboardLogger.logAndCopy(
+            "BUILD MARKER",
+            "HNEMBED-URL-FIX-2026-11-18"
+        )
+        ClipboardLogger.logAndCopy(
+            "loadLinks START",
+            "data=$data; provider=$name; casting=$isCasting"
+        )
 
-    ClipboardLogger.logAndCopy(
-        "BUILD MARKER",
-        "HNEMBED-DIAG-2026-11-18-V5"
-    )
-
-    ClipboardLogger.logAndCopy(
-        "loadLinks START",
-        "data=$data; provider=$name"
-    )
         val ref = parseHnRef(data) ?: run {
             ClipboardLogger.logAndCopy("loadLinks", "Invalid data: $data")
             return false
@@ -291,7 +339,7 @@ class HnembedProvider : MainAPI() {
         if (ref.type == "tv" && (ref.season == null || ref.episode == null)) {
             ClipboardLogger.logAndCopy(
                 "loadLinks",
-                "TV item requires season and episode: $data"
+                "TV playback requires season and episode: $data"
             )
             return false
         }
@@ -314,8 +362,7 @@ class HnembedProvider : MainAPI() {
 
             ClipboardLogger.logAndCopy("HNEmbed target", embedUrl)
 
-            // First let CloudStream try a registered extractor for the official
-            // HNEmbed embed URL itself.
+            // First try the installed CloudStream extractor for the official embed URL.
             try {
                 loadExtractor(embedUrl, "$mirror/", subtitleCallback) { link ->
                     callback.invoke(link)
@@ -335,8 +382,8 @@ class HnembedProvider : MainAPI() {
 
             if (emitted > 0) return true
 
-            // If HNEmbed returns a normal HTML embed page, inspect only public
-            // iframe/video/source URLs and pass those to CloudStream extractors.
+            // Inspect ordinary public embed markup only. No player token or
+            // protected media request is reconstructed here.
             try {
                 val response = app.get(
                     embedUrl,
@@ -345,21 +392,18 @@ class HnembedProvider : MainAPI() {
                 )
                 ClipboardLogger.logAndCopy(
                     "Embed response",
-                    "HTTP ${response.code}; bytes=${response.text.length}"
+                    "HTTP ${response.code}; final=${response.url}; bytes=${response.text.length}"
                 )
                 if (response.code !in 200..299) continue
 
                 val html = response.text
-                val tagRegex = Regex(
-                    """(?is)<(?:iframe|video|source)\b[^>]*>"""
-                )
-                val attrRegex = Regex(
-                    """(?is)(?:src|data-src)\s*=\s*["']([^"']+)["']"""
-                )
+                val tagRegex = Regex("""(?is)<(?:iframe|video|source)\b[^>]*>""")
+                val attrRegex = Regex("""(?is)(?:src|data-src)\s*=\s*["']([^"']+)["']""")
 
                 for (tag in tagRegex.findAll(html)) {
                     val raw = attrRegex.find(tag.value)?.groupValues?.getOrNull(1)
                         ?: continue
+
                     val candidate = try {
                         URI(embedUrl).resolve(
                             raw.replace("&amp;", "&")
@@ -374,10 +418,7 @@ class HnembedProvider : MainAPI() {
                         continue
                     }
 
-                    ClipboardLogger.logAndCopy(
-                        "Embed candidate",
-                        candidate.take(300)
-                    )
+                    ClipboardLogger.logAndCopy("Embed candidate", candidate.take(300))
 
                     val lower = candidate.lowercase()
                     val directType = when {
@@ -408,11 +449,7 @@ class HnembedProvider : MainAPI() {
                     }
 
                     try {
-                        loadExtractor(
-                            candidate,
-                            embedUrl,
-                            subtitleCallback
-                        ) { link ->
+                        loadExtractor(candidate, embedUrl, subtitleCallback) { link ->
                             callback.invoke(link)
                             emitted++
                             ClipboardLogger.logAndCopy(
@@ -442,7 +479,7 @@ class HnembedProvider : MainAPI() {
         ClipboardLogger.logAndCopy(
             "No playable source",
             "HNEmbed returned no URL handled by the installed CloudStream extractors. " +
-                "This is not a direct media URL; no fake ExtractorLink was created."
+                "The embed page itself is not returned as a video link."
         )
         return false
     }
