@@ -1,5 +1,6 @@
 package com.lagradost
 
+import android.util.Base64
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -9,14 +10,9 @@ import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.json.JSONObject
+import java.net.URI
 import java.net.URLEncoder
-import java.util.Base64
 import java.util.regex.Pattern
-
-// =====================================================================================
-// STUB LOGGER (nếu project đã có ClipboardLogger ở file khác → XÓA object này đi)
-// =====================================================================================
-
 
 // =====================================================================================
 // 1. CẤU HÌNH API KEY VÀ ĐỊNH DANH
@@ -218,7 +214,7 @@ class TwoNembedProvider : MainAPI() {
         val tmdbIdInt = ref.id
 
         try {
-            val response = app.get("$TMDB_BASE_URL/$mediaType/$tmdbIdInt?api_key=$TMDB_API_KEY").text
+            val response = tmdbGet("/$mediaType/$tmdbIdInt")
             val json = JSONObject(response)
             if (json.has("status_code")) throw Exception("TMDB: ${json.optString("status_message")}")
 
@@ -235,9 +231,7 @@ class TwoNembedProvider : MainAPI() {
                 val seasonsCount = json.optInt("number_of_seasons", 1)
                 for (s in 1..seasonsCount) {
                     try {
-                        val seasonJson = JSONObject(
-                            app.get("$TMDB_BASE_URL/tv/$tmdbIdInt/season/$s?api_key=$TMDB_API_KEY").text
-                        )
+                        val seasonJson = JSONObject(tmdbGet("/tv/$tmdbIdInt/season/$s"))
                         val eps = seasonJson.optJSONArray("episodes") ?: continue
                         for (e in 0 until eps.length()) {
                             val ep = eps.getJSONObject(e)
@@ -287,12 +281,12 @@ class TwoNembedProvider : MainAPI() {
         isM3u8: Boolean = true,
         headers: Map<String, String> = emptyMap()
     ): ExtractorLink {
-        val finalUrl = if (isM3u8 && !url.contains(".m3u8")) "$url#file.m3u8" else url
+        val cleanUrl = url.substringBefore("#")
 
         return newExtractorLink(
             source = source,
             name = name,
-            url = finalUrl,
+            url = cleanUrl,
             type = if (isM3u8) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
         ) {
             this.referer = referer
@@ -302,8 +296,61 @@ class TwoNembedProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // 5. VIDEO INTERCEPTOR
+    // 5. VIDEO INTERCEPTOR (TƯƠNG THÍCH CLOUDSTREAM 4.5.2 & 4.8+)
     // =====================================================================================
+    private fun sanitizeHlsPlaylist(text: String): String {
+        val lines = text.lines()
+        val mapPattern = Pattern.compile("""#EXT-X-MAP:[^\r\n]*URI=["']([^"']+)["']""", Pattern.CASE_INSENSITIVE)
+        var mapUri: String? = null
+        for (line in lines) {
+            val m = mapPattern.matcher(line.trim())
+            if (m.find()) {
+                mapUri = m.group(1)
+                break
+            }
+        }
+        if (mapUri.isNullOrEmpty()) return text
+        val hasSameMediaLine = lines.any { line ->
+            val t = line.trim()
+            t.isNotEmpty() && !t.startsWith("#") && t == mapUri
+        }
+        if (!hasSameMediaLine) return text
+        return lines.filterNot { it.trim().startsWith("#EXT-X-MAP:", ignoreCase = true) }
+            .joinToString("\n")
+    }
+
+    private fun findPngPayloadOffset(bytes: ByteArray): Int {
+        val limit = minOf(bytes.size - 8, 512)
+        for (i in 8..limit) {
+            if (bytes[i] == 0x49.toByte() &&
+                bytes[i + 1] == 0x45.toByte() &&
+                bytes[i + 2] == 0x4E.toByte() &&
+                bytes[i + 3] == 0x44.toByte()
+            ) {
+                val next = i + 8
+                if (next < bytes.size) return next
+            }
+        }
+        if (bytes.size > 70 && bytes[70] == 0x47.toByte()) return 70
+        return -1
+    }
+
+    private fun isMpegTs(bytes: ByteArray): Boolean {
+        if (bytes.isEmpty() || bytes[0] != 0x47.toByte()) return false
+        return (bytes.size >= 189 && bytes[188] == 0x47.toByte()) || bytes.size == 188
+    }
+
+    private fun detectSegmentMime(bytes: ByteArray): String {
+        if (isMpegTs(bytes)) return "video/mp2t"
+        if (bytes.size >= 8) {
+            val box = String(bytes, 4, 4, Charsets.US_ASCII)
+            if (box == "ftyp" || box == "styp" || box == "moof" || box == "sidx") {
+                return "video/mp4"
+            }
+        }
+        return "video/mp2t"
+    }
+
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor {
         return Interceptor { chain ->
             val request = chain.request()
@@ -316,31 +363,78 @@ class TwoNembedProvider : MainAPI() {
             }
 
             val response = chain.proceed(builder.build())
-            val url = request.url.toString()
+            if (!response.isSuccessful) return@Interceptor response
 
-            if (url.contains("tiktokcdn.com") || url.contains(".image")) {
-                val body = response.body
-                if (body != null) {
-                    val bytes = body.bytes()
-                    if (bytes.size > 70 &&
-                        bytes[0] == 0x89.toByte() &&
-                        bytes[1] == 0x50.toByte() &&
-                        bytes[70] == 0x47.toByte()
-                    ) {
-                        val stripped = bytes.copyOfRange(70, bytes.size)
-                        val mediaType = "video/mp2t".toMediaType()
+            val url = request.url.toString()
+            val ct = (response.header("Content-Type") ?: "").lowercase()
+            val body = response.body ?: return@Interceptor response
+
+            // 1. Sửa M3U8 có #EXT-X-MAP trỏ trùng segment TS đầu (NontonGo Acer/Salix/Cedrus/Mercury...)
+            val maybePlaylist = ct.contains("mpegurl") || ct.contains("m3u8") ||
+                url.substringBefore("?").endsWith(".m3u8", ignoreCase = true) ||
+                url.contains("/_stream") || url.contains("/cdn/")
+
+            if (maybePlaylist) {
+                val peekStr = try {
+                    response.peekBody(4096).string()
+                } catch (_: Exception) {
+                    ""
+                }
+                if (peekStr.trimStart('\uFEFF', ' ', '\t', '\r', '\n').startsWith("#EXTM3U")) {
+                    if (peekStr.contains("#EXT-X-MAP:")) {
+                        val rawText = body.string()
+                        val fixedText = sanitizeHlsPlaylist(rawText)
+                        val mime = "application/vnd.apple.mpegurl"
                         return@Interceptor response.newBuilder()
-                            .body(stripped.toResponseBody(mediaType))
-                            .header("Content-Type", "video/mp2t")
-                            .build()
-                    } else {
-                        val mediaType = body.contentType()
-                        return@Interceptor response.newBuilder()
-                            .body(bytes.toResponseBody(mediaType))
+                            .removeHeader("Content-Length")
+                            .removeHeader("Content-Encoding")
+                            .header("Content-Type", mime)
+                            .body(fixedText.toResponseBody(mime.toMediaType()))
                             .build()
                     }
+                    return@Interceptor response
                 }
             }
+
+            // 2. Peek 256 byte đầu để gỡ PNG giả mạo hoặc sửa Content-Type cho TS
+            val peek = try {
+                response.peekBody(256).bytes()
+            } catch (_: Exception) {
+                return@Interceptor response
+            }
+
+            if (peek.size >= 8 &&
+                peek[0] == 0x89.toByte() &&
+                peek[1] == 0x50.toByte() &&
+                peek[2] == 0x4E.toByte() &&
+                peek[3] == 0x47.toByte()
+            ) {
+                val bytes = body.bytes()
+                val offset = findPngPayloadOffset(bytes)
+                if (offset in 1 until bytes.size) {
+                    val stripped = bytes.copyOfRange(offset, bytes.size)
+                    val mime = detectSegmentMime(stripped)
+                    return@Interceptor response.newBuilder()
+                        .removeHeader("Content-Length")
+                        .removeHeader("Content-Encoding")
+                        .header("Content-Type", mime)
+                        .body(stripped.toResponseBody(mime.toMediaType()))
+                        .build()
+                }
+                val origType = body.contentType()
+                return@Interceptor response.newBuilder()
+                    .removeHeader("Content-Length")
+                    .removeHeader("Content-Encoding")
+                    .body(bytes.toResponseBody(origType))
+                    .build()
+            }
+
+            if (isMpegTs(peek) && (ct.isEmpty() || ct.startsWith("image/") || ct == "video/mp4" || ct == "application/octet-stream" || ct.contains("font"))) {
+                return@Interceptor response.newBuilder()
+                    .header("Content-Type", "video/mp2t")
+                    .build()
+            }
+
             response
         }
     }
@@ -348,6 +442,26 @@ class TwoNembedProvider : MainAPI() {
     // =====================================================================================
     // 6. LOAD LINKS
     // =====================================================================================
+    private data class CandidateButton(val url: String, val name: String)
+
+    private fun parseQuality(label: String): Int {
+        return when {
+            label.contains("4K", true) || label.contains("2160", true) -> Qualities.P2160.value
+            label.contains("1080", true) || label.contains("HD", true) || label.contains("HQ", true) -> Qualities.P1080.value
+            label.contains("720", true) -> Qualities.P720.value
+            label.contains("480", true) -> Qualities.P480.value
+            else -> Qualities.P720.value
+        }
+    }
+
+    private fun resolveUrl(baseUrl: String, relativeOrAbsolute: String): String {
+        return try {
+            URI(baseUrl).resolve(relativeOrAbsolute).toString()
+        } catch (_: Exception) {
+            relativeOrAbsolute
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -371,9 +485,10 @@ class TwoNembedProvider : MainAPI() {
                 "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
         var foundLink = false
         val registeredSubs = mutableSetOf<String>()
+        val seenUrls = mutableSetOf<String>()
 
         // ---------------------------------------------------------------------------------
-        // NGUỒN 1: NontonGo Direct Player (svsoapp)
+        // NGUỒN 1: NontonGo Player (southlong.nontongo.win / svsoapp / backup player)
         // ---------------------------------------------------------------------------------
         val nontongoPlayerUrl = if (type == "movie") {
             "https://nontongo.win/01aus/player.php?id=$tmdbId&type=movie&autoplay=true"
@@ -389,7 +504,6 @@ class TwoNembedProvider : MainAPI() {
                 headers = mapOf("User-Agent" to ua, "Referer" to "https://nontongo.win/")
             ).text
 
-            // 1. Phụ đề từ <track> — dùng Pattern.CASE_INSENSITIVE (không thể shadow)
             val trackPattern = Pattern.compile(
                 """<track[^>]+(?:data-src|src)=["']([^"']+)["'][^>]*label=["']([^"']+)["']|<track[^>]+label=["']([^"']+)["'][^>]+(?:data-src|src)=["']([^"']+)["']""",
                 Pattern.CASE_INSENSITIVE
@@ -398,43 +512,120 @@ class TwoNembedProvider : MainAPI() {
             while (trackMatcher.find()) {
                 val subUrl = (trackMatcher.group(1) ?: "").ifEmpty { trackMatcher.group(4) ?: "" }
                 val label = (trackMatcher.group(2) ?: "").ifEmpty { trackMatcher.group(3) ?: "" }
-                if (subUrl.isNotEmpty() && !registeredSubs.contains(subUrl)) {
-                    registeredSubs.add(subUrl)
+                if (subUrl.isNotEmpty() && registeredSubs.add(subUrl)) {
                     subtitleCallback.invoke(SubtitleFile(label, subUrl))
                     ClipboardLogger.logAndCopy("Sub Added", "$label -> $subUrl")
                 }
             }
 
-            // 2. Stream từ nút button — dùng Pattern.DOTALL (không thể shadow)
             val buttonPattern = Pattern.compile(
                 """<button[^>]*data-url=["']([^"']+)["'][^>]*>(.*?)</button>""",
                 Pattern.DOTALL
             )
+            val streamCandidates = mutableListOf<CandidateButton>()
+            val backupPages = mutableListOf<CandidateButton>()
+
             val buttonMatcher = buttonPattern.matcher(playerHtml)
             while (buttonMatcher.find()) {
-                val rawUrl = (buttonMatcher.group(1) ?: "").replace("&amp;", "&")
+                val rawUrl = (buttonMatcher.group(1) ?: "").replace("&amp;", "&").trim()
                 val labelHtml = buttonMatcher.group(2) ?: ""
                 val serverName = labelHtml.replace(Regex("<[^>]+>"), "").trim()
                     .ifEmpty { "Fast Server" }
+                if (rawUrl.isEmpty()) continue
 
-                if (rawUrl.contains("svsoapp") && rawUrl.contains(".m3u8")) {
-                    val link = safeCreateExtractorLink(
-                        source = this.name,
-                        name = "2embed - $serverName",
-                        url = rawUrl,
-                        referer = "https://nontongo.win/",
-                        quality = if (serverName.contains("HD", true))
-                            Qualities.P1080.value else Qualities.P720.value,
-                        isM3u8 = true,
-                        headers = mapOf(
-                            "User-Agent" to ua,
-                            "Referer" to "https://nontongo.win/",
-                            "Origin" to "https://nontongo.win"
+                if (rawUrl.contains("player-backup.php", ignoreCase = true) ||
+                    rawUrl.contains("player.php", ignoreCase = true)
+                ) {
+                    backupPages.add(CandidateButton(resolveUrl(nontongoPlayerUrl, rawUrl), serverName))
+                } else {
+                    streamCandidates.add(
+                        CandidateButton(
+                            resolveUrl(nontongoPlayerUrl, rawUrl).substringBefore("#"),
+                            serverName
                         )
                     )
+                }
+            }
+
+            val nontongoHeaders = mapOf(
+                "User-Agent" to ua,
+                "Referer" to "https://nontongo.win/",
+                "Origin" to "https://nontongo.win"
+            )
+
+            // Kiểm tra song song để loại bỏ các link chết (502/404)
+            val validNontonLinks = streamCandidates
+                .distinctBy { it.url }
+                .amap { cand ->
+                    try {
+                        val res = app.get(cand.url, headers = nontongoHeaders)
+                        if (res.code in 200..299 && res.text.trimStart().startsWith("#EXTM3U")) {
+                            safeCreateExtractorLink(
+                                source = this.name,
+                                name = "2embed - ${cand.name}",
+                                url = cand.url,
+                                referer = "https://nontongo.win/",
+                                quality = parseQuality(cand.name),
+                                isM3u8 = true,
+                                headers = nontongoHeaders
+                            )
+                        } else {
+                            ClipboardLogger.log("NontonGo Skip", "${cand.name} HTTP ${res.code}")
+                            null
+                        }
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        ClipboardLogger.log("NontonGo Probe Err", "${cand.name}: ${e.message}")
+                        null
+                    }
+                }
+                .filterNotNull()
+
+            for (link in validNontonLinks) {
+                if (seenUrls.add(link.url)) {
                     callback.invoke(link)
                     foundLink = true
-                    ClipboardLogger.logAndCopy("Stream Added", "Server: $serverName (svsoapp)")
+                    ClipboardLogger.logAndCopy("Stream Added", "${link.name} (NontonGo)")
+                }
+            }
+
+            // Kiểm tra trang dự phòng MP4 (usa.nontongo.win/01baltic/player-backup.php)
+            for (bk in backupPages) {
+                try {
+                    val bkHtml = app.get(
+                        bk.url,
+                        headers = mapOf("User-Agent" to ua, "Referer" to "https://nontongo.win/")
+                    ).text
+                    val bkOriginMatch = Pattern.compile("""^(https?://[^/]+)""").matcher(bk.url)
+                    val bkOrigin = if (bkOriginMatch.find()) bkOriginMatch.group(1)!! else "https://usa.nontongo.win"
+                    val bkMatcher = buttonPattern.matcher(bkHtml)
+                    while (bkMatcher.find()) {
+                        val bUrl = (bkMatcher.group(1) ?: "").replace("&amp;", "&").substringBefore("#").trim()
+                        val bName = (bkMatcher.group(2) ?: "").replace(Regex("<[^>]+>"), "").trim()
+                            .ifEmpty { bk.name }
+                        if (bUrl.startsWith("http") && seenUrls.add(bUrl)) {
+                            val isHls = bUrl.contains(".m3u8", ignoreCase = true)
+                            val link = safeCreateExtractorLink(
+                                source = this.name,
+                                name = "2embed - $bName (Backup)",
+                                url = bUrl,
+                                referer = "$bkOrigin/",
+                                quality = parseQuality(bName),
+                                isM3u8 = isHls,
+                                headers = mapOf(
+                                    "User-Agent" to ua,
+                                    "Referer" to "$bkOrigin/",
+                                    "Origin" to bkOrigin
+                                )
+                            )
+                            callback.invoke(link)
+                            foundLink = true
+                            ClipboardLogger.logAndCopy("Stream Added", "$bName (Backup)")
+                        }
+                    }
+                } catch (e: Exception) {
+                    if (e is java.util.concurrent.CancellationException) throw e
+                    ClipboardLogger.log("Backup Error", e.message ?: "")
                 }
             }
         } catch (e: Exception) {
@@ -445,19 +636,24 @@ class TwoNembedProvider : MainAPI() {
         // ---------------------------------------------------------------------------------
         // NGUỒN 2: vidsrc.buzz / videm.buzz
         // ---------------------------------------------------------------------------------
-        val embedCandidates = mutableListOf<String>()
-        if (type == "movie") {
-            embedCandidates.add("https://vidsrc.buzz/embed/movie/$tmdbId")
-            embedCandidates.add("https://videm.buzz/embed/movie/$tmdbId")
+        val embedCandidates = if (type == "movie") {
+            listOf(
+                "https://vidsrc.buzz/embed/movie/$tmdbId",
+                "https://videm.buzz/embed/movie/$tmdbId"
+            )
         } else {
-            embedCandidates.add("https://vidsrc.buzz/embed/tv/$tmdbId/${season ?: 1}/${episode ?: 1}")
-            embedCandidates.add("https://videm.buzz/embed/tv/$tmdbId/${season ?: 1}/${episode ?: 1}")
+            listOf(
+                "https://vidsrc.buzz/embed/tv/$tmdbId/${season ?: 1}/${episode ?: 1}",
+                "https://videm.buzz/embed/tv/$tmdbId/${season ?: 1}/${episode ?: 1}"
+            )
         }
 
+        var addedVidsrcServers = 0
         for (playerUrl in embedCandidates) {
+            if (addedVidsrcServers > 0) break
             try {
                 val pDomainMatch = Pattern.compile("""^(https?://[^/]+)""").matcher(playerUrl)
-                val pDomain = if (pDomainMatch.find()) pDomainMatch.group(1) else "https://vidsrc.buzz"
+                val pDomain = if (pDomainMatch.find()) pDomainMatch.group(1)!! else "https://vidsrc.buzz"
                 val pHtml = app.get(
                     playerUrl,
                     headers = mapOf(
@@ -466,30 +662,36 @@ class TwoNembedProvider : MainAPI() {
                     )
                 ).text
 
-                // Pattern.DOTALL — không thể shadow
+                // Đọc <base href="..."> để gọi đúng /pl/api.php (vidsrc.buzz) hoặc /api.php (videm.buzz)
+                val baseMatcher = Pattern.compile(
+                    """<base[^>]+href=["']([^"']+)["']""",
+                    Pattern.CASE_INSENSITIVE
+                ).matcher(pHtml)
+                val baseHref = if (baseMatcher.find()) baseMatcher.group(1) ?: "/" else "/"
+                val apiBaseUrl = resolveUrl(playerUrl, baseHref).trimEnd('/')
+
                 val qPattern = Pattern.compile("""var Q\s*=\s*(\{.*?\});""", Pattern.DOTALL)
                 val qMatcher = qPattern.matcher(pHtml)
                 if (!qMatcher.find()) continue
-                val qJson = JSONObject(qMatcher.group(1))
+                val qJson = JSONObject(qMatcher.group(1)!!)
                 val token = qJson.optString("t")
                 val qType = qJson.optString("type", type)
                 val qId = qJson.optString("id", tmdbId.toString())
                 val qS = qJson.optInt("s", season ?: 0)
                 val qE = qJson.optInt("e", episode ?: 0)
 
-                // Phụ đề OpenSubtitles
+                val apiHeaders = mapOf(
+                    "User-Agent" to ua,
+                    "Referer" to playerUrl,
+                    "Origin" to pDomain,
+                    "Accept" to "application/json"
+                )
+
+                // Phụ đề OpenSubtitles (ưu tiên api.php?a=sub trả text/vtt thay cho link .gz)
                 try {
-                    val subsUrl = "$pDomain/pl/api.php?a=subs&type=$qType&id=$qId&s=$qS&e=$qE" +
+                    val subsUrl = "$apiBaseUrl/api.php?a=subs&type=$qType&id=$qId&s=$qS&e=$qE" +
                             "&t=${URLEncoder.encode(token, "UTF-8")}"
-                    val subsRes = app.get(
-                        subsUrl,
-                        headers = mapOf(
-                            "User-Agent" to ua,
-                            "Referer" to playerUrl,
-                            "Origin" to pDomain,
-                            "Accept" to "application/json"
-                        )
-                    ).text
+                    val subsRes = app.get(subsUrl, headers = apiHeaders).text
 
                     if (subsRes.trimStart().startsWith("{")) {
                         val subsJson = JSONObject(subsRes)
@@ -508,18 +710,24 @@ class TwoNembedProvider : MainAPI() {
                                 if (directUrl.isEmpty() && subRef.isNotEmpty()) {
                                     try {
                                         val payload = subRef.substringBefore(".")
-                                        val padded = payload + "=".repeat((4 - payload.length % 4) % 4)
-                                        val decodedBytes = Base64.getUrlDecoder().decode(padded)
+                                        val decodedBytes = Base64.decode(
+                                            payload,
+                                            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
+                                        )
                                         val decodedJson = JSONObject(String(decodedBytes))
                                         directUrl = decodedJson.optString("u")
                                     } catch (_: Exception) { }
                                 }
 
-                                val finalSubUrl = if (directUrl.isNotEmpty()) directUrl
-                                else "$pDomain/pl/api.php?a=sub&ref=${URLEncoder.encode(subRef, "UTF-8")}"
+                                val finalSubUrl = if (directUrl.isNotEmpty() && !directUrl.endsWith(".gz", ignoreCase = true)) {
+                                    directUrl
+                                } else if (subRef.isNotEmpty()) {
+                                    "$apiBaseUrl/api.php?a=sub&ref=${URLEncoder.encode(subRef, "UTF-8")}"
+                                } else {
+                                    directUrl
+                                }
 
-                                if (!registeredSubs.contains(finalSubUrl)) {
-                                    registeredSubs.add(finalSubUrl)
+                                if (finalSubUrl.isNotEmpty() && registeredSubs.add(finalSubUrl)) {
                                     subtitleCallback.invoke(
                                         SubtitleFile("$label (OpenSubs)", finalSubUrl)
                                     )
@@ -532,57 +740,68 @@ class TwoNembedProvider : MainAPI() {
                     ClipboardLogger.logAndCopy("Vidsrc Subs Error", e.message ?: "")
                 }
 
-                // Các luồng máy chủ vidsrc
+                // Các luồng máy chủ vidsrc / videm
                 val servers = qJson.optJSONObject("ssr")?.optJSONArray("servers")
                 if (servers != null) {
-                    for (i in 0 until servers.length()) {
-                        try {
-                            val serverObj = servers.getJSONObject(i)
-                            val sName = serverObj.optString("name", "Server ${i + 1}")
-                            val sRef = serverObj.optString("ref")
+                    val serverList = (0 until servers.length()).map { servers.getJSONObject(it) }
+                    val streamHeaders = mapOf(
+                        "Origin" to pDomain,
+                        "Referer" to "$pDomain/",
+                        "User-Agent" to ua
+                    )
 
-                            val playApiUrl = "$pDomain/pl/api.php?a=play" +
+                    val resolvedLinks = serverList.amap { serverObj ->
+                        val sName = serverObj.optString("name", "Server")
+                        val sRef = serverObj.optString("ref")
+                        if (sRef.isEmpty()) return@amap null
+                        try {
+                            val playApiUrl = "$apiBaseUrl/api.php?a=play" +
                                     "&ref=${URLEncoder.encode(sRef, "UTF-8")}" +
                                     "&t=${URLEncoder.encode(token, "UTF-8")}"
-                            val playRes = app.get(
-                                playApiUrl,
-                                headers = mapOf(
-                                    "User-Agent" to ua,
-                                    "Referer" to playerUrl,
-                                    "Origin" to pDomain,
-                                    "Accept" to "application/json"
-                                )
-                            ).text
-
-                            val playJson = JSONObject(playRes)
-                            var streamUrl = playJson.optString("url")
-                            if (streamUrl.isEmpty()) continue
-
-                            if (streamUrl.startsWith("/")) {
-                                streamUrl = if (streamUrl.startsWith("/pl/"))
-                                    "$pDomain$streamUrl"
-                                else "$pDomain/pl$streamUrl"
+                            val playRes = app.get(playApiUrl, headers = apiHeaders).text
+                            if (!playRes.trimStart().startsWith("{")) {
+                                ClipboardLogger.log("Server Play Skip", "$sName: non-JSON response")
+                                return@amap null
                             }
 
-                            val link = safeCreateExtractorLink(
+                            val playJson = JSONObject(playRes)
+                            val rawStreamUrl = playJson.optString("url")
+                            if (rawStreamUrl.isEmpty()) return@amap null
+
+                            // Giữ nguyên root path ("/_stream?id=...") không tự ý ghép "/pl"
+                            val resolvedStreamUrl = resolveUrl(playerUrl, rawStreamUrl).substringBefore("#")
+                            val isHls = !playJson.optString("type", "hls").equals("mp4", true)
+
+                            if (isHls) {
+                                val probe = app.get(resolvedStreamUrl, headers = streamHeaders)
+                                if (probe.code !in 200..299 || !probe.text.trimStart().startsWith("#EXTM3U")) {
+                                    ClipboardLogger.log("Vidsrc Probe Skip", "$sName HTTP ${probe.code}")
+                                    return@amap null
+                                }
+                            }
+
+                            safeCreateExtractorLink(
                                 source = this.name,
                                 name = "2embed - $sName",
-                                url = streamUrl,
+                                url = resolvedStreamUrl,
                                 referer = "$pDomain/",
                                 quality = Qualities.P1080.value,
-                                isM3u8 = true,
-                                headers = mapOf(
-                                    "Origin" to pDomain,
-                                    "Referer" to "$pDomain/",
-                                    "User-Agent" to ua
-                                )
+                                isM3u8 = isHls,
+                                headers = streamHeaders
                             )
-                            callback.invoke(link)
-                            foundLink = true
-                            ClipboardLogger.logAndCopy("Stream Added", "Server: $sName (vidsrc)")
                         } catch (e: Exception) {
                             if (e is java.util.concurrent.CancellationException) throw e
-                            ClipboardLogger.logAndCopy("Server Play Error", e.message ?: "")
+                            ClipboardLogger.logAndCopy("Server Play Error", "$sName: ${e.message ?: ""}")
+                            null
+                        }
+                    }.filterNotNull()
+
+                    for (link in resolvedLinks) {
+                        if (seenUrls.add(link.url)) {
+                            callback.invoke(link)
+                            foundLink = true
+                            addedVidsrcServers++
+                            ClipboardLogger.logAndCopy("Stream Added", "${link.name} (vidsrc)")
                         }
                     }
                 }
