@@ -1,4 +1,3 @@
-
 package com.lagradost
 
 import android.content.ClipData
@@ -7,9 +6,10 @@ import android.content.Context
 import android.util.Log
 import com.lagradost.cloudstream3.CommonActivity
 
+/** Clipboard + Logcat diagnostics for CloudStream 4.5.x. */
 object ClipboardLogger {
     private const val TAG = "HnembedDiag"
-    private const val MAX_CHARS = 45000
+    private const val MAX_CHARS = 45_000
 
     private val lock = Any()
     private val buffer = StringBuilder()
@@ -22,14 +22,10 @@ object ClipboardLogger {
     }
 
     fun logAndCopy(title: String, message: String) {
-        val safeMessage = redact(message).take(9000)
-        val entry = "=== [$title] ===\n" +
-            "$safeMessage\n" +
-            "===================\n"
+        val entry = "=== [$title] ===\n${redact(message).take(9_000)}\n===================\n"
 
         synchronized(lock) {
             buffer.append(entry).append('\n')
-
             if (buffer.length > MAX_CHARS) {
                 buffer.delete(0, buffer.length - MAX_CHARS)
             }
@@ -40,25 +36,18 @@ object ClipboardLogger {
         val activity = try {
             CommonActivity.activity
         } catch (e: Throwable) {
-            Log.e(TAG, "Cannot get CommonActivity", e)
+            Log.e(TAG, "Cannot obtain CommonActivity", e)
             null
         }
 
         if (activity == null) {
-            Log.w(
-                TAG,
-                "CLIPBOARD SKIPPED: CommonActivity.activity is null"
-            )
+            Log.w(TAG, "CLIPBOARD SKIPPED: CommonActivity.activity is null")
             return
         }
 
         activity.runOnUiThread {
             try {
-                // Read the latest buffer when the UI task executes.
-                val snapshot = synchronized(lock) {
-                    buffer.toString()
-                }
-
+                val snapshot = synchronized(lock) { buffer.toString() }
                 val clipboard = activity.getSystemService(
                     Context.CLIPBOARD_SERVICE
                 ) as? ClipboardManager
@@ -69,16 +58,9 @@ object ClipboardLogger {
                 }
 
                 clipboard.setPrimaryClip(
-                    ClipData.newPlainText(
-                        "Hnembed diagnostics",
-                        snapshot
-                    )
+                    ClipData.newPlainText("Hnembed diagnostics", snapshot)
                 )
-
-                Log.d(
-                    TAG,
-                    "CLIPBOARD UPDATED: ${snapshot.length} characters"
-                )
+                Log.d(TAG, "CLIPBOARD UPDATED: ${snapshot.length} characters")
             } catch (e: Exception) {
                 Log.e(TAG, "Clipboard copy failed", e)
             }
@@ -88,13 +70,11 @@ object ClipboardLogger {
     private fun redact(input: String): String {
         return input
             .replace(
-                Regex(
-                    """(?i)(api_token|token|authorization|cookie|vs)=([^&\s"'<>]+)"""
-                ),
+                Regex("""(?i)(api_token|token|authorization|cookie|vs)=([^&\\s"'<>]+)"""),
                 "$1=<redacted>"
             )
             .replace(
-                Regex("""(?i)(Bearer\s+)[A-Za-z0-9._~-]+"""),
+                Regex("""(?i)(Bearer\\s+)[A-Za-z0-9._~-]+"""),
                 "$1<redacted>"
             )
     }
