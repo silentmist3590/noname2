@@ -51,7 +51,7 @@ object ClipboardLogger {
 
     private fun redact(value: String): String = value
         .replace(
-            Regex("""(?i)([?&](?:vs|token|key|sig|signature|auth|authorization)=)[^&\s]+"""),
+            Regex("""(?i)([?&](?:api[_-]?)?(?:vs|token|key|sig|signature|auth|authorization)=)[^&\s]+"""),
             "$1<redacted>"
         )
         .replace(
