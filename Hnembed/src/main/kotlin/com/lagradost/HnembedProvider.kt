@@ -314,31 +314,47 @@ class HnembedProvider : MainAPI() {
 
                     val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
                     // Trigger only well-known video-player controls; never click arbitrary page buttons.
-                    val clickJs = "(function(){try{" +
-                        "var sels=['#bigPlay','.jw-icon-display','.jw-display-icon-container','.jw-bigplay'," +
-                        '.vjs-big-play-button','.plyr__control--overlaid','[data-plyr=play]'," +
-                        '[aria-label="Play"],button[title="Play"]'];' +
-                        "for(var i=0;i<sels.length;i++){var e=document.querySelector(sels[i]);" +
-                        "if(e&&e.getClientRects().length){e.click();break;}}" +
-                        "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();" +
-                        "if(p&&p.catch)p.catch(function(){});}" +
-                        "if(typeof window.jwplayer==='function'){try{window.jwplayer().play(true);}catch(e){}}" +
-                        "}catch(e){}})();"
-                    val probeJs = "(function(){try{" +
-                        "var vs=[].slice.call(document.querySelectorAll('video')).map(function(v){return {" +
-                        "src:v.getAttribute('src')||'',currentSrc:v.currentSrc||'',paused:v.paused," +
-                        "readyState:v.readyState,networkState:v.networkState,duration:v.duration," +
-                        "error:v.error?{code:v.error.code,message:v.error.message}:null}});" +
-                        "var ifr=[].slice.call(document.querySelectorAll('iframe')).map(function(f){return f.src||''}).slice(0,8);" +
-                        "var buttons=[].slice.call(document.querySelectorAll('button,[role=button]')).map(function(b){" +
-                        "return (b.id||'')+'|'+(b.className||'')+'|'+(b.getAttribute('aria-label')||b.title||b.innerText||'').slice(0,60)" +
-                        "}).slice(0,20);" +
-                        "var res=performance.getEntriesByType('resource').map(function(x){return x.name}).filter(function(x){" +
-                        "return /m3u8|mpd|mp4|m4s|\\.ts(?:[?#]|$)|page-\\\\d+\\.html/i.test(x)}).slice(-20);" +
-                        "return JSON.stringify({ready:document.readyState,title:document.title,url:location.href," +
-                        "video:vs,iframes:ifr,buttons:buttons,Hls:!!window.Hls,jwplayer:typeof window.jwplayer," +
-                        "resources:res,body:(document.body&&document.body.innerText||'').slice(0,500)});" +
-                        "}catch(e){return JSON.stringify({probeError:String(e)});}})();"
+                    val clickJs = """
+                        (function(){try{
+                          var sels=['#bigPlay','.jw-icon-display','.jw-display-icon-container',
+                            '.jw-bigplay','.vjs-big-play-button','.plyr__control--overlaid',
+                            '[data-plyr=play]','[aria-label="Play"]','button[title="Play"]'];
+                          for(var i=0;i<sels.length;i++){
+                            var e=document.querySelector(sels[i]);
+                            if(e&&e.getClientRects().length){e.click();break;}
+                          }
+                          var v=document.querySelector('video');
+                          if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}
+                          if(typeof window.jwplayer==='function'){
+                            try{window.jwplayer().play(true);}catch(e){}
+                          }
+                        }catch(e){}})();
+                    """.trimIndent()
+                    val probeJs = """
+                        (function(){try{
+                          var vs=[].slice.call(document.querySelectorAll('video')).map(function(v){return {
+                            src:v.getAttribute('src')||'',currentSrc:v.currentSrc||'',paused:v.paused,
+                            readyState:v.readyState,networkState:v.networkState,duration:v.duration,
+                            error:v.error?{code:v.error.code,message:v.error.message}:null
+                          };});
+                          var ifr=[].slice.call(document.querySelectorAll('iframe'))
+                            .map(function(f){return f.src||'';}).slice(0,8);
+                          var buttons=[].slice.call(document.querySelectorAll('button,[role=button]'))
+                            .map(function(b){
+                              return (b.id||'')+'|'+(b.className||'')+'|'+
+                                (b.getAttribute('aria-label')||b.title||b.innerText||'').slice(0,60);
+                            }).slice(0,20);
+                          var res=performance.getEntriesByType('resource').map(function(x){return x.name;})
+                            .filter(function(x){return /m3u8|mpd|mp4|m4s|\\.ts(?:[?#]|$)|page-\\d+\\.html/i.test(x);})
+                            .slice(-20);
+                          return JSON.stringify({
+                            ready:document.readyState,title:document.title,url:location.href,
+                            video:vs,iframes:ifr,buttons:buttons,Hls:!!window.Hls,
+                            jwplayer:typeof window.jwplayer,resources:res,
+                            body:(document.body&&document.body.innerText||'').slice(0,500)
+                          });
+                        }catch(e){return JSON.stringify({probeError:String(e)});}})();
+                    """.trimIndent()
 
                     var taps = 0
                     var probes = 0
@@ -349,8 +365,9 @@ class HnembedProvider : MainAPI() {
                             wv.evaluateJavascript(fakePopup + clickJs, null)
                             if (probes < 10) {
                                 probes++
+                                val probeIndex = probes
                                 wv.evaluateJavascript(probeJs) { result ->
-                                    ClipboardLogger.logAndCopy("Player State #$probes", result ?: "(no JS result)")
+                                    ClipboardLogger.logAndCopy("Player State #$probeIndex", result ?: "(no JS result)")
                                 }
                             }
                             val t = SystemClock.uptimeMillis()
