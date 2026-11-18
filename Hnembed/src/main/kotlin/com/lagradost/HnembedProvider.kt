@@ -563,57 +563,57 @@ class HnembedProvider : MainAPI() {
 
         val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
         
-        // Danh sách các mirror cung cấp vs_src.php
-        val mirrors = listOf("https://hnembed.cc", "https://vidsrc.sh", "https://vidsrc.io")
+        // Use only the two embed domains documented by HNEmbed.
+        // The public documentation specifies direct embed URLs.
+        val embedDomains = listOf("https://hnembed.cc", "https://hnembed.net")
         var finalUrl: String? = null
-        var refererForWv = "https://stellarconductornexus.com/"
+        var refererForWv = ""
         var streamPageUrl: String? = null
         var streamHeaders: Map<String, String> = emptyMap()
 
-        for (mirror in mirrors) {
-            val embedUrl = if (type == "movie") "$mirror/embed/movie/$tmdbId/" else "$mirror/embed/tv/$tmdbId/$season/$episode/"
-            val srcApi = if (type == "movie") "$mirror/vs_src.php?type=movie&id=$tmdbId"
-            else "$mirror/vs_src.php?type=tv&id=$tmdbId&season=$season&episode=$episode"
-
-            for (attempt in 1..2) {
-                try {
-                    val r2 = app.get(srcApi, headers = mapOf(
-                        "User-Agent" to ua,
-                        "Accept" to "application/json",
-                        "Referer" to embedUrl,
-                        "Origin" to mirror
-                    ))
-                    val if2 = Regex("\"src\"\\s*:\\s*\"([^\"]+)\"").find(r2.text)?.groupValues?.get(1)?.let { cleanJsUrl(it) }
-                    if (if2 == null) {
-                        ClipboardLogger.logAndCopy("Notice", "Mirror $mirror lần $attempt: HTTP ${r2.code}: ${r2.text.take(150)}")
-                        continue
-                    }
-
-                    val r3 = app.get(if2, headers = mapOf("User-Agent" to ua, "Referer" to "$mirror/"))
-                    val pu = Regex("\"playerUrl\"\\s*:\\s*\"([^\"]+)\"").find(r3.text)?.groupValues?.get(1)
-                    val target = pu?.let { absUrl(if2, cleanJsUrl(it)) } ?: if2
-                    refererForWv = if2
-
-                    ClipboardLogger.logAndCopy("Target", "Sniffing $target")
-                    val seen = mutableListOf<String>()
-                    val capturedHeaders = linkedMapOf<String, String>()
-                    finalUrl = sniffStream(target, refererForWv, ua, seen, subtitleCallback, capturedHeaders)
-                    ClipboardLogger.logAndCopy(
-                        "Sniff Result",
-                        "mirror=$mirror; attempt=$attempt; result=" + (finalUrl ?: "NOT FOUND") +
-                            "; requests=" + seen.size + "\n" + synchronized(seen) { seen.joinToString("\n") }
-                    )
-                    if (finalUrl != null) {
-                        streamPageUrl = target
-                        streamHeaders = synchronized(capturedHeaders) { capturedHeaders.toMap() }
-                        break
-                    }
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    ClipboardLogger.logAndCopy("Exception", "Mirror $mirror lần $attempt: ${e.message}")
-                }
+        for (domain in embedDomains) {
+            val target = if (type == "movie") {
+                "$domain/embed/movie/$tmdbId"
+            } else {
+                "$domain/embed/tv/$tmdbId/$season/$episode"
             }
-            if (finalUrl != null) break
+            refererForWv = "$domain/"
+
+            ClipboardLogger.logAndCopy(
+                "Documented Embed URL",
+                "domain=$domain; type=$type; target=$target; referer=$refererForWv"
+            )
+
+            try {
+                val seen = mutableListOf<String>()
+                val capturedHeaders = linkedMapOf<String, String>()
+                finalUrl = sniffStream(
+                    target,
+                    refererForWv,
+                    ua,
+                    seen,
+                    subtitleCallback,
+                    capturedHeaders
+                )
+
+                ClipboardLogger.logAndCopy(
+                    "Sniff Result",
+                    "domain=$domain; target=$target; result=" + (finalUrl ?: "NOT FOUND") +
+                        "; requests=" + seen.size + "\n" + synchronized(seen) { seen.joinToString("\n") }
+                )
+
+                if (!finalUrl.isNullOrBlank()) {
+                    streamPageUrl = target
+                    streamHeaders = synchronized(capturedHeaders) { capturedHeaders.toMap() }
+                    break
+                }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                ClipboardLogger.logAndCopy(
+                    "Embed Exception",
+                    "domain=$domain; target=$target; " + e.message + "\n" + e.stackTraceToString().take(900)
+                )
+            }
         }
 
         val url = finalUrl
