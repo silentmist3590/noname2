@@ -1,13 +1,14 @@
 package com.lagradost
 
 import android.annotation.SuppressLint
-import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.net.Uri
+import android.webkit.CookieManager
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -256,24 +257,15 @@ class HnembedProvider : MainAPI() {
         referer: String,
         ua: String,
         seen: MutableList<String>,
-        subtitleCallback: (SubtitleFile) -> Unit
+        subtitleCallback: (SubtitleFile) -> Unit,
+        capturedHeaders: MutableMap<String, String>
     ): String? {
         return suspendCoroutine { cont ->
             val handler = Handler(Looper.getMainLooper())
             handler.post {
-                val appCtx: Context? = try {
-                    CloudStreamApp.context
-                } catch (_: Throwable) {
-                    try {
-                        val activityThread = Class.forName("android.app.ActivityThread")
-                        val method = activityThread.getMethod("currentApplication")
-                        method.invoke(null) as? Context
-                    } catch (_: Throwable) {
-                        null
-                    }
-                }
+                // CloudStream 4.5.2: avoid the non-public CloudStreamApp class.
                 val act = try { CommonActivity.activity } catch (_: Throwable) { null }
-                val ctx: Context? = act ?: appCtx
+                val ctx = act
                 if (ctx == null) {
                     ClipboardLogger.logAndCopy("Sniff", "Không có Context để khởi tạo WebView")
                     cont.resume(null)
@@ -281,9 +273,18 @@ class HnembedProvider : MainAPI() {
                 }
 
                 try {
-                    val w = 1080
-                    val h = 1920
-                    val wv = WebView(ctx)
+                    // Use the real device orientation and dimensions (TVs are usually landscape).
+                    val metrics = ctx.resources.displayMetrics
+                    val w = metrics.widthPixels.coerceAtLeast(1)
+                    val h = metrics.heightPixels.coerceAtLeast(1)
+                    val wv = WebView(ctx).apply {
+                        // Keep the page in the visible window so visibility checks and simulated
+                        // center taps work, while making the sniffing surface effectively invisible.
+                        alpha = 0.01f
+                        isFocusable = false
+                        isFocusableInTouchMode = false
+                        isClickable = false
+                    }
                     var finished = false
 
                     fun finish(res: String?) {
@@ -298,7 +299,10 @@ class HnembedProvider : MainAPI() {
                         cont.resume(res)
                     }
 
-                    val streamRegex = Regex("""\.m3u8|\.mpd|master\.txt""", RegexOption.IGNORE_CASE)
+                    val streamRegex = Regex(
+                        """\.(?:m3u8|mpd|mp4)(?:$|[?#&])|master\.txt(?:$|[?#&])""",
+                        RegexOption.IGNORE_CASE
+                    )
                     val junkRegex = Regex("""\.(css|png|jpe?g|gif|svg|ico|woff2?|ttf)(\?|$)""", RegexOption.IGNORE_CASE)
 
                     wv.settings.apply {
@@ -310,23 +314,81 @@ class HnembedProvider : MainAPI() {
                         userAgentString = ua
                         mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     }
+                    CookieManager.getInstance().setAcceptCookie(true)
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
                     wv.webChromeClient = object : WebChromeClient() {
                         override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
+
+                        override fun onConsoleMessage(message: android.webkit.ConsoleMessage?): Boolean {
+                            if (message != null) {
+                                ClipboardLogger.logAndCopy(
+                                    "JavaScript Console",
+                                    message.message().take(1200) + " at " + message.sourceId() + ":" + message.lineNumber()
+                                )
+                            }
+                            return true
+                        }
                     }
 
                     val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
-                    val clickJs = "(function(){function fire(el){if(!el)return;try{el.click();}catch(e){}}" +
-                            "fire(document.getElementById('bigPlay'));" +
-                            "fire(document.querySelector('.jw-icon-display,.jw-display-icon-container,.jw-bigplay,[aria-label=Play]'));" +
-                            "var v=document.querySelector('video');if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}})();"
+                    // Trigger only well-known video-player controls; never click arbitrary page buttons.
+                    val clickJs = """
+                        (function(){try{
+                          var sels=['#bigPlay','.jw-icon-display','.jw-display-icon-container',
+                            '.jw-bigplay','.vjs-big-play-button','.plyr__control--overlaid',
+                            '[data-plyr=play]','[aria-label="Play"]','button[title="Play"]'];
+                          for(var i=0;i<sels.length;i++){
+                            var e=document.querySelector(sels[i]);
+                            if(e&&e.getClientRects().length){e.click();break;}
+                          }
+                          var v=document.querySelector('video');
+                          if(v){v.muted=true;var p=v.play();if(p&&p.catch)p.catch(function(){});}
+                          if(typeof window.jwplayer==='function'){
+                            try{window.jwplayer().play(true);}catch(e){}
+                          }
+                        }catch(e){}})();
+                    """.trimIndent()
+                    val probeJs = """
+                        (function(){try{
+                          var vs=[].slice.call(document.querySelectorAll('video')).map(function(v){return {
+                            src:v.getAttribute('src')||'',currentSrc:v.currentSrc||'',paused:v.paused,
+                            readyState:v.readyState,networkState:v.networkState,duration:v.duration,
+                            error:v.error?{code:v.error.code,message:v.error.message}:null
+                          };});
+                          var ifr=[].slice.call(document.querySelectorAll('iframe'))
+                            .map(function(f){return f.src||'';}).slice(0,8);
+                          var buttons=[].slice.call(document.querySelectorAll('button,[role=button]'))
+                            .map(function(b){
+                              return (b.id||'')+'|'+(b.className||'')+'|'+
+                                (b.getAttribute('aria-label')||b.title||b.innerText||'').slice(0,60);
+                            }).slice(0,20);
+                          var res=performance.getEntriesByType('resource').map(function(x){return x.name;})
+                            .filter(function(x){return /m3u8|mpd|mp4|m4s|\.ts(?:[?#]|$)|page-\d+\.html/i.test(x);})
+                            .slice(-20);
+                          return JSON.stringify({
+                            ready:document.readyState,title:document.title,url:location.href,
+                            video:vs,iframes:ifr,buttons:buttons,Hls:!!window.Hls,
+                            jwplayer:typeof window.jwplayer,resources:res,
+                            body:(document.body&&document.body.innerText||'').slice(0,500)
+                          });
+                        }catch(e){return JSON.stringify({probeError:String(e)});}})();
+                    """.trimIndent()
 
                     var taps = 0
+                    var probes = 0
                     fun tap() {
                         if (finished) return
                         taps++
                         try {
                             wv.evaluateJavascript(fakePopup + clickJs, null)
+                            if (probes < 10) {
+                                probes++
+                                val probeIndex = probes
+                                wv.evaluateJavascript(probeJs) { result ->
+                                    ClipboardLogger.logAndCopy("Player State #$probeIndex", result ?: "(no JS result)")
+                                }
+                            }
                             val t = SystemClock.uptimeMillis()
                             val d = MotionEvent.obtain(t, t, MotionEvent.ACTION_DOWN, w / 2f, h / 2f, 0)
                             val u = MotionEvent.obtain(t, t + 60, MotionEvent.ACTION_UP, w / 2f, h / 2f, 0)
@@ -341,10 +403,33 @@ class HnembedProvider : MainAPI() {
                     wv.webViewClient = object : WebViewClient() {
                         override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
                             val u = request?.url?.toString() ?: return null
-                            if (!junkRegex.containsMatchIn(u) && seen.size < 80) seen.add(u.take(220))
+                            if (!junkRegex.containsMatchIn(u)) {
+                                synchronized(seen) {
+                                    if (seen.size < 100) seen.add((request?.method ?: "GET") + " " + u.take(260))
+                                }
+                            }
 
-                            // Bắt link stream video
+                            // Capture request headers required by some signed playlists.
                             if (streamRegex.containsMatchIn(u) && !u.contains("/embed/iframe_player/")) {
+                                try {
+                                    request?.requestHeaders?.forEach { (key, value) ->
+                                        if (key.equals("cookie", true) ||
+                                            key.equals("authorization", true) ||
+                                            key.equals("referer", true) ||
+                                            key.equals("origin", true) ||
+                                            key.equals("user-agent", true)
+                                        ) {
+                                            synchronized(capturedHeaders) { capturedHeaders[key] = value }
+                                        }
+                                    }
+                                    val cookie = CookieManager.getInstance().getCookie(u)
+                                    if (!cookie.isNullOrBlank()) {
+                                        synchronized(capturedHeaders) { capturedHeaders["Cookie"] = cookie }
+                                    }
+                                } catch (e: Throwable) {
+                                    ClipboardLogger.logAndCopy("Stream headers", e.message ?: "Could not read headers")
+                                }
+                                ClipboardLogger.logAndCopy("Stream candidate", "Captured " + u.take(500))
                                 handler.post { finish(u) }
                             }
 
@@ -358,23 +443,84 @@ class HnembedProvider : MainAPI() {
                         }
 
                         override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                            val u = request?.url?.toString() ?: return false
-                            val ok = u.startsWith(pageUrl.substringBefore("?")) || u.contains("stellarconductornexus.com")
-                            if (!ok) seen.add("BLOCKED: " + u.take(150))
-                            return !ok
+                            val req = request ?: return false
+                            // The actual video player is often hosted in a cross-origin iframe.
+                            // Allow iframe navigation; popup windows remain disabled above.
+                            if (!req.isForMainFrame) return false
+
+                            val uri = req.url
+                            val u = uri.toString()
+                            if (uri.scheme != "http" && uri.scheme != "https") {
+                                synchronized(seen) {
+                                    if (seen.size < 100) seen.add("BLOCKED SCHEME: " + u.take(180))
+                                }
+                                return true
+                            }
+
+                            val initialHost = Uri.parse(pageUrl).host?.lowercase()
+                            val host = uri.host?.lowercase()
+                            val allowMainFrame = host != null && (
+                                host == initialHost ||
+                                host == "stellarconductornexus.com" ||
+                                host.endsWith(".stellarconductornexus.com")
+                            )
+                            if (!allowMainFrame) {
+                                synchronized(seen) {
+                                    if (seen.size < 100) seen.add("BLOCKED MAIN FRAME: " + u.take(220))
+                                }
+                            }
+                            return !allowMainFrame
+                        }
+
+                        override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                            ClipboardLogger.logAndCopy("WebView page started", url ?: "(null)")
                         }
 
                         override fun onPageFinished(view: WebView?, url: String?) {
+                            ClipboardLogger.logAndCopy("WebView page finished", url ?: "(null)")
                             handler.postDelayed({ tap() }, 800)
+                        }
+
+                        override fun onReceivedError(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                            error: android.webkit.WebResourceError?
+                        ) {
+                            if (request?.isForMainFrame == true) {
+                                ClipboardLogger.logAndCopy(
+                                    "WebView main-frame error",
+                                    "url=" + request.url + "; code=" + error?.errorCode + "; description=" + error?.description
+                                )
+                            }
+                        }
+
+                        override fun onReceivedHttpError(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                            errorResponse: WebResourceResponse?
+                        ) {
+                            if (request?.isForMainFrame == true) {
+                                ClipboardLogger.logAndCopy(
+                                    "WebView main-frame HTTP error",
+                                    "url=" + request.url + "; status=" + errorResponse?.statusCode +
+                                        "; reason=" + errorResponse?.reasonPhrase
+                                )
+                            }
                         }
                     }
 
                     wv.measure(View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY), View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY))
                     wv.layout(0, 0, w, h)
-                    wv.translationX = -4000f
-                    try { act?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (_: Exception) {}
+                    wv.translationX = 0f
+                    try { act?.addContentView(wv, ViewGroup.LayoutParams(w, h)) } catch (e: Exception) {
+                        ClipboardLogger.logAndCopy("WebView attach", e.message ?: "Could not attach WebView")
+                    }
+                    ClipboardLogger.logAndCopy(
+                        "WebView viewport",
+                        w.toString() + "x" + h + "; orientation=" + (if (w >= h) "landscape" else "portrait")
+                    )
 
-                    handler.postDelayed({ finish(null) }, 35_000L)
+                    handler.postDelayed({ finish(null) }, 45_000L)
                     wv.loadUrl(pageUrl, mapOf("Referer" to referer))
                 } catch (e: Exception) {
                     ClipboardLogger.logAndCopy("Sniff Exception", e.stackTraceToString().take(800))
@@ -394,9 +540,10 @@ class HnembedProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // 5. LOAD LINKS: KẾT HỢP DỰ PHÒNG CÁC HOST (hnembed.cc -> vidsrc.sh -> vidsrc.io)
+    // 5. LOAD LINKS: HNEMBED DOCUMENTED EMBED DOMAINS
     // =====================================================================================
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
+        ClipboardLogger.reset()
         ClipboardLogger.logAndCopy("LoadLinks Start", "Data: $data")
         val ref = parseRef(data)
         if (ref == null) {
@@ -416,45 +563,57 @@ class HnembedProvider : MainAPI() {
 
         val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
         
-        // Danh sách các mirror cung cấp vs_src.php
-        val mirrors = listOf("https://hnembed.cc", "https://vidsrc.sh", "https://vidsrc.io")
+        // Use only the two embed domains documented by HNEmbed.
+        // The public documentation specifies direct embed URLs.
+        val embedDomains = listOf("https://hnembed.cc", "https://hnembed.net")
         var finalUrl: String? = null
-        var refererForWv = "https://stellarconductornexus.com/"
+        var refererForWv = ""
+        var streamPageUrl: String? = null
+        var streamHeaders: Map<String, String> = emptyMap()
 
-        for (mirror in mirrors) {
-            val embedUrl = if (type == "movie") "$mirror/embed/movie/$tmdbId/" else "$mirror/embed/tv/$tmdbId/$season/$episode/"
-            val srcApi = if (type == "movie") "$mirror/vs_src.php?type=movie&id=$tmdbId"
-            else "$mirror/vs_src.php?type=tv&id=$tmdbId&season=$season&episode=$episode"
-
-            for (attempt in 1..2) {
-                try {
-                    val r2 = app.get(srcApi, headers = mapOf(
-                        "User-Agent" to ua,
-                        "Accept" to "application/json",
-                        "Referer" to embedUrl,
-                        "Origin" to mirror
-                    ))
-                    val if2 = Regex("\"src\"\\s*:\\s*\"([^\"]+)\"").find(r2.text)?.groupValues?.get(1)?.let { cleanJsUrl(it) }
-                    if (if2 == null) {
-                        ClipboardLogger.logAndCopy("Notice", "Mirror $mirror lần $attempt: HTTP ${r2.code}: ${r2.text.take(150)}")
-                        continue
-                    }
-
-                    val r3 = app.get(if2, headers = mapOf("User-Agent" to ua, "Referer" to "$mirror/"))
-                    val pu = Regex("\"playerUrl\"\\s*:\\s*\"([^\"]+)\"").find(r3.text)?.groupValues?.get(1)
-                    val target = pu?.let { absUrl(if2, cleanJsUrl(it)) } ?: if2
-                    refererForWv = if2
-
-                    ClipboardLogger.logAndCopy("Target", "Sniffing $target")
-                    val seen = mutableListOf<String>()
-                    finalUrl = sniffStream(target, refererForWv, ua, seen, subtitleCallback)
-                    if (finalUrl != null) break
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    ClipboardLogger.logAndCopy("Exception", "Mirror $mirror lần $attempt: ${e.message}")
-                }
+        for (domain in embedDomains) {
+            val target = if (type == "movie") {
+                "$domain/embed/movie/$tmdbId"
+            } else {
+                "$domain/embed/tv/$tmdbId/$season/$episode"
             }
-            if (finalUrl != null) break
+            refererForWv = "$domain/"
+
+            ClipboardLogger.logAndCopy(
+                "Documented Embed URL",
+                "domain=$domain; type=$type; target=$target; referer=$refererForWv"
+            )
+
+            try {
+                val seen = mutableListOf<String>()
+                val capturedHeaders = linkedMapOf<String, String>()
+                finalUrl = sniffStream(
+                    target,
+                    refererForWv,
+                    ua,
+                    seen,
+                    subtitleCallback,
+                    capturedHeaders
+                )
+
+                ClipboardLogger.logAndCopy(
+                    "Sniff Result",
+                    "domain=$domain; target=$target; result=" + (finalUrl ?: "NOT FOUND") +
+                        "; requests=" + seen.size + "\n" + synchronized(seen) { seen.joinToString("\n") }
+                )
+
+                if (!finalUrl.isNullOrBlank()) {
+                    streamPageUrl = target
+                    streamHeaders = synchronized(capturedHeaders) { capturedHeaders.toMap() }
+                    break
+                }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                ClipboardLogger.logAndCopy(
+                    "Embed Exception",
+                    "domain=$domain; target=$target; " + e.message + "\n" + e.stackTraceToString().take(900)
+                )
+            }
         }
 
         val url = finalUrl
@@ -464,17 +623,48 @@ class HnembedProvider : MainAPI() {
         }
 
         ApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
-        val origin = Regex("""^(https?://[^/]+)""").find(refererForWv)?.groupValues?.get(1) ?: "https://stellarconductornexus.com"
+        // Prefer the actual request headers observed on the media request; an iframe
+        // may use a different Referer/Origin from the outer player page.
+        val capturedReferer = streamHeaders.entries
+            .firstOrNull { it.key.equals("referer", ignoreCase = true) }?.value
+        val capturedOrigin = streamHeaders.entries
+            .firstOrNull { it.key.equals("origin", ignoreCase = true) }?.value
+        val pageReferer = capturedReferer ?: streamPageUrl ?: refererForWv
+        val origin = capturedOrigin
+            ?: Regex("""^(https?://[^/]+)""").find(pageReferer)?.groupValues?.get(1)
+            ?: "https://stellarconductornexus.com"
+        val streamType = when {
+            Regex("""\.mpd(?:$|[?#&])""", RegexOption.IGNORE_CASE).containsMatchIn(url) -> ExtractorLinkType.DASH
+            Regex("""\.mp4(?:$|[?#&])""", RegexOption.IGNORE_CASE).containsMatchIn(url) -> ExtractorLinkType.VIDEO
+            else -> ExtractorLinkType.M3U8
+        }
+        val headers = linkedMapOf<String, String>()
+        streamHeaders.forEach { (key, value) ->
+            val canonicalKey = when (key.lowercase()) {
+                "user-agent" -> "User-Agent"
+                "referer" -> "Referer"
+                "origin" -> "Origin"
+                "cookie" -> "Cookie"
+                "authorization" -> "Authorization"
+                else -> key
+            }
+            headers[canonicalKey] = value
+        }
+        headers["Origin"] = origin
+        headers["Referer"] = pageReferer
+        headers["User-Agent"] = streamHeaders.entries
+            .firstOrNull { it.key.equals("user-agent", ignoreCase = true) }?.value ?: ua
 
+        ClipboardLogger.logAndCopy("Final Link", "type=" + streamType + "; referer=" + pageReferer + "; origin=" + origin + "; url=" + url.take(500))
         callback.invoke(
             ExtractorLink(
                 source = this.name,
                 name = "Hnembed",
                 url = url,
-                referer = "$origin/",
+                referer = pageReferer,
                 quality = Qualities.Unknown.value,
-                type = ExtractorLinkType.M3U8,
-                headers = mapOf("Origin" to origin, "Referer" to "$origin/", "User-Agent" to ua)
+                type = streamType,
+                headers = headers
             )
         )
         return true
