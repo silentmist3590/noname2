@@ -440,7 +440,7 @@ class TwoNembedProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // 6. LOAD LINKS
+    // 6. LOAD LINKS (CHẠY SONG SONG NGUỒN + MIRROR + BACKUP)
     // =====================================================================================
     private data class CandidateButton(val url: String, val name: String)
 
@@ -461,6 +461,12 @@ class TwoNembedProvider : MainAPI() {
             relativeOrAbsolute
         }
     }
+
+    private data class ResolvedResult(
+        val subs: List<SubtitleFile> = emptyList(),
+        val links: List<ExtractorLink> = emptyList(),
+        val logs: List<Pair<String, String>> = emptyList()
+    )
 
     override suspend fun loadLinks(
         data: String,
@@ -483,26 +489,101 @@ class TwoNembedProvider : MainAPI() {
 
         val ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-        var foundLink = false
-        val registeredSubs = mutableSetOf<String>()
-        val seenUrls = mutableSetOf<String>()
 
-        // ---------------------------------------------------------------------------------
-        // NGUỒN 1: NontonGo Player (southlong.nontongo.win / svsoapp / backup player)
-        // ---------------------------------------------------------------------------------
-        val nontongoPlayerUrl = if (type == "movie") {
-            "https://nontongo.win/01aus/player.php?id=$tmdbId&type=movie&autoplay=true"
-        } else {
-            "https://nontongo.win/01aus/player.php?id=$tmdbId" +
-                    "&season=${season ?: 1}&episode=${episode ?: 1}&type=tv&autoplay=true"
+        val results = listOf(1, 2).amap { sourceIdx ->
+            if (sourceIdx == 1) {
+                fetchNontonGo(type, tmdbId, season, episode, ua)
+            } else {
+                fetchVidsrcOrVidem(type, tmdbId, season, episode, ua)
+            }
         }
 
-        try {
-            ClipboardLogger.logAndCopy("NontonGo Player", "Fetching: $nontongoPlayerUrl")
-            val playerHtml = app.get(
-                nontongoPlayerUrl,
-                headers = mapOf("User-Agent" to ua, "Referer" to "https://nontongo.win/")
-            ).text
+        val registeredSubs = mutableSetOf<String>()
+        val seenUrls = mutableSetOf<String>()
+        var foundLink = false
+
+        for (res in results) {
+            for (sub in res.subs) {
+                if (registeredSubs.add(sub.url)) {
+                    subtitleCallback.invoke(sub)
+                }
+            }
+            for (link in res.links) {
+                if (seenUrls.add(link.url)) {
+                    callback.invoke(link)
+                    foundLink = true
+                }
+            }
+            for ((cat, msg) in res.logs) {
+                ClipboardLogger.logAndCopy(cat, msg)
+            }
+        }
+
+        if (foundLink) {
+            TwoNembedApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
+        }
+        return foundLink
+    }
+
+    private suspend fun fetchNontonGo(
+        type: String,
+        tmdbId: Int,
+        season: Int?,
+        episode: Int?,
+        ua: String
+    ): ResolvedResult {
+        val subs = mutableListOf<SubtitleFile>()
+        val links = mutableListOf<ExtractorLink>()
+        val logs = mutableListOf<Pair<String, String>>()
+
+        val query = if (type == "movie") {
+            "id=$tmdbId&type=movie&autoplay=true"
+        } else {
+            "id=$tmdbId&season=${season ?: 1}&episode=${episode ?: 1}&type=tv&autoplay=true"
+        }
+        val backupQuery = if (type == "movie") {
+            "id=$tmdbId&type=movie"
+        } else {
+            "id=$tmdbId&season=${season ?: 1}&episode=${episode ?: 1}&type=tv"
+        }
+
+        val primaryCandidates = listOf(
+            "https://nontongo.win/01aus/player.php?$query",
+            "https://usa.nontongo.win/01aus/player.php?$query"
+        )
+
+        var activePlayerUrl = primaryCandidates.first()
+        var playerHtml = ""
+        for (candidateUrl in primaryCandidates) {
+            try {
+                ClipboardLogger.log("NontonGo Player", "Fetching: $candidateUrl")
+                val origin = resolveUrl(candidateUrl, "/")
+                val res = app.get(
+                    candidateUrl,
+                    headers = mapOf("User-Agent" to ua, "Referer" to origin),
+                    timeout = 20L
+                )
+                if (res.code in 200..299 && res.text.contains("data-url", ignoreCase = true)) {
+                    activePlayerUrl = candidateUrl
+                    playerHtml = res.text
+                    break
+                }
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                logs.add("NontonGo Error" to "$candidateUrl -> ${e.message ?: "timeout"}")
+            }
+        }
+
+        val buttonPattern = Pattern.compile(
+            """<button[^>]*data-url=["']([^"']+)["'][^>]*>(.*?)</button>""",
+            Pattern.DOTALL
+        )
+        val backupPages = linkedSetOf<String>()
+        backupPages.add("https://usa.nontongo.win/01baltic/player-backup.php?$backupQuery")
+
+        if (playerHtml.isNotEmpty()) {
+            val activeOrigin = resolveUrl(activePlayerUrl, "/")
+            val activeDomain = activeOrigin.trimEnd('/')
 
             val trackPattern = Pattern.compile(
                 """<track[^>]+(?:data-src|src)=["']([^"']+)["'][^>]*label=["']([^"']+)["']|<track[^>]+label=["']([^"']+)["'][^>]+(?:data-src|src)=["']([^"']+)["']""",
@@ -512,19 +593,13 @@ class TwoNembedProvider : MainAPI() {
             while (trackMatcher.find()) {
                 val subUrl = (trackMatcher.group(1) ?: "").ifEmpty { trackMatcher.group(4) ?: "" }
                 val label = (trackMatcher.group(2) ?: "").ifEmpty { trackMatcher.group(3) ?: "" }
-                if (subUrl.isNotEmpty() && registeredSubs.add(subUrl)) {
-                    subtitleCallback.invoke(SubtitleFile(label, subUrl))
-                    ClipboardLogger.logAndCopy("Sub Added", "$label -> $subUrl")
+                if (subUrl.isNotEmpty()) {
+                    subs.add(SubtitleFile(label, subUrl))
+                    logs.add("Sub Added" to "$label -> $subUrl")
                 }
             }
 
-            val buttonPattern = Pattern.compile(
-                """<button[^>]*data-url=["']([^"']+)["'][^>]*>(.*?)</button>""",
-                Pattern.DOTALL
-            )
             val streamCandidates = mutableListOf<CandidateButton>()
-            val backupPages = mutableListOf<CandidateButton>()
-
             val buttonMatcher = buttonPattern.matcher(playerHtml)
             while (buttonMatcher.find()) {
                 val rawUrl = (buttonMatcher.group(1) ?: "").replace("&amp;", "&").trim()
@@ -536,11 +611,11 @@ class TwoNembedProvider : MainAPI() {
                 if (rawUrl.contains("player-backup.php", ignoreCase = true) ||
                     rawUrl.contains("player.php", ignoreCase = true)
                 ) {
-                    backupPages.add(CandidateButton(resolveUrl(nontongoPlayerUrl, rawUrl), serverName))
+                    backupPages.add(resolveUrl(activePlayerUrl, rawUrl))
                 } else {
                     streamCandidates.add(
                         CandidateButton(
-                            resolveUrl(nontongoPlayerUrl, rawUrl).substringBefore("#"),
+                            resolveUrl(activePlayerUrl, rawUrl).substringBefore("#"),
                             serverName
                         )
                     )
@@ -549,22 +624,21 @@ class TwoNembedProvider : MainAPI() {
 
             val nontongoHeaders = mapOf(
                 "User-Agent" to ua,
-                "Referer" to "https://nontongo.win/",
-                "Origin" to "https://nontongo.win"
+                "Referer" to activeOrigin,
+                "Origin" to activeDomain
             )
 
-            // Kiểm tra song song để loại bỏ các link chết (502/404)
             val validNontonLinks = streamCandidates
                 .distinctBy { it.url }
                 .amap { cand ->
                     try {
-                        val res = app.get(cand.url, headers = nontongoHeaders)
+                        val res = app.get(cand.url, headers = nontongoHeaders, timeout = 12L)
                         if (res.code in 200..299 && res.text.trimStart().startsWith("#EXTM3U")) {
                             safeCreateExtractorLink(
                                 source = this.name,
                                 name = "2embed - ${cand.name}",
                                 url = cand.url,
-                                referer = "https://nontongo.win/",
+                                referer = activeOrigin,
                                 quality = parseQuality(cand.name),
                                 isM3u8 = true,
                                 headers = nontongoHeaders
@@ -582,60 +656,86 @@ class TwoNembedProvider : MainAPI() {
                 .filterNotNull()
 
             for (link in validNontonLinks) {
-                if (seenUrls.add(link.url)) {
-                    callback.invoke(link)
-                    foundLink = true
-                    ClipboardLogger.logAndCopy("Stream Added", "${link.name} (NontonGo)")
-                }
+                links.add(link)
+                logs.add("Stream Added" to "${link.name} (NontonGo)")
             }
-
-            // Kiểm tra trang dự phòng MP4 (usa.nontongo.win/01baltic/player-backup.php)
-            for (bk in backupPages) {
-                try {
-                    val bkHtml = app.get(
-                        bk.url,
-                        headers = mapOf("User-Agent" to ua, "Referer" to "https://nontongo.win/")
-                    ).text
-                    val bkOriginMatch = Pattern.compile("""^(https?://[^/]+)""").matcher(bk.url)
-                    val bkOrigin = if (bkOriginMatch.find()) bkOriginMatch.group(1)!! else "https://usa.nontongo.win"
-                    val bkMatcher = buttonPattern.matcher(bkHtml)
-                    while (bkMatcher.find()) {
-                        val bUrl = (bkMatcher.group(1) ?: "").replace("&amp;", "&").substringBefore("#").trim()
-                        val bName = (bkMatcher.group(2) ?: "").replace(Regex("<[^>]+>"), "").trim()
-                            .ifEmpty { bk.name }
-                        if (bUrl.startsWith("http") && seenUrls.add(bUrl)) {
-                            val isHls = bUrl.contains(".m3u8", ignoreCase = true)
-                            val link = safeCreateExtractorLink(
-                                source = this.name,
-                                name = "2embed - $bName (Backup)",
-                                url = bUrl,
-                                referer = "$bkOrigin/",
-                                quality = parseQuality(bName),
-                                isM3u8 = isHls,
-                                headers = mapOf(
-                                    "User-Agent" to ua,
-                                    "Referer" to "$bkOrigin/",
-                                    "Origin" to bkOrigin
-                                )
-                            )
-                            callback.invoke(link)
-                            foundLink = true
-                            ClipboardLogger.logAndCopy("Stream Added", "$bName (Backup)")
-                        }
-                    }
-                } catch (e: Exception) {
-                    if (e is java.util.concurrent.CancellationException) throw e
-                    ClipboardLogger.log("Backup Error", e.message ?: "")
-                }
-            }
-        } catch (e: Exception) {
-            if (e is java.util.concurrent.CancellationException) throw e
-            ClipboardLogger.logAndCopy("NontonGo Error", e.message ?: "")
         }
 
-        // ---------------------------------------------------------------------------------
-        // NGUỒN 2: vidsrc.buzz / videm.buzz
-        // ---------------------------------------------------------------------------------
+        // Trang dự phòng MP4 (usa.nontongo.win/01baltic/player-backup.php)
+        for (bkUrl in backupPages) {
+            try {
+                val bkOrigin = resolveUrl(bkUrl, "/").trimEnd('/')
+                val bkHtml = app.get(
+                    bkUrl,
+                    headers = mapOf("User-Agent" to ua, "Referer" to "https://nontongo.win/"),
+                    timeout = 15L
+                ).text
+                val bkButtons = mutableListOf<CandidateButton>()
+                val bkMatcher = buttonPattern.matcher(bkHtml)
+                while (bkMatcher.find()) {
+                    val bUrl = (bkMatcher.group(1) ?: "").replace("&amp;", "&").substringBefore("#").trim()
+                    val bName = (bkMatcher.group(2) ?: "").replace(Regex("<[^>]+>"), "").trim()
+                        .ifEmpty { "Backup Server" }
+                    if (bUrl.startsWith("http")) {
+                        bkButtons.add(CandidateButton(bUrl, bName))
+                    }
+                }
+                val bkHeaders = mapOf(
+                    "User-Agent" to ua,
+                    "Referer" to "$bkOrigin/",
+                    "Origin" to bkOrigin
+                )
+                val validBackupLinks = bkButtons.distinctBy { it.url }.amap { bk ->
+                    try {
+                        val isHls = bk.url.contains(".m3u8", ignoreCase = true)
+                        val probeHeaders = if (isHls) bkHeaders else bkHeaders + ("Range" to "bytes=0-15")
+                        val probe = app.get(bk.url, headers = probeHeaders, timeout = 10L)
+                        val ok = if (isHls) {
+                            probe.code in 200..299 && probe.text.trimStart().startsWith("#EXTM3U")
+                        } else {
+                            probe.code in 200..299 && !probe.text.trimStart().startsWith("<")
+                        }
+                        if (!ok) return@amap null
+                        safeCreateExtractorLink(
+                            source = this.name,
+                            name = "2embed - ${bk.name} (Backup)",
+                            url = bk.url,
+                            referer = "$bkOrigin/",
+                            quality = parseQuality(bk.name),
+                            isM3u8 = isHls,
+                            headers = bkHeaders
+                        )
+                    } catch (e: Exception) {
+                        if (e is java.util.concurrent.CancellationException) throw e
+                        null
+                    }
+                }.filterNotNull()
+
+                for (link in validBackupLinks) {
+                    links.add(link)
+                    logs.add("Stream Added" to "${link.name} (Backup)")
+                }
+                if (validBackupLinks.isNotEmpty()) break
+            } catch (e: Exception) {
+                if (e is java.util.concurrent.CancellationException) throw e
+                ClipboardLogger.log("Backup Error", e.message ?: "")
+            }
+        }
+
+        return ResolvedResult(subs, links, logs)
+    }
+
+    private suspend fun fetchVidsrcOrVidem(
+        type: String,
+        tmdbId: Int,
+        season: Int?,
+        episode: Int?,
+        ua: String
+    ): ResolvedResult {
+        val subs = mutableListOf<SubtitleFile>()
+        val links = mutableListOf<ExtractorLink>()
+        val logs = mutableListOf<Pair<String, String>>()
+
         val embedCandidates = if (type == "movie") {
             listOf(
                 "https://vidsrc.buzz/embed/movie/$tmdbId",
@@ -648,9 +748,8 @@ class TwoNembedProvider : MainAPI() {
             )
         }
 
-        var addedVidsrcServers = 0
         for (playerUrl in embedCandidates) {
-            if (addedVidsrcServers > 0) break
+            if (links.isNotEmpty()) break
             try {
                 val pDomainMatch = Pattern.compile("""^(https?://[^/]+)""").matcher(playerUrl)
                 val pDomain = if (pDomainMatch.find()) pDomainMatch.group(1)!! else "https://vidsrc.buzz"
@@ -659,7 +758,8 @@ class TwoNembedProvider : MainAPI() {
                     headers = mapOf(
                         "User-Agent" to ua,
                         "Referer" to "https://www.2embed.cc/"
-                    )
+                    ),
+                    timeout = 15L
                 ).text
 
                 // Đọc <base href="..."> để gọi đúng /pl/api.php (vidsrc.buzz) hoặc /api.php (videm.buzz)
@@ -691,7 +791,7 @@ class TwoNembedProvider : MainAPI() {
                 try {
                     val subsUrl = "$apiBaseUrl/api.php?a=subs&type=$qType&id=$qId&s=$qS&e=$qE" +
                             "&t=${URLEncoder.encode(token, "UTF-8")}"
-                    val subsRes = app.get(subsUrl, headers = apiHeaders).text
+                    val subsRes = app.get(subsUrl, headers = apiHeaders, timeout = 12L).text
 
                     if (subsRes.trimStart().startsWith("{")) {
                         val subsJson = JSONObject(subsRes)
@@ -727,17 +827,15 @@ class TwoNembedProvider : MainAPI() {
                                     directUrl
                                 }
 
-                                if (finalSubUrl.isNotEmpty() && registeredSubs.add(finalSubUrl)) {
-                                    subtitleCallback.invoke(
-                                        SubtitleFile("$label (OpenSubs)", finalSubUrl)
-                                    )
+                                if (finalSubUrl.isNotEmpty()) {
+                                    subs.add(SubtitleFile("$label (OpenSubs)", finalSubUrl))
                                 }
                             }
                         }
                     }
                 } catch (e: Exception) {
                     if (e is java.util.concurrent.CancellationException) throw e
-                    ClipboardLogger.logAndCopy("Vidsrc Subs Error", e.message ?: "")
+                    logs.add("Vidsrc Subs Error" to (e.message ?: ""))
                 }
 
                 // Các luồng máy chủ vidsrc / videm
@@ -758,7 +856,7 @@ class TwoNembedProvider : MainAPI() {
                             val playApiUrl = "$apiBaseUrl/api.php?a=play" +
                                     "&ref=${URLEncoder.encode(sRef, "UTF-8")}" +
                                     "&t=${URLEncoder.encode(token, "UTF-8")}"
-                            val playRes = app.get(playApiUrl, headers = apiHeaders).text
+                            val playRes = app.get(playApiUrl, headers = apiHeaders, timeout = 12L).text
                             if (!playRes.trimStart().startsWith("{")) {
                                 ClipboardLogger.log("Server Play Skip", "$sName: non-JSON response")
                                 return@amap null
@@ -773,7 +871,7 @@ class TwoNembedProvider : MainAPI() {
                             val isHls = !playJson.optString("type", "hls").equals("mp4", true)
 
                             if (isHls) {
-                                val probe = app.get(resolvedStreamUrl, headers = streamHeaders)
+                                val probe = app.get(resolvedStreamUrl, headers = streamHeaders, timeout = 10L)
                                 if (probe.code !in 200..299 || !probe.text.trimStart().startsWith("#EXTM3U")) {
                                     ClipboardLogger.log("Vidsrc Probe Skip", "$sName HTTP ${probe.code}")
                                     return@amap null
@@ -791,30 +889,23 @@ class TwoNembedProvider : MainAPI() {
                             )
                         } catch (e: Exception) {
                             if (e is java.util.concurrent.CancellationException) throw e
-                            ClipboardLogger.logAndCopy("Server Play Error", "$sName: ${e.message ?: ""}")
+                            ClipboardLogger.log("Server Play Error", "$sName: ${e.message ?: ""}")
                             null
                         }
                     }.filterNotNull()
 
                     for (link in resolvedLinks) {
-                        if (seenUrls.add(link.url)) {
-                            callback.invoke(link)
-                            foundLink = true
-                            addedVidsrcServers++
-                            ClipboardLogger.logAndCopy("Stream Added", "${link.name} (vidsrc)")
-                        }
+                        links.add(link)
+                        logs.add("Stream Added" to "${link.name} (vidsrc)")
                     }
                 }
             } catch (e: Exception) {
                 if (e is java.util.concurrent.CancellationException) throw e
-                ClipboardLogger.logAndCopy("Player Scraping Error", e.message ?: "")
+                logs.add("Player Scraping Error" to (e.message ?: ""))
             }
         }
 
-        if (foundLink) {
-            TwoNembedApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
-        }
-        return foundLink
+        return ResolvedResult(subs, links, logs)
     }
 }
 
