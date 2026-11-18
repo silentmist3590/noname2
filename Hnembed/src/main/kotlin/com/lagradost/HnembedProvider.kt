@@ -540,7 +540,7 @@ class HnembedProvider : MainAPI() {
     }
 
     // =====================================================================================
-    // 5. LOAD LINKS: KẾT HỢP DỰ PHÒNG CÁC HOST (hnembed.cc -> vidsrc.sh -> vidsrc.io)
+    // 5. LOAD LINKS: HNEMBED DOCUMENTED EMBED DOMAINS
     // =====================================================================================
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         ClipboardLogger.reset()
