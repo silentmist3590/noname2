@@ -552,22 +552,39 @@ class HnembedProvider : MainAPI() {
         }
 
         ApiServices.sendTraktScrobble("stop", type, tmdbId, 100f, season, episode)
-        val pageReferer = streamPageUrl ?: refererForWv
-        val origin = Regex("""^(https?://[^/]+)""").find(pageReferer)?.groupValues?.get(1)
+        // Prefer the actual request headers observed on the media request; an iframe
+        // may use a different Referer/Origin from the outer player page.
+        val capturedReferer = streamHeaders.entries
+            .firstOrNull { it.key.equals("referer", ignoreCase = true) }?.value
+        val capturedOrigin = streamHeaders.entries
+            .firstOrNull { it.key.equals("origin", ignoreCase = true) }?.value
+        val pageReferer = capturedReferer ?: streamPageUrl ?: refererForWv
+        val origin = capturedOrigin
+            ?: Regex("""^(https?://[^/]+)""").find(pageReferer)?.groupValues?.get(1)
             ?: "https://stellarconductornexus.com"
         val streamType = when {
             Regex("""\.mpd(?:$|[?#&])""", RegexOption.IGNORE_CASE).containsMatchIn(url) -> ExtractorLinkType.DASH
             Regex("""\.mp4(?:$|[?#&])""", RegexOption.IGNORE_CASE).containsMatchIn(url) -> ExtractorLinkType.VIDEO
             else -> ExtractorLinkType.M3U8
         }
-        val headers = linkedMapOf(
-            "Origin" to origin,
-            "Referer" to pageReferer,
-            "User-Agent" to ua
-        )
-        streamHeaders.forEach { (key, value) -> headers[key] = value }
+        val headers = linkedMapOf<String, String>()
+        streamHeaders.forEach { (key, value) ->
+            val canonicalKey = when (key.lowercase()) {
+                "user-agent" -> "User-Agent"
+                "referer" -> "Referer"
+                "origin" -> "Origin"
+                "cookie" -> "Cookie"
+                "authorization" -> "Authorization"
+                else -> key
+            }
+            headers[canonicalKey] = value
+        }
+        headers["Origin"] = origin
+        headers["Referer"] = pageReferer
+        headers["User-Agent"] = streamHeaders.entries
+            .firstOrNull { it.key.equals("user-agent", ignoreCase = true) }?.value ?: ua
 
-        ClipboardLogger.logAndCopy("Final Link", "type=" + streamType + "; referer=" + pageReferer + "; url=" + url.take(500))
+        ClipboardLogger.logAndCopy("Final Link", "type=" + streamType + "; referer=" + pageReferer + "; origin=" + origin + "; url=" + url.take(500))
         callback.invoke(
             ExtractorLink(
                 source = this.name,
