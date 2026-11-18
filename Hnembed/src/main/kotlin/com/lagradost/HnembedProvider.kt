@@ -310,6 +310,16 @@ class HnembedProvider : MainAPI() {
 
                     wv.webChromeClient = object : WebChromeClient() {
                         override fun onCreateWindow(view: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean = false
+
+                        override fun onConsoleMessage(message: android.webkit.ConsoleMessage?): Boolean {
+                            if (message != null) {
+                                ClipboardLogger.logAndCopy(
+                                    "JavaScript Console",
+                                    message.message().take(1200) + " at " + message.sourceId() + ":" + message.lineNumber()
+                                )
+                            }
+                            return true
+                        }
                     }
 
                     val fakePopup = "try{window.open=function(){return {closed:false,focus:function(){},close:function(){},blur:function(){}}};}catch(e){}"
@@ -460,16 +470,6 @@ class HnembedProvider : MainAPI() {
                         override fun onPageFinished(view: WebView?, url: String?) {
                             ClipboardLogger.logAndCopy("WebView page finished", url ?: "(null)")
                             handler.postDelayed({ tap() }, 800)
-                        }
-
-                        override fun onConsoleMessage(message: android.webkit.ConsoleMessage?): Boolean {
-                            if (message != null) {
-                                ClipboardLogger.logAndCopy(
-                                    "JavaScript Console",
-                                    message.message().take(1200) + " at " + message.sourceId() + ":" + message.lineNumber()
-                                )
-                            }
-                            return true
                         }
 
                         override fun onReceivedError(
