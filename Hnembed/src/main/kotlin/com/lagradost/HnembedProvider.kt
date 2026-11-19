@@ -1,5 +1,14 @@
 package com.lagradost
 
+import android.os.Handler
+import android.os.Looper
+import android.webkit.CookieManager
+import android.webkit.WebChromeClient
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import com.lagradost.cloudstream3.CommonActivity
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -7,11 +16,14 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
+import org.json.JSONTokener
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
 import java.util.concurrent.CancellationException
+import kotlin.coroutines.resume
+import kotlin.coroutines.suspendCoroutine
 
 private const val TMDB_BASE_URL = "https://tmdb-proxy.silentmist3590.workers.dev/3"
 private const val TMDB_API_KEY = "c3d997893bf55c01f39f821b53781547"
@@ -96,6 +108,343 @@ private fun resolveHttpUrl(baseUrl: String, raw: String?): String? {
 
 private fun Element.attributeCandidate(attribute: String): String? =
     if (hasAttr(attribute)) attr(attribute).trim().takeIf { it.isNotBlank() } else null
+
+/**
+ * Loads the public HNEmbed wrapper in a non-interactive WebView and reads the
+ * rendered iframe DOM after the page scripts have had time to run.
+ * It does not click controls, alter player behavior, or extract protected media.
+ */
+private suspend fun inspectRenderedIframeUrls(
+    pageUrl: String,
+    userAgent: String
+): List<String> = suspendCoroutine { continuation ->
+    val activity = try {
+        CommonActivity.activity
+    } catch (_: Throwable) {
+        null
+    }
+
+    if (activity == null) {
+        ClipboardLogger.logAndCopy(
+            "Rendered iframe inspection",
+            "Skipped: CommonActivity.activity is null"
+        )
+        continuation.resume(emptyList())
+        return@suspendCoroutine
+    }
+
+    val mainHandler = Handler(Looper.getMainLooper())
+    mainHandler.post {
+        val webView = try {
+            WebView(activity)
+        } catch (e: Exception) {
+            ClipboardLogger.logAndCopy(
+                "Rendered iframe inspection",
+                "WebView creation failed: ${e.message}"
+            )
+            continuation.resume(emptyList())
+            return@post
+        }
+
+        var finished = false
+        var pageFinished = false
+        var pollCount = 0
+        var lastSnapshot = ""
+        val iframeUrls = linkedSetOf<String>()
+        val subframeRequests = linkedSetOf<String>()
+        val resourceUrls = linkedSetOf<String>()
+
+        var pollTask: Runnable? = null
+        var timeoutTask: Runnable? = null
+
+        fun finish() {
+            if (finished) return
+            finished = true
+            pollTask?.let(mainHandler::removeCallbacks)
+            timeoutTask?.let(mainHandler::removeCallbacks)
+
+            val result = linkedSetOf<String>()
+            result.addAll(iframeUrls)
+            synchronized(subframeRequests) { result.addAll(subframeRequests) }
+            result.addAll(resourceUrls)
+
+            ClipboardLogger.logAndCopy(
+                "Rendered iframe inspection summary",
+                "pageFinished=$pageFinished; polls=$pollCount; " +
+                    "iframeUrls=${iframeUrls.size}; subframeRequests=${subframeRequests.size}; " +
+                    "mediaResources=${resourceUrls.size}"
+            )
+            ClipboardLogger.logAndCopy(
+                "Rendered iframe candidates",
+                result.joinToString("\n").ifBlank {
+                    "No public iframe/player/media URL observed after JavaScript execution"
+                }
+            )
+
+            try {
+                webView.stopLoading()
+                webView.destroy()
+            } catch (_: Exception) {
+                // Best-effort WebView cleanup.
+            }
+            continuation.resume(result.toList())
+        }
+
+        timeoutTask = Runnable {
+            ClipboardLogger.logAndCopy(
+                "Rendered iframe inspection",
+                "Timed out after 18 seconds waiting for the rendered iframe/player URL"
+            )
+            finish()
+        }
+
+        pollTask = Runnable {
+            if (finished) return@Runnable
+            pollCount++
+
+            val javascript = """
+                (function() {
+                  try {
+                    var frames = Array.prototype.slice.call(
+                      document.querySelectorAll('iframe,frame')
+                    ).map(function(f) {
+                      var attrs = Array.prototype.slice.call(f.attributes || [])
+                        .map(function(a) { return {name:a.name, value:a.value}; });
+                      return {
+                        id: f.id || '',
+                        name: f.name || '',
+                        srcAttr: f.getAttribute('src') || '',
+                        src: f.src || '',
+                        srcdoc: (f.getAttribute('srcdoc') || '').slice(0,5000),
+                        attrs: attrs,
+                        outerHTML: (f.outerHTML || '').slice(0,3000)
+                      };
+                    });
+                    var media = Array.prototype.slice.call(
+                      document.querySelectorAll('video,source')
+                    ).map(function(v) {
+                      return {
+                        tag: v.tagName,
+                        srcAttr: v.getAttribute('src') || '',
+                        src: v.src || '',
+                        type: v.getAttribute('type') || ''
+                      };
+                    });
+                    var resources = performance.getEntriesByType('resource')
+                      .map(function(e) { return e.name; })
+                      .filter(function(u) {
+                        return /\.m3u8(?:$|[?#])|\.mpd(?:$|[?#])|\.mp4(?:$|[?#])|\/embed\/player\/|\/player\//i.test(u);
+                      }).slice(-100);
+                    return JSON.stringify({
+                      page: location.href,
+                      readyState: document.readyState,
+                      frameCount: frames.length,
+                      frames: frames,
+                      media: media,
+                      resources: resources
+                    });
+                  } catch (e) {
+                    return JSON.stringify({error:String(e)});
+                  }
+                })();
+            """.trimIndent()
+
+            webView.evaluateJavascript(javascript) { rawResult ->
+                if (finished) return@evaluateJavascript
+
+                try {
+                    val decoded = JSONTokener(rawResult ?: "null").nextValue() as? String
+                    if (!decoded.isNullOrBlank() && decoded != lastSnapshot) {
+                        lastSnapshot = decoded
+                        val snapshot = JSONObject(decoded)
+                        val frameLines = mutableListOf<String>()
+                        val frames = snapshot.optJSONArray("frames")
+
+                        if (frames != null) {
+                            for (i in 0 until frames.length()) {
+                                val frame = frames.optJSONObject(i) ?: continue
+                                val attrs = frame.optJSONArray("attrs")
+                                val values = linkedSetOf<String>()
+                                values.add(frame.optString("srcAttr"))
+                                values.add(frame.optString("src"))
+
+                                if (attrs != null) {
+                                    for (j in 0 until attrs.length()) {
+                                        val attr = attrs.optJSONObject(j) ?: continue
+                                        values.add(attr.optString("value"))
+                                    }
+                                }
+
+                                for (value in values) {
+                                    val candidate = resolveHttpUrl(pageUrl, value) ?: continue
+                                    if (candidate != pageUrl) iframeUrls.add(candidate)
+                                }
+
+                                val srcdoc = frame.optString("srcdoc")
+                                if (srcdoc.isNotBlank()) {
+                                    val srcdocDoc = Jsoup.parse(srcdoc, pageUrl)
+                                    for (nested in srcdocDoc.select("iframe[src],frame[src]")) {
+                                        resolveHttpUrl(pageUrl, nested.attr("src"))
+                                            ?.let(iframeUrls::add)
+                                    }
+                                }
+
+                                frameLines.add(
+                                    "iframe[$i] id=${frame.optString("id")} " +
+                                        "name=${frame.optString("name")} " +
+                                        "srcAttr=${frame.optString("srcAttr")} " +
+                                        "src=${frame.optString("src")} " +
+                                        "srcdoc=${srcdoc.take(500)} " +
+                                        "outerHTML=${frame.optString("outerHTML").take(1800)}"
+                                )
+                            }
+                        }
+
+                        ClipboardLogger.logAndCopy(
+                            "Rendered iframe DOM poll $pollCount",
+                            "page=${snapshot.optString("page")}\n" +
+                                "readyState=${snapshot.optString("readyState")}\n" +
+                                "frameCount=${snapshot.optInt("frameCount")}\n" +
+                                frameLines.joinToString("\n\n").ifBlank { "No iframe nodes" }
+                        )
+
+                        val media = snapshot.optJSONArray("media")
+                        if (media != null && media.length() > 0) {
+                            for (i in 0 until media.length()) {
+                                val item = media.optJSONObject(i) ?: continue
+                                val raw = item.optString("srcAttr").ifBlank {
+                                    item.optString("src")
+                                }
+                                resolveHttpUrl(pageUrl, raw)?.let { candidate ->
+                                    resourceUrls.add(candidate)
+                                }
+                            }
+                        }
+
+                        val resources = snapshot.optJSONArray("resources")
+                        if (resources != null) {
+                            for (i in 0 until resources.length()) {
+                                val raw = resources.optString(i)
+                                val resolved = resolveHttpUrl(pageUrl, raw) ?: continue
+                                val lower = resolved.lowercase()
+                                if (Regex("\\.(m3u8|mpd|mp4)(?:$|[?#])")
+                                        .containsMatchIn(lower) ||
+                                    lower.contains("/embed/player/") ||
+                                    lower.contains("/player/")) {
+                                    resourceUrls.add(resolved)
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    ClipboardLogger.logAndCopy(
+                        "Rendered iframe inspection error",
+                        e.stackTraceToString()
+                    )
+                }
+
+                // Poll repeatedly: the wrapper may assign iframe.src asynchronously
+                // after sbx.js finishes initializing the page.
+                if (pollCount < 14) {
+                    pollTask?.let { mainHandler.postDelayed(it, 650L) }
+                } else {
+                    finish()
+                }
+            }
+        }
+
+        try {
+            webView.settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                javaScriptCanOpenWindowsAutomatically = false
+                setSupportMultipleWindows(false)
+                userAgentString = userAgent
+                mediaPlaybackRequiresUserGesture = false
+                allowFileAccess = false
+                mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            }
+
+            CookieManager.getInstance().setAcceptCookie(true)
+            CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+
+            webView.webChromeClient = object : WebChromeClient() {
+                override fun onConsoleMessage(message: android.webkit.ConsoleMessage?): Boolean {
+                    if (message != null) {
+                        ClipboardLogger.logAndCopy(
+                            "Rendered page console",
+                            "${message.message()} (${message.sourceId()}:${message.lineNumber()})"
+                        )
+                    }
+                    return true
+                }
+            }
+
+            webView.webViewClient = object : WebViewClient() {
+                override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                    super.onPageStarted(view, url, favicon)
+                    ClipboardLogger.logAndCopy(
+                        "Rendered WebView page started",
+                        url ?: "<null>"
+                    )
+                }
+
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    super.onPageFinished(view, url)
+                    if (!pageFinished) {
+                        pageFinished = true
+                        ClipboardLogger.logAndCopy(
+                            "Rendered WebView page finished",
+                            url ?: "<null>"
+                        )
+                        pollTask?.let { mainHandler.postDelayed(it, 800L) }
+                    }
+                }
+
+                override fun shouldInterceptRequest(
+                    view: WebView?,
+                    request: WebResourceRequest?
+                ): WebResourceResponse? {
+                    if (request != null && !request.isForMainFrame) {
+                        val requestUrl = request.url.toString()
+                        val lower = requestUrl.lowercase()
+                        val isLikelyFrameOrMedia =
+                            lower.contains("/embed/player/") ||
+                            lower.contains("/player/") ||
+                            Regex("\\.(m3u8|mpd|mp4)(?:$|[?#])")
+                                .containsMatchIn(lower)
+
+                        if (isLikelyFrameOrMedia) {
+                            synchronized(subframeRequests) {
+                                subframeRequests.add(requestUrl)
+                            }
+                        }
+                    }
+                    return null
+                }
+            }
+
+            timeoutTask?.let { mainHandler.postDelayed(it, 18_000L) }
+            ClipboardLogger.logAndCopy(
+                "Rendered iframe inspection",
+                "Loading HNEmbed wrapper and polling the rendered iframe DOM for up to 9 seconds: $pageUrl"
+            )
+            webView.loadUrl(
+                pageUrl,
+                mapOf(
+                    "User-Agent" to userAgent,
+                    "Referer" to "https://hnembed.cc/"
+                )
+            )
+        } catch (e: Exception) {
+            ClipboardLogger.logAndCopy(
+                "Rendered iframe inspection error",
+                e.stackTraceToString()
+            )
+            finish()
+        }
+    }
+}
 
 class HnembedProvider : MainAPI() {
     override var mainUrl = "https://hnembed.cc"
@@ -341,7 +690,7 @@ class HnembedProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         ClipboardLogger.clear()
-        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-HTML-PARSER-2026-11-19")
+        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-RUNTIME-IFRAME-POLL-2026-11-19-V7")
         ClipboardLogger.logAndCopy(
             "loadLinks START",
             "data=$data; provider=$name; casting=$isCasting"
@@ -360,9 +709,8 @@ class HnembedProvider : MainAPI() {
             return false
         }
 
-        // hnembed.net has failed DNS resolution in the user's previous test.
-        // Keep it as a fallback, but hnembed.cc is always tried first.
-        val mirrors = listOf("https://hnembed.cc", "https://hnembed.net")
+        // hnembed.net failed DNS resolution in the user's test; use the working .cc host.
+        val mirrors = listOf("https://hnembed.cc")
         val headers = mapOf(
             "User-Agent" to userAgent,
             "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
@@ -430,6 +778,17 @@ class HnembedProvider : MainAPI() {
                         "videoSourceCount=${videoElements.size}\n" +
                         "embedObjectCount=${embedElements.size}\n" +
                         "scriptCount=${scriptElements.size}"
+                )
+
+                val staticIframeDetails = iframeElements.mapIndexed { index, iframe ->
+                    val attrs = iframe.attributes().asList().joinToString("; ") {
+                        "${it.key}=${it.value}"
+                    }
+                    "iframe[$index] id=${iframe.id()} name=${iframe.attr("name")} attrs={$attrs} outer=${iframe.outerHtml().take(2200)}"
+                }
+                ClipboardLogger.logAndCopy(
+                    "Static iframe details",
+                    staticIframeDetails.joinToString("\n\n").ifBlank { "No iframe elements" }
                 )
 
                 val externalScripts = scriptElements
@@ -598,6 +957,64 @@ class HnembedProvider : MainAPI() {
                         )
                     }
                 }
+
+                // Static HTML contains an iframe without a usable src. Execute the
+                // page's normal JavaScript in WebView and inspect the rendered DOM.
+                if (emitted == 0 && iframeElements.isNotEmpty()) {
+                    val renderedCandidates = inspectRenderedIframeUrls(finalUrl, userAgent)
+                    for (candidate in renderedCandidates) {
+                        if (!tried.add(candidate)) continue
+
+                        ClipboardLogger.logAndCopy(
+                            "Rendered embed candidate",
+                            candidate.take(450)
+                        )
+
+                        val directType = when {
+                            Regex("\\.m3u8(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) -> ExtractorLinkType.M3U8
+                            Regex("\\.mpd(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) -> ExtractorLinkType.DASH
+                            Regex("\\.mp4(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) -> ExtractorLinkType.VIDEO
+                            else -> null
+                        }
+
+                        if (directType != null) {
+                            callback.invoke(
+                                newExtractorLink(
+                                    source = name,
+                                    name = "HNEmbed",
+                                    url = candidate,
+                                    type = directType
+                                ) {
+                                    referer = finalUrl
+                                    quality = Qualities.Unknown.value
+                                    this.headers = mapOf(
+                                        "User-Agent" to userAgent,
+                                        "Referer" to finalUrl
+                                    )
+                                }
+                            )
+                            emitted++
+                            continue
+                        }
+
+                        try {
+                            loadExtractor(candidate, finalUrl, subtitleCallback) { link ->
+                                callback.invoke(link)
+                                emitted++
+                                ClipboardLogger.logAndCopy(
+                                    "Rendered extractor link",
+                                    "${link.name} | ${link.url.take(250)}"
+                                )
+                            }
+                        } catch (e: Exception) {
+                            if (e is CancellationException) throw e
+                            ClipboardLogger.logAndCopy(
+                                "Rendered candidate extractor",
+                                "${candidate.take(250)} | ${e.javaClass.simpleName}: ${e.message}"
+                            )
+                        }
+                    }
+                }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 ClipboardLogger.logAndCopy(
@@ -612,7 +1029,7 @@ class HnembedProvider : MainAPI() {
         ClipboardLogger.logAndCopy(
             "No playable source",
             "HNEmbed returned no candidate handled by the installed CloudStream extractors. " +
-                "Check HTML scan, HTML candidates and Inline script hints. " +
+                "Check Static iframe details, Rendered iframe DOM polls and Rendered iframe candidates. " +
                 "The HTML page is not reported as a video link."
         )
         return false
