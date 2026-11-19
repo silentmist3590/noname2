@@ -7,6 +7,8 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import org.json.JSONObject
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Element
 import java.net.URI
 import java.net.URLEncoder
 import java.util.concurrent.CancellationException
@@ -27,17 +29,17 @@ private val HN_REF_REGEX =
 private val HN_EMBED_PATH_REGEX =
     Regex("""^/embed/(movie|tv)/(\d+)(?:/(\d+)/(\d+))?/?$""")
 
-// Compatibility with old SearchResponse URLs that were incorrectly fixed by CloudStream.
+// Backward compatibility for old SearchResponse URLs that were incorrectly fixed by CloudStream.
 private val HN_LEGACY_PATH_REGEX =
     Regex("""^/hnembed:(movie|tv):(\d+)(?::(\d+):(\d+))?/?$""")
 
 /**
- * Accepts all supported data forms:
+ * Accepted forms:
  *   hnembed:movie:123
  *   hnembed:tv:123:1:2
  *   https://hnembed.cc/embed/movie/123
  *   https://hnembed.cc/embed/tv/123/1/2
- *   https://hnembed.cc/hnembed:movie:123 (legacy broken route)
+ *   https://hnembed.cc/hnembed:movie:123 (legacy broken URL)
  */
 private fun parseHnRef(value: String): HnMediaRef? {
     val input = value.trim()
@@ -60,17 +62,40 @@ private fun parseHnRef(value: String): HnMediaRef? {
     )
 }
 
-/** Return an absolute URL for CloudStream's SearchResponse/LoadResponse.url. */
+/** URL shown to CloudStream's UI must be an absolute HTTP URL. */
 private fun hnDetailUrl(type: String, id: Int): String {
     return if (type == "movie") {
         "https://hnembed.cc/embed/movie/$id"
     } else {
-        // HNEmbed's documented TV embed format requires season and episode.
-        // This URL is only the stable detail-page identifier; individual
-        // episode playback uses Episode.data below.
+        // Series detail URL. Playback data for each episode remains separate.
         "https://hnembed.cc/embed/tv/$id/1/1"
     }
 }
+
+/** Resolve relative and protocol-relative URLs against the final embed page. */
+private fun resolveHttpUrl(baseUrl: String, raw: String?): String? {
+    val value = raw
+        ?.trim()
+        ?.replace("&amp;", "&")
+        ?.replace("\\/", "/")
+        ?.takeIf { it.isNotBlank() }
+        ?: return null
+
+    if (value.startsWith("javascript:", ignoreCase = true) ||
+        value.startsWith("data:", ignoreCase = true) ||
+        value.startsWith("blob:", ignoreCase = true)
+    ) return null
+
+    return try {
+        val resolved = URI(baseUrl).resolve(value).toString()
+        resolved.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun Element.attributeCandidate(attribute: String): String? =
+    if (hasAttr(attribute)) attr(attribute).trim().takeIf { it.isNotBlank() } else null
 
 class HnembedProvider : MainAPI() {
     override var mainUrl = "https://hnembed.cc"
@@ -113,9 +138,7 @@ class HnembedProvider : MainAPI() {
 
                 if (response.code == 200) {
                     val body = response.text
-                    if (body.trimStart().startsWith("{")) {
-                        return JSONObject(body)
-                    }
+                    if (body.trimStart().startsWith("{")) return JSONObject(body)
                 }
 
                 lastError = IllegalStateException("TMDB HTTP ${response.code}: $host")
@@ -146,7 +169,8 @@ class HnembedProvider : MainAPI() {
 
         if (title.isBlank()) return null
 
-        // IMPORTANT: url is a real absolute HTTP URL, not "hnembed:movie:id".
+        // Do not pass hnembed:movie:id as a SearchResponse URL. CloudStream may
+        // treat it as a relative URL and prepend mainUrl to it.
         return newMovieSearchResponse(
             title,
             hnDetailUrl(type, id),
@@ -306,14 +330,9 @@ class HnembedProvider : MainAPI() {
     }
 
     /**
-     * HNEmbed's documented embed URL formats:
-     *   /embed/movie/{IMDb-or-TMDB-ID}
-     *   /embed/tv/{IMDb-or-TMDB-ID}/{season}/{episode}
-     *
-     * The provider first delegates the official embed URL to CloudStream's
-     * registered extractors. If the embed HTML exposes normal iframe/video
-     * URLs, those URLs are passed to the matching extractor as a fallback.
-     * A page URL is never falsely reported as a playable video URL.
+     * Extract only URLs exposed in the public embed markup and delegate player
+     * hosts to CloudStream's registered extractors. This method does not try to
+     * reverse proprietary player tokens or protected media delivery.
      */
     override suspend fun loadLinks(
         data: String,
@@ -322,10 +341,7 @@ class HnembedProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         ClipboardLogger.clear()
-        ClipboardLogger.logAndCopy(
-            "BUILD MARKER",
-            "HNEMBED-URL-FIX-2026-11-18"
-        )
+        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-HTML-PARSER-2026-11-19")
         ClipboardLogger.logAndCopy(
             "loadLinks START",
             "data=$data; provider=$name; casting=$isCasting"
@@ -344,6 +360,8 @@ class HnembedProvider : MainAPI() {
             return false
         }
 
+        // hnembed.net has failed DNS resolution in the user's previous test.
+        // Keep it as a fallback, but hnembed.cc is always tried first.
         val mirrors = listOf("https://hnembed.cc", "https://hnembed.net")
         val headers = mapOf(
             "User-Agent" to userAgent,
@@ -362,14 +380,14 @@ class HnembedProvider : MainAPI() {
 
             ClipboardLogger.logAndCopy("HNEmbed target", embedUrl)
 
-            // First try the installed CloudStream extractor for the official embed URL.
+            // First ask CloudStream whether an installed extractor supports HNEmbed directly.
             try {
                 loadExtractor(embedUrl, "$mirror/", subtitleCallback) { link ->
                     callback.invoke(link)
                     emitted++
                     ClipboardLogger.logAndCopy(
                         "Extractor link",
-                        "${link.name} | ${link.url.take(180)}"
+                        "${link.name} | ${link.url.take(250)}"
                     )
                 }
             } catch (e: Exception) {
@@ -382,49 +400,164 @@ class HnembedProvider : MainAPI() {
 
             if (emitted > 0) return true
 
-            // Inspect ordinary public embed markup only. No player token or
-            // protected media request is reconstructed here.
             try {
                 val response = app.get(
                     embedUrl,
                     headers = headers,
                     referer = "$mirror/"
                 )
+                val html = response.text
+                val finalUrl = response.url.toString()
+
                 ClipboardLogger.logAndCopy(
                     "Embed response",
-                    "HTTP ${response.code}; final=${response.url}; bytes=${response.text.length}"
+                    "HTTP ${response.code}; final=$finalUrl; bytes=${html.length}"
                 )
                 if (response.code !in 200..299) continue
 
-                val html = response.text
-                val tagRegex = Regex("""(?is)<(?:iframe|video|source)\b[^>]*>""")
-                val attrRegex = Regex("""(?is)(?:src|data-src)\s*=\s*["']([^"']+)["']""")
+                val doc = Jsoup.parse(html, finalUrl)
+                val iframeElements = doc.select("iframe, frame")
+                val videoElements = doc.select("video, source")
+                val embedElements = doc.select("embed, object")
+                val scriptElements = doc.select("script")
 
-                for (tag in tagRegex.findAll(html)) {
-                    val raw = attrRegex.find(tag.value)?.groupValues?.getOrNull(1)
-                        ?: continue
+                ClipboardLogger.logAndCopy(
+                    "HTML scan",
+                    "title=${doc.title()}\n" +
+                        "finalUrl=$finalUrl\n" +
+                        "htmlBytes=${html.length}\n" +
+                        "iframeCount=${iframeElements.size}\n" +
+                        "videoSourceCount=${videoElements.size}\n" +
+                        "embedObjectCount=${embedElements.size}\n" +
+                        "scriptCount=${scriptElements.size}"
+                )
 
-                    val candidate = try {
-                        URI(embedUrl).resolve(
-                            raw.replace("&amp;", "&")
-                                .replace("\\/", "/")
-                                .trim()
-                        ).toString()
-                    } catch (_: Exception) {
-                        continue
+                val externalScripts = scriptElements
+                    .filter { it.hasAttr("src") }
+                    .map { it.absUrl("src") }
+                    .filter { it.startsWith("http://") || it.startsWith("https://") }
+                    .distinct()
+                    .take(25)
+
+                ClipboardLogger.logAndCopy(
+                    "External scripts",
+                    externalScripts.joinToString("\n").ifBlank { "No external scripts found" }
+                )
+
+                // Only inspect likely player/media elements and data-* attributes.
+                val scanElements = doc.select(
+                    "iframe, frame, video, source, embed, object, " +
+                        "[data-src], [data-lazy-src], [data-url], [data-embed], " +
+                        "[data-player], [data-video], [data-file], [data-href], [data-link]"
+                )
+                val attributeNames = listOf(
+                    "src",
+                    "data-src",
+                    "data-lazy-src",
+                    "data-url",
+                    "data-embed",
+                    "data-player",
+                    "data-video",
+                    "data-file",
+                    "data-href",
+                    "data-link",
+                    "href",
+                    "data"
+                )
+
+                // Keep URL plus the HTML element/attribute that exposed it.
+                val candidates = linkedMapOf<String, String>()
+                for (element in scanElements) {
+                    for (attribute in attributeNames) {
+                        val raw = element.attributeCandidate(attribute) ?: continue
+                        val candidate = resolveHttpUrl(finalUrl, raw) ?: continue
+                        if (!candidates.containsKey(candidate)) {
+                            candidates[candidate] = "<${element.tagName()}> @$attribute"
+                        }
+                    }
+                }
+
+                // Some players publish their URL in OpenGraph/Twitter player metadata.
+                val playerMeta = doc.select(
+                    "meta[property=og:video], meta[property=og:video:url], " +
+                        "meta[name=twitter:player], meta[name=twitter:player:stream]"
+                )
+                for (meta in playerMeta) {
+                    val raw = meta.attr("content")
+                    val candidate = resolveHttpUrl(finalUrl, raw) ?: continue
+                    if (!candidates.containsKey(candidate)) {
+                        candidates[candidate] = "<meta ${meta.attr("property").ifBlank { meta.attr("name") }}> @content"
+                    }
+                }
+
+                ClipboardLogger.logAndCopy(
+                    "HTML candidates",
+                    candidates.entries.take(60).joinToString("\n") {
+                        "${it.value} -> ${it.key.take(450)}"
+                    }.ifBlank { "No iframe/video/source/data-* candidates in static HTML" }
+                )
+
+                // Capture short surrounding snippets for useful inline-JS diagnostics.
+                // URLs in scripts are only promoted when they clearly look like player URLs.
+                val keywordRegex = Regex(
+                    "(?i)(iframe|player|embed|video|source|stream|manifest|m3u8|mpd)"
+                )
+                val inlineScriptHints = ArrayList<String>()
+                val scriptUrlRegex = Regex("""https?://[^\"'\s<>]+""")
+                for (script in scriptElements.filter { !it.hasAttr("src") }) {
+                    val content = script.data().ifBlank { script.html() }
+                        .replace("\\/", "/")
+                    val keyMatch = keywordRegex.find(content)
+                    if (keyMatch != null && inlineScriptHints.size < 10) {
+                        val start = (keyMatch.range.first - 180).coerceAtLeast(0)
+                        val end = (keyMatch.range.last + 350).coerceAtMost(content.length)
+                        inlineScriptHints.add(content.substring(start, end))
                     }
 
-                    if (!candidate.startsWith("http") || !tried.add(candidate)) {
-                        continue
+                    for (urlMatch in scriptUrlRegex.findAll(content)) {
+                        val raw = urlMatch.value.trimEnd(')', ']', '}', ',', ';')
+                        val lower = raw.lowercase()
+                        val looksLikePlayer = listOf(
+                            "/embed/", "/player", "video", "stream", ".m3u8", ".mpd", ".mp4"
+                        ).any { lower.contains(it) }
+                        if (!looksLikePlayer) continue
+
+                        val candidate = resolveHttpUrl(finalUrl, raw) ?: continue
+                        if (!candidates.containsKey(candidate)) {
+                            candidates[candidate] = "inline-script URL"
+                        }
                     }
+                }
 
-                    ClipboardLogger.logAndCopy("Embed candidate", candidate.take(300))
+                ClipboardLogger.logAndCopy(
+                    "Inline script hints",
+                    inlineScriptHints.joinToString("\n\n--- HINT ---\n\n").ifBlank {
+                        "No relevant inline player script found"
+                    }
+                )
 
-                    val lower = candidate.lowercase()
+                ClipboardLogger.logAndCopy(
+                    "All candidates",
+                    candidates.entries.take(80).joinToString("\n") {
+                        "${it.value} -> ${it.key.take(450)}"
+                    }.ifBlank { "No candidates found" }
+                )
+
+                for ((candidate, sourceDescription) in candidates) {
+                    if (!tried.add(candidate)) continue
+
+                    ClipboardLogger.logAndCopy(
+                        "Embed candidate",
+                        "$sourceDescription -> ${candidate.take(450)}"
+                    )
+
                     val directType = when {
-                        ".m3u8" in lower -> ExtractorLinkType.M3U8
-                        ".mpd" in lower -> ExtractorLinkType.DASH
-                        ".mp4" in lower -> ExtractorLinkType.VIDEO
+                        Regex("\\.m3u8(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
+                            ExtractorLinkType.M3U8
+                        Regex("\\.mpd(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
+                            ExtractorLinkType.DASH
+                        Regex("\\.mp4(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
+                            ExtractorLinkType.VIDEO
                         else -> null
                     }
 
@@ -436,11 +569,11 @@ class HnembedProvider : MainAPI() {
                                 url = candidate,
                                 type = directType
                             ) {
-                                referer = embedUrl
+                                referer = finalUrl
                                 quality = Qualities.Unknown.value
                                 this.headers = mapOf(
                                     "User-Agent" to userAgent,
-                                    "Referer" to embedUrl
+                                    "Referer" to finalUrl
                                 )
                             }
                         )
@@ -449,26 +582,26 @@ class HnembedProvider : MainAPI() {
                     }
 
                     try {
-                        loadExtractor(candidate, embedUrl, subtitleCallback) { link ->
+                        loadExtractor(candidate, finalUrl, subtitleCallback) { link ->
                             callback.invoke(link)
                             emitted++
                             ClipboardLogger.logAndCopy(
                                 "Extractor link",
-                                "${link.name} | ${link.url.take(180)}"
+                                "${link.name} | ${link.url.take(250)}"
                             )
                         }
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
                         ClipboardLogger.logAndCopy(
                             "Candidate extractor",
-                            "${candidate.take(180)} | ${e.message}"
+                            "${candidate.take(250)} | ${e.javaClass.simpleName}: ${e.message}"
                         )
                     }
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 ClipboardLogger.logAndCopy(
-                    "Embed fetch",
+                    "Embed fetch/parse",
                     "${e.javaClass.simpleName}: ${e.message}"
                 )
             }
@@ -478,8 +611,9 @@ class HnembedProvider : MainAPI() {
 
         ClipboardLogger.logAndCopy(
             "No playable source",
-            "HNEmbed returned no URL handled by the installed CloudStream extractors. " +
-                "The embed page itself is not returned as a video link."
+            "HNEmbed returned no candidate handled by the installed CloudStream extractors. " +
+                "Check HTML scan, HTML candidates and Inline script hints. " +
+                "The HTML page is not reported as a video link."
         )
         return false
     }
