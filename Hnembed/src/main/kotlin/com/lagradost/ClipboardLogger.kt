@@ -70,11 +70,11 @@ object ClipboardLogger {
     private fun redact(input: String): String {
         return input
             .replace(
-                Regex("""(?i)(api_token|token|authorization|cookie|vs)=([^&\\s"'<>]+)"""),
+                Regex("""(?i)(api_token|token|authorization|cookie|vs)=([^&\s"'<>]+)"""),
                 "$1=<redacted>"
             )
             .replace(
-                Regex("""(?i)(Bearer\\s+)[A-Za-z0-9._~-]+"""),
+                Regex("""(?i)(Bearer\s+)[A-Za-z0-9._~-]+"""),
                 "$1<redacted>"
             )
     }
