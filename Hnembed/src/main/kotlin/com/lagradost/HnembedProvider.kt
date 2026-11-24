@@ -801,7 +801,7 @@ class HnembedProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         ClipboardLogger.clear()
-        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-RUNTIME-NETWORK-DIAG-2026-11-24-V8")
+        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-DATA-API-DIAG-2026-11-24-V9")
         ClipboardLogger.logAndCopy(
             "loadLinks START",
             "data=$data; provider=$name; casting=$isCasting"
@@ -937,6 +937,131 @@ class HnembedProvider : MainAPI() {
 
                 // Keep URL plus the HTML element/attribute that exposed it.
                 val candidates = linkedMapOf<String, String>()
+
+                /*
+                 * HNEmbed's public wrapper exposes its source endpoint on the
+                 * player iframe as data-api. Use that exact DOM attribute rather
+                 * than hard-coding an undocumented URL pattern for every host.
+                 * This step only reads the public API response and its returned
+                 * iframe/player URL; it does not bypass CAPTCHA or decode media.
+                 */
+                val playerIframe = iframeElements.firstOrNull {
+                    it.id() == "player_iframe"
+                } ?: iframeElements.firstOrNull {
+                    it.hasAttr("data-api")
+                }
+
+                val apiRaw = playerIframe?.attr("data-api")
+                    ?.takeIf { it.isNotBlank() }
+                val apiUrl = resolveHttpUrl(finalUrl, apiRaw)
+
+                ClipboardLogger.logAndCopy(
+                    "HNEmbed data-api",
+                    apiUrl ?: "The player iframe did not expose a usable data-api attribute"
+                )
+
+                if (apiUrl != null) {
+                    try {
+                        val apiResponse = app.get(
+                            apiUrl,
+                            headers = mapOf(
+                                "User-Agent" to userAgent,
+                                "Accept" to "application/json,text/plain,*/*",
+                                "Referer" to finalUrl,
+                                "Origin" to mirror
+                            )
+                        )
+                        val apiText = apiResponse.text
+
+                        ClipboardLogger.logAndCopy(
+                            "HNEmbed vs_src response",
+                            "HTTP ${apiResponse.code}; final=${apiResponse.url}; " +
+                                "bytes=${apiText.length}\n${apiText.take(1800)}"
+                        )
+
+                        val srcFromJson = try {
+                            JSONObject(apiText).optString("src")
+                                .takeIf { it.isNotBlank() && it != "null" }
+                        } catch (_: Exception) {
+                            null
+                        }
+                        val srcFromRegex = Regex(
+                            """\"src\"\s*:\s*\"([^\"]+)\""""
+                        ).find(apiText)?.groupValues?.getOrNull(1)
+
+                        val srcRaw = (srcFromJson ?: srcFromRegex)
+                            ?.replace("\\/", "/")
+                            ?.replace("\\u0026", "&")
+                        val srcUrl = resolveHttpUrl(apiUrl, srcRaw)
+
+                        ClipboardLogger.logAndCopy(
+                            "HNEmbed src result",
+                            srcUrl ?: "No valid HTTP src field was returned"
+                        )
+
+                        if (srcUrl != null) {
+                            candidates[srcUrl] = "HNEmbed data-api src"
+
+                            // Inspect the public landing response for a playerUrl
+                            // field. This is diagnostic; the normal extractor loop
+                            // below will handle the returned URL if one is present.
+                            try {
+                                val landing = app.get(
+                                    srcUrl,
+                                    headers = mapOf(
+                                        "User-Agent" to userAgent,
+                                        "Accept" to "text/html,application/json,*/*",
+                                        "Referer" to "$mirror/"
+                                    )
+                                )
+                                val landingText = landing.text
+
+                                ClipboardLogger.logAndCopy(
+                                    "HNEmbed src landing",
+                                    "HTTP ${landing.code}; final=${landing.url}; " +
+                                        "bytes=${landingText.length}\n${landingText.take(1800)}"
+                                )
+
+                                val playerFromJson = try {
+                                    JSONObject(landingText).optString("playerUrl")
+                                        .takeIf { it.isNotBlank() && it != "null" }
+                                } catch (_: Exception) {
+                                    null
+                                }
+                                val playerFromRegex = Regex(
+                                    """\"playerUrl\"\s*:\s*\"([^\"]+)\""""
+                                ).find(landingText)?.groupValues?.getOrNull(1)
+
+                                val playerRaw = (playerFromJson ?: playerFromRegex)
+                                    ?.replace("\\/", "/")
+                                    ?.replace("\\u0026", "&")
+                                val playerUrl = resolveHttpUrl(srcUrl, playerRaw)
+
+                                ClipboardLogger.logAndCopy(
+                                    "HNEmbed resolved playerUrl",
+                                    playerUrl ?: "No playerUrl field found in the src landing page"
+                                )
+
+                                if (playerUrl != null) {
+                                    candidates[playerUrl] = "HNEmbed src landing playerUrl"
+                                }
+                            } catch (e: Exception) {
+                                if (e is CancellationException) throw e
+                                ClipboardLogger.logAndCopy(
+                                    "HNEmbed src landing error",
+                                    "${e.javaClass.simpleName}: ${e.message}"
+                                )
+                            }
+                        }
+                    } catch (e: Exception) {
+                        if (e is CancellationException) throw e
+                        ClipboardLogger.logAndCopy(
+                            "HNEmbed vs_src error",
+                            "${e.javaClass.simpleName}: ${e.message}"
+                        )
+                    }
+                }
+
                 for (element in scanElements) {
                     for (attribute in attributeNames) {
                         val raw = element.attributeCandidate(attribute) ?: continue
