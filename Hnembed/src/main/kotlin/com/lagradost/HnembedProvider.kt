@@ -110,6 +110,64 @@ private fun Element.attributeCandidate(attribute: String): String? =
     if (hasAttr(attribute)) attr(attribute).trim().takeIf { it.isNotBlank() } else null
 
 /**
+ * Sends a lightweight HEAD request to a rendered /pl/ source URL.
+ * This is diagnostic only: it does not download the stream or assume its format.
+ * Cookies are read from Android's WebView cookie store because the source URL
+ * may be session-bound to the player page.
+ */
+private suspend fun inspectPlayerSource(
+    sourceUrl: String,
+    playerUrl: String,
+    userAgent: String
+) {
+    try {
+        val cookieHeader = try {
+            CookieManager.getInstance().getCookie(sourceUrl)
+        } catch (_: Exception) {
+            null
+        }
+
+        val requestHeaders = mutableMapOf(
+            "User-Agent" to userAgent,
+            "Accept" to "*/*"
+        )
+        if (!cookieHeader.isNullOrBlank()) {
+            requestHeaders["Cookie"] = cookieHeader
+        }
+
+        val response = app.head(
+            sourceUrl,
+            headers = requestHeaders,
+            referer = playerUrl,
+            timeout = 12L
+        )
+
+        val contentType = response.headers["Content-Type"].orEmpty()
+        val contentLength = response.headers["Content-Length"].orEmpty()
+        val acceptRanges = response.headers["Accept-Ranges"].orEmpty()
+        val contentRange = response.headers["Content-Range"].orEmpty()
+
+        ClipboardLogger.logAndCopy(
+            "PLAYER SOURCE HEAD",
+            "HTTP=${response.code}\n" +
+                "finalUrl=${response.url}\n" +
+                "contentType=$contentType\n" +
+                "contentLength=$contentLength\n" +
+                "acceptRanges=$acceptRanges\n" +
+                "contentRange=$contentRange\n" +
+                "referer=$playerUrl\n" +
+                "cookieSent=${!cookieHeader.isNullOrBlank()}"
+        )
+    } catch (e: Exception) {
+        if (e is CancellationException) throw e
+        ClipboardLogger.logAndCopy(
+            "PLAYER SOURCE HEAD ERROR",
+            "${e.javaClass.simpleName}: ${e.message}"
+        )
+    }
+}
+
+/**
  * Loads either the public HNEmbed wrapper or the resolved player page in WebView.
  * It reads the rendered DOM and observable network metadata after page scripts run.
  * It does not synthesize clicks, bypass challenges, or decode protected media payloads.
@@ -850,7 +908,7 @@ class HnembedProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         ClipboardLogger.clear()
-        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-DIRECT-PLAYER-DIAG-2026-11-24-V10")
+        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-DIRECT-PLAYER-DIAG-2026-11-24-V11")
         ClipboardLogger.logAndCopy(
             "loadLinks START",
             "data=$data; provider=$name; casting=$isCasting"
@@ -1286,6 +1344,13 @@ class HnembedProvider : MainAPI() {
                             "Direct player candidate",
                             candidate.take(450)
                         )
+
+                        // The V10 log showed a rendered <source> URL under /pl/.
+                        // Inspect its response headers before deciding whether it is
+                        // HLS, DASH, MP4, or a custom/HTML endpoint.
+                        if (candidate.contains("/pl/", ignoreCase = true)) {
+                            inspectPlayerSource(candidate, playerPage, userAgent)
+                        }
 
                         val directType = when {
                             Regex("\\.m3u8(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
