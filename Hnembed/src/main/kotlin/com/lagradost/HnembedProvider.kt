@@ -219,7 +219,7 @@ private suspend fun inspectRenderedIframeUrls(
         val consoleMessages = linkedSetOf<String>()
 
         val mediaUrlPattern = Regex(
-            """(?i)(\.(m3u8|mpd|mp4|m4s|ts|m4a|aac|mp3|webm)(?:$|[?#])|/segment(?:/|[?#])|/chunk(?:/|[?#])|videoplayback)"""
+            """(?i)(/pl/|/content/|\.(m3u8|mpd|mp4|m4s|ts|m4a|aac|mp3|webm)(?:$|[?#])|/segment(?:/|[?#])|/chunk(?:/|[?#])|videoplayback)"""
         )
 
         fun recordRequest(kind: String, url: String) {
@@ -358,7 +358,7 @@ private suspend fun inspectRenderedIframeUrls(
                     var resources = performance.getEntriesByType('resource')
                       .map(function(e) { return e.name; })
                       .filter(function(u) {
-                        return /\.m3u8(?:$|[?#])|\.mpd(?:$|[?#])|\.mp4(?:$|[?#])|\/embed\/player\/|\/player\//i.test(u);
+                        return /\/pl\/|\/content\/|\.m3u8(?:$|[?#])|\.mpd(?:$|[?#])|\.mp4(?:$|[?#])|\/embed\/player\/|\/player\//i.test(u);
                       }).slice(-100);
                     return JSON.stringify({
                       page: location.href,
@@ -456,13 +456,27 @@ private suspend fun inspectRenderedIframeUrls(
                         if (media != null && media.length() > 0) {
                             for (i in 0 until media.length()) {
                                 val item = media.optJSONObject(i) ?: continue
-                                val raw = item.optString("currentSrc")
-                                    .ifBlank { item.optString("srcAttr") }
-                                    .ifBlank { item.optString("src") }
+                                val tag = item.optString("tag")
+                                // SOURCE.currentSrc is normally empty; prefer its literal src attribute.
+                                // VIDEO.currentSrc may be blob:, which is not a native-player URL.
+                                val raw = if (tag.equals("SOURCE", ignoreCase = true)) {
+                                    item.optString("srcAttr")
+                                        .ifBlank { item.optString("src") }
+                                } else {
+                                    item.optString("currentSrc")
+                                        .ifBlank { item.optString("srcAttr") }
+                                        .ifBlank { item.optString("src") }
+                                }
 
                                 if (raw.startsWith("http://") || raw.startsWith("https://")) {
                                     synchronized(exposedMediaUrls) {
                                         if (exposedMediaUrls.size < 40) exposedMediaUrls.add(raw)
+                                    }
+                                    if (tag.equals("SOURCE", ignoreCase = true)) {
+                                        ClipboardLogger.logAndCopy(
+                                            "PLAYER SOURCE DOM",
+                                            "url=$raw; type=${item.optString("type")}"
+                                        )
                                     }
                                 }
 
@@ -493,7 +507,9 @@ private suspend fun inspectRenderedIframeUrls(
                                 val raw = resources.optString(i)
                                 val resolved = resolveHttpUrl(pageUrl, raw) ?: continue
                                 val lower = resolved.lowercase()
-                                if (Regex("\\.(m3u8|mpd|mp4)(?:$|[?#])")
+                                if (lower.contains("/pl/") ||
+                                    lower.contains("/content/") ||
+                                    Regex("\\.(m3u8|mpd|mp4)(?:$|[?#])")
                                         .containsMatchIn(lower) ||
                                     lower.contains("/embed/player/") ||
                                     lower.contains("/player/")) {
@@ -908,7 +924,7 @@ class HnembedProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         ClipboardLogger.clear()
-        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-DIRECT-PLAYER-DIAG-2026-11-24-V11")
+        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-DIRECT-PLAYER-DIAG-2026-11-24-V12")
         ClipboardLogger.logAndCopy(
             "loadLinks START",
             "data=$data; provider=$name; casting=$isCasting"
