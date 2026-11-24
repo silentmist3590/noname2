@@ -153,6 +153,32 @@ private suspend fun inspectRenderedIframeUrls(
         val iframeUrls = linkedSetOf<String>()
         val subframeRequests = linkedSetOf<String>()
         val resourceUrls = linkedSetOf<String>()
+        val observedRequests = linkedSetOf<String>()
+        val exposedApiEndpoints = linkedSetOf<String>()
+        val networkErrors = linkedSetOf<String>()
+        val consoleMessages = linkedSetOf<String>()
+
+        val mediaUrlPattern = Regex(
+            """(?i)(\.(m3u8|mpd|mp4|m4s|ts|m4a|aac|mp3|webm)(?:$|[?#])|/segment(?:/|[?#])|/chunk(?:/|[?#])|videoplayback)"""
+        )
+
+        fun recordRequest(kind: String, url: String) {
+            if (!url.startsWith("http://") && !url.startsWith("https://")) return
+            synchronized(observedRequests) {
+                if (observedRequests.size < 180) observedRequests.add("$kind $url")
+            }
+            if (mediaUrlPattern.containsMatchIn(url)) {
+                synchronized(resourceUrls) {
+                    if (resourceUrls.size < 100) resourceUrls.add(url)
+                }
+            }
+        }
+
+        fun recordNetworkError(value: String) {
+            synchronized(networkErrors) {
+                if (networkErrors.size < 80) networkErrors.add(value)
+            }
+        }
 
         var pollTask: Runnable? = null
         var timeoutTask: Runnable? = null
@@ -163,22 +189,45 @@ private suspend fun inspectRenderedIframeUrls(
             pollTask?.let(mainHandler::removeCallbacks)
             timeoutTask?.let(mainHandler::removeCallbacks)
 
+            // Only iframe destinations and media-like resources are extractor candidates.
+            // Keep the complete subresource list diagnostic-only (never feed ads/scripts to extractors).
             val result = linkedSetOf<String>()
             result.addAll(iframeUrls)
-            synchronized(subframeRequests) { result.addAll(subframeRequests) }
-            result.addAll(resourceUrls)
+            synchronized(resourceUrls) { result.addAll(resourceUrls) }
+
+            val requestSnapshot = synchronized(observedRequests) { observedRequests.toList() }
+            val apiSnapshot = synchronized(exposedApiEndpoints) { exposedApiEndpoints.toList() }
+            val errorSnapshot = synchronized(networkErrors) { networkErrors.toList() }
+            val consoleSnapshot = synchronized(consoleMessages) { consoleMessages.toList() }
 
             ClipboardLogger.logAndCopy(
                 "Rendered iframe inspection summary",
                 "pageFinished=$pageFinished; polls=$pollCount; " +
                     "iframeUrls=${iframeUrls.size}; subframeRequests=${subframeRequests.size}; " +
-                    "mediaResources=${resourceUrls.size}"
+                    "mediaResources=${resourceUrls.size}; observedRequests=${requestSnapshot.size}; " +
+                    "apiEndpoints=${apiSnapshot.size}; networkErrors=${errorSnapshot.size}"
             )
             ClipboardLogger.logAndCopy(
                 "Rendered iframe candidates",
                 result.joinToString("\n").ifBlank {
                     "No public iframe/player/media URL observed after JavaScript execution"
                 }
+            )
+            ClipboardLogger.logAndCopy(
+                "Exposed player API attributes",
+                apiSnapshot.joinToString("\n").ifBlank { "No data-api URL attribute found" }
+            )
+            ClipboardLogger.logAndCopy(
+                "Observed WebView network requests",
+                requestSnapshot.joinToString("\n").ifBlank { "No WebView requests captured" }
+            )
+            ClipboardLogger.logAndCopy(
+                "WebView network errors",
+                errorSnapshot.joinToString("\n").ifBlank { "No HTTP/network errors reported by WebView" }
+            )
+            ClipboardLogger.logAndCopy(
+                "Filtered WebView console",
+                consoleSnapshot.joinToString("\n").ifBlank { "No console warnings/errors captured" }
             )
 
             try {
@@ -193,7 +242,7 @@ private suspend fun inspectRenderedIframeUrls(
         timeoutTask = Runnable {
             ClipboardLogger.logAndCopy(
                 "Rendered iframe inspection",
-                "Timed out after 18 seconds waiting for the rendered iframe/player URL"
+                "Timed out after 26 seconds waiting for the rendered iframe/player URL"
             )
             finish()
         }
@@ -271,7 +320,22 @@ private suspend fun inspectRenderedIframeUrls(
                                 if (attrs != null) {
                                     for (j in 0 until attrs.length()) {
                                         val attr = attrs.optJSONObject(j) ?: continue
-                                        values.add(attr.optString("value"))
+                                        val attrName = attr.optString("name").lowercase()
+                                        val attrValue = attr.optString("value")
+                                        when (attrName) {
+                                            "src", "data-src", "data-url", "data-embed",
+                                            "data-player", "data-file", "data-href", "href" -> {
+                                                values.add(attrValue)
+                                            }
+                                            "data-api" -> {
+                                                val apiUrl = resolveHttpUrl(pageUrl, attrValue)
+                                                if (apiUrl != null) {
+                                                    synchronized(exposedApiEndpoints) {
+                                                        exposedApiEndpoints.add(apiUrl)
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
 
@@ -316,7 +380,9 @@ private suspend fun inspectRenderedIframeUrls(
                                     item.optString("src")
                                 }
                                 resolveHttpUrl(pageUrl, raw)?.let { candidate ->
-                                    resourceUrls.add(candidate)
+                                    synchronized(resourceUrls) {
+                                        resourceUrls.add(candidate)
+                                    }
                                 }
                             }
                         }
@@ -331,7 +397,9 @@ private suspend fun inspectRenderedIframeUrls(
                                         .containsMatchIn(lower) ||
                                     lower.contains("/embed/player/") ||
                                     lower.contains("/player/")) {
-                                    resourceUrls.add(resolved)
+                                    synchronized(resourceUrls) {
+                                        resourceUrls.add(resolved)
+                                    }
                                 }
                             }
                         }
@@ -345,7 +413,7 @@ private suspend fun inspectRenderedIframeUrls(
 
                 // Poll repeatedly: the wrapper may assign iframe.src asynchronously
                 // after sbx.js finishes initializing the page.
-                if (pollCount < 14) {
+                if (pollCount < 20) {
                     pollTask?.let { mainHandler.postDelayed(it, 650L) }
                 } else {
                     finish()
@@ -360,7 +428,7 @@ private suspend fun inspectRenderedIframeUrls(
                 javaScriptCanOpenWindowsAutomatically = false
                 setSupportMultipleWindows(false)
                 userAgentString = userAgent
-                mediaPlaybackRequiresUserGesture = false
+                mediaPlaybackRequiresUserGesture = true
                 allowFileAccess = false
                 mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             }
@@ -371,10 +439,14 @@ private suspend fun inspectRenderedIframeUrls(
             webView.webChromeClient = object : WebChromeClient() {
                 override fun onConsoleMessage(message: android.webkit.ConsoleMessage?): Boolean {
                     if (message != null) {
-                        ClipboardLogger.logAndCopy(
-                            "Rendered page console",
-                            "${message.message()} (${message.sourceId()}:${message.lineNumber()})"
-                        )
+                        val level = message.messageLevel().toString()
+                        if (level == "ERROR" || level == "WARNING") {
+                            val text = "$level: ${message.message()} " +
+                                "(${message.sourceId()}:${message.lineNumber()})"
+                            synchronized(consoleMessages) {
+                                if (consoleMessages.size < 60) consoleMessages.add(text)
+                            }
+                        }
                     }
                     return true
                 }
@@ -405,29 +477,69 @@ private suspend fun inspectRenderedIframeUrls(
                     view: WebView?,
                     request: WebResourceRequest?
                 ): WebResourceResponse? {
-                    if (request != null && !request.isForMainFrame) {
-                        val requestUrl = request.url.toString()
-                        val lower = requestUrl.lowercase()
-                        val isLikelyFrameOrMedia =
-                            lower.contains("/embed/player/") ||
-                            lower.contains("/player/") ||
-                            Regex("\\.(m3u8|mpd|mp4)(?:$|[?#])")
-                                .containsMatchIn(lower)
+                    if (request != null) {
+                        val url = request.url.toString()
+                        val kind = if (request.isForMainFrame) "MAIN" else "SUB"
+                        recordRequest("$kind ${request.method}", url)
 
-                        if (isLikelyFrameOrMedia) {
+                        if (!request.isForMainFrame) {
                             synchronized(subframeRequests) {
-                                subframeRequests.add(requestUrl)
+                                if (subframeRequests.size < 120) subframeRequests.add(url)
                             }
                         }
                     }
                     return null
                 }
+
+                override fun onLoadResource(view: WebView?, url: String?) {
+                    super.onLoadResource(view, url)
+                    if (!url.isNullOrBlank()) recordRequest("LOAD", url)
+                }
+
+                override fun onReceivedHttpError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    errorResponse: WebResourceResponse?
+                ) {
+                    super.onReceivedHttpError(view, request, errorResponse)
+                    if (request != null && errorResponse != null) {
+                        recordNetworkError(
+                            "HTTP ${errorResponse.statusCode} " +
+                                "${if (request.isForMainFrame) "MAIN" else "SUB"} ${request.url}"
+                        )
+                    }
+                }
+
+                override fun onReceivedError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    error: android.webkit.WebResourceError?
+                ) {
+                    super.onReceivedError(view, request, error)
+                    if (request != null && error != null) {
+                        recordNetworkError(
+                            "WebError ${error.errorCode}: ${error.description} " +
+                                "${if (request.isForMainFrame) "MAIN" else "SUB"} ${request.url}"
+                        )
+                    }
+                }
+
+                override fun onReceivedSslError(
+                    view: WebView?,
+                    handler: android.webkit.SslErrorHandler?,
+                    error: android.net.http.SslError?
+                ) {
+                    recordNetworkError("SSL error: ${error?.toString() ?: "unknown"}")
+                    handler?.cancel()
+                }
             }
 
-            timeoutTask?.let { mainHandler.postDelayed(it, 18_000L) }
+            timeoutTask?.let            }
+
+            timeoutTask?.let { mainHandler.postDelayed(it, 26_000L) }
             ClipboardLogger.logAndCopy(
                 "Rendered iframe inspection",
-                "Loading HNEmbed wrapper and polling the rendered iframe DOM for up to 9 seconds: $pageUrl"
+                "Loading HNEmbed wrapper and polling the rendered iframe DOM for up to 13 seconds: $pageUrl"
             )
             webView.loadUrl(
                 pageUrl,
@@ -690,7 +802,7 @@ class HnembedProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         ClipboardLogger.clear()
-        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-RUNTIME-IFRAME-POLL-2026-11-19-V7")
+        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-RUNTIME-NETWORK-DIAG-2026-11-24-V8")
         ClipboardLogger.logAndCopy(
             "loadLinks START",
             "data=$data; provider=$name; casting=$isCasting"
@@ -940,6 +1052,11 @@ class HnembedProvider : MainAPI() {
                         continue
                     }
 
+                    val beforeCandidate = emitted
+                    ClipboardLogger.logAndCopy(
+                        "Extractor attempt",
+                        "start=$candidate; referer=$finalUrl"
+                    )
                     try {
                         loadExtractor(candidate, finalUrl, subtitleCallback) { link ->
                             callback.invoke(link)
@@ -949,6 +1066,10 @@ class HnembedProvider : MainAPI() {
                                 "${link.name} | ${link.url.take(250)}"
                             )
                         }
+                        ClipboardLogger.logAndCopy(
+                            "Extractor result",
+                            "candidate=$candidate; callbacks=${emitted - beforeCandidate}"
+                        )
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
                         ClipboardLogger.logAndCopy(
@@ -997,6 +1118,11 @@ class HnembedProvider : MainAPI() {
                             continue
                         }
 
+                        val beforeCandidate = emitted
+                        ClipboardLogger.logAndCopy(
+                            "Rendered extractor attempt",
+                            "start=$candidate; referer=$finalUrl"
+                        )
                         try {
                             loadExtractor(candidate, finalUrl, subtitleCallback) { link ->
                                 callback.invoke(link)
@@ -1006,6 +1132,10 @@ class HnembedProvider : MainAPI() {
                                     "${link.name} | ${link.url.take(250)}"
                                 )
                             }
+                            ClipboardLogger.logAndCopy(
+                                "Rendered extractor result",
+                                "candidate=$candidate; callbacks=${emitted - beforeCandidate}"
+                            )
                         } catch (e: Exception) {
                             if (e is CancellationException) throw e
                             ClipboardLogger.logAndCopy(
@@ -1029,7 +1159,7 @@ class HnembedProvider : MainAPI() {
         ClipboardLogger.logAndCopy(
             "No playable source",
             "HNEmbed returned no candidate handled by the installed CloudStream extractors. " +
-                "Check Static iframe details, Rendered iframe DOM polls and Rendered iframe candidates. " +
+                "Check Rendered iframe candidates, Observed WebView network requests and WebView network errors. " +
                 "The HTML page is not reported as a video link."
         )
         return false
