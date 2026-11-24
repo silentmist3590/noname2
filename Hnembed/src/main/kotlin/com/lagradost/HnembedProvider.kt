@@ -534,7 +534,6 @@ private suspend fun inspectRenderedIframeUrls(
                 }
             }
 
-            timeoutTask?.let            }
 
             timeoutTask?.let { mainHandler.postDelayed(it, 26_000L) }
             ClipboardLogger.logAndCopy(
