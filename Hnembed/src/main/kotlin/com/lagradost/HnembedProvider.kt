@@ -106,6 +106,17 @@ private fun resolveHttpUrl(baseUrl: String, raw: String?): String? {
     }
 }
 
+/** Redacts query values in diagnostics while retaining the actual URL for playback. */
+private fun redactUrlForLog(value: String): String {
+    return try {
+        val uri = URI(value)
+        if (uri.rawQuery.isNullOrBlank()) value
+        else URI(uri.scheme, uri.rawAuthority, uri.rawPath, "<redacted>", null).toString()
+    } catch (_: Exception) {
+        value.substringBefore('?') + if ('?' in value) "?<redacted>" else ""
+    }
+}
+
 private fun Element.attributeCandidate(attribute: String): String? =
     if (hasAttr(attribute)) attr(attribute).trim().takeIf { it.isNotBlank() } else null
 
@@ -119,7 +130,7 @@ private suspend fun inspectPlayerSource(
     sourceUrl: String,
     playerUrl: String,
     userAgent: String
-) {
+): Boolean {
     try {
         val cookieHeader = try {
             CookieManager.getInstance().getCookie(sourceUrl)
@@ -142,28 +153,38 @@ private suspend fun inspectPlayerSource(
             timeout = 12L
         )
 
-        val contentType = response.headers["Content-Type"].orEmpty()
-        val contentLength = response.headers["Content-Length"].orEmpty()
-        val acceptRanges = response.headers["Accept-Ranges"].orEmpty()
-        val contentRange = response.headers["Content-Range"].orEmpty()
+        fun header(name: String): String = response.headers.entries
+            .firstOrNull { it.key.equals(name, ignoreCase = true) }
+            ?.value.orEmpty()
+
+        val contentType = header("Content-Type")
+        val contentLength = header("Content-Length")
+        val acceptRanges = header("Accept-Ranges")
+        val contentRange = header("Content-Range")
+        val isHls = response.code in 200..299 &&
+            (contentType.contains("mpegurl", ignoreCase = true) ||
+                contentType.contains("vnd.apple.mpegurl", ignoreCase = true))
 
         ClipboardLogger.logAndCopy(
             "PLAYER SOURCE HEAD",
             "HTTP=${response.code}\n" +
-                "finalUrl=${response.url}\n" +
+                "finalUrl=${redactUrlForLog(response.url.toString())}\n" +
                 "contentType=$contentType\n" +
+                "confirmedHls=$isHls\n" +
                 "contentLength=$contentLength\n" +
                 "acceptRanges=$acceptRanges\n" +
                 "contentRange=$contentRange\n" +
-                "referer=$playerUrl\n" +
+                "referer=${redactUrlForLog(playerUrl)}\n" +
                 "cookieSent=${!cookieHeader.isNullOrBlank()}"
         )
+        isHls
     } catch (e: Exception) {
         if (e is CancellationException) throw e
         ClipboardLogger.logAndCopy(
             "PLAYER SOURCE HEAD ERROR",
             "${e.javaClass.simpleName}: ${e.message}"
         )
+        false
     }
 }
 
@@ -271,7 +292,7 @@ private suspend fun inspectRenderedIframeUrls(
             )
             ClipboardLogger.logAndCopy(
                 "Rendered iframe candidates",
-                result.joinToString("\n").ifBlank {
+                result.joinToString("\n") { redactUrlForLog(it) }.ifBlank {
                     "No public iframe/player/media URL observed after JavaScript execution"
                 }
             )
@@ -379,6 +400,7 @@ private suspend fun inspectRenderedIframeUrls(
 
             webView.evaluateJavascript(javascript) { rawResult ->
                 if (finished) return@evaluateJavascript
+                var detectedHlsSource = false
 
                 try {
                     val decoded = JSONTokener(rawResult ?: "null").nextValue() as? String
@@ -473,16 +495,21 @@ private suspend fun inspectRenderedIframeUrls(
                                         if (exposedMediaUrls.size < 40) exposedMediaUrls.add(raw)
                                     }
                                     if (tag.equals("SOURCE", ignoreCase = true)) {
+                                        val sourceType = item.optString("type")
                                         ClipboardLogger.logAndCopy(
                                             "PLAYER SOURCE DOM",
-                                            "url=$raw; type=${item.optString("type")}"
+                                            "url=${redactUrlForLog(raw)}; type=$sourceType"
                                         )
+                                        if (raw.contains("/pl/", ignoreCase = true) &&
+                                            sourceType.contains("mpegurl", ignoreCase = true)) {
+                                            detectedHlsSource = true
+                                        }
                                     }
                                 }
 
                                 mediaStateLines.add(
-                                    "tag=${item.optString("tag")}; src=${item.optString("src").take(260)}; " +
-                                        "currentSrc=${item.optString("currentSrc").take(260)}; " +
+                                    "tag=${item.optString("tag")}; src=${redactUrlForLog(item.optString("src")).take(260)}; " +
+                                        "currentSrc=${redactUrlForLog(item.optString("currentSrc")).take(260)}; " +
                                         "paused=${item.opt("paused")}; readyState=${item.opt("readyState")}; " +
                                         "networkState=${item.opt("networkState")}; " +
                                         "videoSize=${item.opt("videoWidth")}x${item.opt("videoHeight")}; " +
@@ -527,9 +554,17 @@ private suspend fun inspectRenderedIframeUrls(
                     )
                 }
 
-                // Poll repeatedly: the wrapper may assign iframe.src asynchronously
-                // after sbx.js finishes initializing the page.
-                if (pollCount < 20) {
+                // A rendered /pl/ SOURCE explicitly typed as HLS is enough to stop
+                // waiting for more DOM changes. Return it immediately for a server-side
+                // HEAD check; do not rely on the DOM MIME declaration alone for playback.
+                if (detectedHlsSource) {
+                    ClipboardLogger.logAndCopy(
+                        "HLS source detected",
+                        "Found a public /pl/ SOURCE with an HLS MIME declaration; ending DOM polling early"
+                    )
+                    finish()
+                } else if (pollCount < 20) {
+                    // The wrapper may assign iframe.src asynchronously after page scripts run.
                     pollTask?.let { mainHandler.postDelayed(it, 650L) }
                 } else {
                     finish()
@@ -924,7 +959,7 @@ class HnembedProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         ClipboardLogger.clear()
-        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-DIRECT-PLAYER-DIAG-2026-11-24-V12")
+        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-DIRECT-PLAYER-DIAG-2026-11-24-V13")
         ClipboardLogger.logAndCopy(
             "loadLinks START",
             "data=$data; provider=$name; casting=$isCasting"
@@ -1319,13 +1354,13 @@ class HnembedProvider : MainAPI() {
                         }
                         ClipboardLogger.logAndCopy(
                             "Extractor result",
-                            "candidate=$candidate; callbacks=${emitted - beforeCandidate}"
+                            "candidate=${redactUrlForLog(candidate)}; callbacks=${emitted - beforeCandidate}"
                         )
                     } catch (e: Exception) {
                         if (e is CancellationException) throw e
                         ClipboardLogger.logAndCopy(
                             "Candidate extractor",
-                            "${candidate.take(250)} | ${e.javaClass.simpleName}: ${e.message}"
+                            "${redactUrlForLog(candidate).take(250)} | ${e.javaClass.simpleName}: ${e.message}"
                         )
                     }
                 }
@@ -1337,7 +1372,7 @@ class HnembedProvider : MainAPI() {
                     val playerPage = directPlayerPageUrl!!
                     ClipboardLogger.logAndCopy(
                         "Direct player inspection start",
-                        "url=$playerPage; referer=$directPlayerReferer"
+                        "url=${redactUrlForLog(playerPage)}; referer=${redactUrlForLog(directPlayerReferer)}"
                     )
 
                     val renderedCandidates = inspectRenderedIframeUrls(
@@ -1348,7 +1383,7 @@ class HnembedProvider : MainAPI() {
 
                     ClipboardLogger.logAndCopy(
                         "Direct player inspection candidates",
-                        renderedCandidates.joinToString("\n").ifBlank {
+                        renderedCandidates.joinToString("\n") { redactUrlForLog(it) }.ifBlank {
                             "No public iframe or media URL exposed by the direct player page"
                         }
                     )
@@ -1358,17 +1393,20 @@ class HnembedProvider : MainAPI() {
 
                         ClipboardLogger.logAndCopy(
                             "Direct player candidate",
-                            candidate.take(450)
+                            redactUrlForLog(candidate).take(450)
                         )
 
-                        // The V10 log showed a rendered <source> URL under /pl/.
+                        // The rendered <source> URL under /pl/ is checked against server headers.
                         // Inspect its response headers before deciding whether it is
                         // HLS, DASH, MP4, or a custom/HTML endpoint.
-                        if (candidate.contains("/pl/", ignoreCase = true)) {
+                        val serverConfirmedHls = if (candidate.contains("/pl/", ignoreCase = true)) {
                             inspectPlayerSource(candidate, playerPage, userAgent)
+                        } else {
+                            false
                         }
 
                         val directType = when {
+                            serverConfirmedHls -> ExtractorLinkType.M3U8
                             Regex("\\.m3u8(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
                                 ExtractorLinkType.M3U8
                             Regex("\\.mpd(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
@@ -1379,6 +1417,18 @@ class HnembedProvider : MainAPI() {
                         }
 
                         if (directType != null) {
+                            val playbackHeaders = mutableMapOf(
+                                "User-Agent" to userAgent,
+                                "Referer" to playerPage
+                            )
+                            try {
+                                CookieManager.getInstance().getCookie(candidate)
+                                    ?.takeIf { it.isNotBlank() }
+                                    ?.let { playbackHeaders["Cookie"] = it }
+                            } catch (_: Exception) {
+                                // The tokenized source URL may be sufficient without cookies.
+                            }
+
                             callback.invoke(
                                 newExtractorLink(
                                     source = name,
@@ -1388,10 +1438,7 @@ class HnembedProvider : MainAPI() {
                                 ) {
                                     referer = playerPage
                                     quality = Qualities.Unknown.value
-                                    this.headers = mapOf(
-                                        "User-Agent" to userAgent,
-                                        "Referer" to playerPage
-                                    )
+                                    this.headers = playbackHeaders
                                 }
                             )
                             emitted++
@@ -1410,13 +1457,13 @@ class HnembedProvider : MainAPI() {
                             }
                             ClipboardLogger.logAndCopy(
                                 "Direct player extractor result",
-                                "candidate=$candidate; callbacks=${emitted - beforeCandidate}"
+                                "candidate=${redactUrlForLog(candidate)}; callbacks=${emitted - beforeCandidate}"
                             )
                         } catch (e: Exception) {
                             if (e is CancellationException) throw e
                             ClipboardLogger.logAndCopy(
                                 "Direct player extractor error",
-                                "${candidate.take(250)} | ${e.javaClass.simpleName}: ${e.message}"
+                                "${redactUrlForLog(candidate).take(250)} | ${e.javaClass.simpleName}: ${e.message}"
                             )
                         }
                     }
@@ -1448,13 +1495,13 @@ class HnembedProvider : MainAPI() {
                             }
                             ClipboardLogger.logAndCopy(
                                 "Rendered extractor result",
-                                "candidate=$candidate; callbacks=${emitted - beforeCandidate}"
+                                "candidate=${redactUrlForLog(candidate)}; callbacks=${emitted - beforeCandidate}"
                             )
                         } catch (e: Exception) {
                             if (e is CancellationException) throw e
                             ClipboardLogger.logAndCopy(
                                 "Rendered candidate extractor",
-                                "${candidate.take(250)} | ${e.javaClass.simpleName}: ${e.message}"
+                                "${redactUrlForLog(candidate).take(250)} | ${e.javaClass.simpleName}: ${e.message}"
                             )
                         }
                     }
