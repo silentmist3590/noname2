@@ -1,27 +1,41 @@
 package com.lagradost
 
+import android.annotation.SuppressLint
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.view.ViewGroup
+import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
-import android.webkit.WebView
-import android.webkit.WebViewClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
-import com.lagradost.cloudstream3.CommonActivity
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import org.json.JSONArray
 import org.json.JSONObject
-import org.json.JSONTokener
 import org.jsoup.Jsoup
-import org.jsoup.nodes.Element
+import java.io.BufferedReader
+import java.io.ByteArrayInputStream
+import java.io.InputStreamReader
+import java.net.HttpURLConnection
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.net.URI
+import java.net.URL
 import java.net.URLEncoder
-import java.util.concurrent.CancellationException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 
@@ -41,18 +55,25 @@ private val HN_REF_REGEX =
 private val HN_EMBED_PATH_REGEX =
     Regex("""^/embed/(movie|tv)/(\d+)(?:/(\d+)/(\d+))?/?$""")
 
-// Backward compatibility for old SearchResponse URLs that were incorrectly fixed by CloudStream.
 private val HN_LEGACY_PATH_REGEX =
     Regex("""^/hnembed:(movie|tv):(\d+)(?::(\d+):(\d+))?/?$""")
 
-/**
- * Accepted forms:
- *   hnembed:movie:123
- *   hnembed:tv:123:1:2
- *   https://hnembed.cc/embed/movie/123
- *   https://hnembed.cc/embed/tv/123/1/2
- *   https://hnembed.cc/hnembed:movie:123 (legacy broken URL)
- */
+private val HN_STATIC_PL_REGEX =
+    Regex("""/pl/([A-Za-z0-9_-]{30,})(?:/master\.m3u8)?/?(?:$|\?|#)""", RegexOption.IGNORE_CASE)
+
+private val HN_ANY_PL_REGEX =
+    Regex("""/pl[ci]?/[A-Za-z0-9_-]{30,}(?:/master\.m3u8)?/?(?:$|\?|#)""", RegexOption.IGNORE_CASE)
+
+private fun rethrowIfCancellation(t: Throwable) {
+    var cur: Throwable? = t
+    while (cur != null) {
+        if (cur.javaClass.name.endsWith("CancellationException")) {
+            throw t
+        }
+        cur = cur.cause
+    }
+}
+
 private fun parseHnRef(value: String): HnMediaRef? {
     val input = value.trim()
     val path = try {
@@ -74,21 +95,19 @@ private fun parseHnRef(value: String): HnMediaRef? {
     )
 }
 
-/** URL shown to CloudStream's UI must be an absolute HTTP URL. */
 private fun hnDetailUrl(type: String, id: Int): String {
     return if (type == "movie") {
         "https://hnembed.cc/embed/movie/$id"
     } else {
-        // Series detail URL. Playback data for each episode remains separate.
         "https://hnembed.cc/embed/tv/$id/1/1"
     }
 }
 
-/** Resolve relative and protocol-relative URLs against the final embed page. */
 private fun resolveHttpUrl(baseUrl: String, raw: String?): String? {
     val value = raw
         ?.trim()
         ?.replace("&amp;", "&")
+        ?.replace("\\u0026", "&")
         ?.replace("\\/", "/")
         ?.takeIf { it.isNotBlank() }
         ?: return null
@@ -106,563 +125,283 @@ private fun resolveHttpUrl(baseUrl: String, raw: String?): String? {
     }
 }
 
-private fun Element.attributeCandidate(attribute: String): String? =
-    if (hasAttr(attribute)) attr(attribute).trim().takeIf { it.isNotBlank() } else null
-
-/**
- * Sends a lightweight HEAD request to a rendered /pl/ source URL.
- * This is diagnostic only: it does not download the stream or assume its format.
- * Cookies are read from Android's WebView cookie store because the source URL
- * may be session-bound to the player page.
- */
-private suspend fun inspectPlayerSource(
-    sourceUrl: String,
-    playerUrl: String,
-    userAgent: String
-) {
-    try {
-        val cookieHeader = try {
-            CookieManager.getInstance().getCookie(sourceUrl)
-        } catch (_: Exception) {
-            null
+private fun originOfUrl(rawUrl: String): String {
+    return try {
+        val u = URI(rawUrl)
+        if (u.scheme != null && u.host != null) {
+            val portPart = if (u.port > 0) ":${u.port}" else ""
+            "${u.scheme}://${u.host}$portPart"
+        } else {
+            ""
         }
-
-        val requestHeaders = mutableMapOf(
-            "User-Agent" to userAgent,
-            "Accept" to "*/*"
-        )
-        if (!cookieHeader.isNullOrBlank()) {
-            requestHeaders["Cookie"] = cookieHeader
-        }
-
-        val response = app.head(
-            sourceUrl,
-            headers = requestHeaders,
-            referer = playerUrl,
-            timeout = 12L
-        )
-
-        val contentType = response.headers["Content-Type"].orEmpty()
-        val contentLength = response.headers["Content-Length"].orEmpty()
-        val acceptRanges = response.headers["Accept-Ranges"].orEmpty()
-        val contentRange = response.headers["Content-Range"].orEmpty()
-
-        ClipboardLogger.logAndCopy(
-            "PLAYER SOURCE HEAD",
-            "HTTP=${response.code}\n" +
-                "finalUrl=${response.url}\n" +
-                "contentType=$contentType\n" +
-                "contentLength=$contentLength\n" +
-                "acceptRanges=$acceptRanges\n" +
-                "contentRange=$contentRange\n" +
-                "referer=$playerUrl\n" +
-                "cookieSent=${!cookieHeader.isNullOrBlank()}"
-        )
-    } catch (e: Exception) {
-        if (e is CancellationException) throw e
-        ClipboardLogger.logAndCopy(
-            "PLAYER SOURCE HEAD ERROR",
-            "${e.javaClass.simpleName}: ${e.message}"
-        )
+    } catch (_: Exception) {
+        ""
     }
 }
 
+private fun extractQueryParam(url: String, key: String): String? {
+    val qIdx = url.indexOf('?')
+    if (qIdx < 0) return null
+    val query = url.substring(qIdx + 1).substringBefore('#')
+    for (part in query.split('&')) {
+        val eq = part.indexOf('=')
+        if (eq > 0 && part.substring(0, eq) == key) {
+            return part.substring(eq + 1)
+        }
+    }
+    return null
+}
+
+private fun appendTokenParam(url: String, tokenParamName: String, tokenValue: String): String {
+    if (tokenValue.isBlank()) return url
+    if (url.contains("__TOKEN__")) {
+        return url.replace("__TOKEN__", tokenValue)
+    }
+    if (Regex("""[?&]${Regex.escape(tokenParamName)}=""").containsMatchIn(url)) {
+        return url
+    }
+    val hashIdx = url.indexOf('#')
+    val base = if (hashIdx >= 0) url.substring(0, hashIdx) else url
+    val hash = if (hashIdx >= 0) url.substring(hashIdx) else ""
+    val sep = if (base.contains('?')) "&" else "?"
+    return "$base$sep$tokenParamName=$tokenValue$hash"
+}
+
 /**
- * Loads either the public HNEmbed wrapper or the resolved player page in WebView.
- * It reads the rendered DOM and observable network metadata after page scripts run.
- * It does not synthesize clicks, bypass challenges, or decode protected media payloads.
+ * Local loopback M3U8 proxy for HNEmbed static `/pl/` playlists when `/pli/` is unavailable:
+ * stamps `?token=` (or `?cast_token=`) onto every child variant playlist and segment URI so
+ * CloudStream ExoPlayer never hits HTTP 403 on child playlists or `.ts` chunks.
  */
-private suspend fun inspectRenderedIframeUrls(
-    pageUrl: String,
-    userAgent: String,
-    initialReferer: String = "https://hnembed.cc/"
-): List<String> {
-    return suspendCoroutine<List<String>> { continuation ->
-    val activity = try {
-        CommonActivity.activity
-    } catch (_: Throwable) {
-        null
-    }
+private object HnHlsTokenLoopbackProxy {
+    data class RouteEntry(
+        val targetUrl: String,
+        val origin: String,
+        val tokenName: String,
+        val tokenValue: String,
+        val referer: String,
+        val userAgent: String
+    )
 
-    if (activity == null) {
-        ClipboardLogger.logAndCopy(
-            "Rendered iframe inspection",
-            "Skipped: CommonActivity.activity is null"
-        )
-        continuation.resume(emptyList())
-        return@suspendCoroutine
-    }
+    private var serverSocket: ServerSocket? = null
+    private var port: Int = -1
+    private val seq = AtomicInteger(0)
+    private val entries = ConcurrentHashMap<String, RouteEntry>()
+    private val keyByParams = ConcurrentHashMap<String, String>()
 
-    val mainHandler = Handler(Looper.getMainLooper())
-    mainHandler.post {
-        val webView = try {
-            WebView(activity)
-        } catch (e: Exception) {
-            ClipboardLogger.logAndCopy(
-                "Rendered iframe inspection",
-                "WebView creation failed: ${e.message}"
-            )
-            continuation.resume(emptyList())
-            return@post
-        }
-
-        var finished = false
-        var pageFinished = false
-        var pollCount = 0
-        var lastSnapshot = ""
-        val iframeUrls = linkedSetOf<String>()
-        val subframeRequests = linkedSetOf<String>()
-        val resourceUrls = linkedSetOf<String>()
-        val exposedMediaUrls = linkedSetOf<String>()
-        val observedRequests = linkedSetOf<String>()
-        val exposedApiEndpoints = linkedSetOf<String>()
-        val networkErrors = linkedSetOf<String>()
-        val consoleMessages = linkedSetOf<String>()
-
-        val mediaUrlPattern = Regex(
-            """(?i)(\.(m3u8|mpd|mp4|m4s|ts|m4a|aac|mp3|webm)(?:$|[?#])|/segment(?:/|[?#])|/chunk(?:/|[?#])|videoplayback)"""
-        )
-
-        fun recordRequest(kind: String, url: String) {
-            if (!url.startsWith("http://") && !url.startsWith("https://")) return
-            synchronized(observedRequests) {
-                if (observedRequests.size < 180) observedRequests.add("$kind $url")
-            }
-            if (mediaUrlPattern.containsMatchIn(url)) {
-                synchronized(resourceUrls) {
-                    if (resourceUrls.size < 100) resourceUrls.add(url)
-                }
-            }
-        }
-
-        fun recordNetworkError(value: String) {
-            synchronized(networkErrors) {
-                if (networkErrors.size < 80) networkErrors.add(value)
-            }
-        }
-
-        var pollTask: Runnable? = null
-        var timeoutTask: Runnable? = null
-
-        fun finish() {
-            if (finished) return
-            finished = true
-            pollTask?.let(mainHandler::removeCallbacks)
-            timeoutTask?.let(mainHandler::removeCallbacks)
-
-            // Only iframe destinations and media-like resources are extractor candidates.
-            // Keep the complete subresource list diagnostic-only (never feed ads/scripts to extractors).
-            val result = linkedSetOf<String>()
-            result.addAll(iframeUrls)
-            synchronized(resourceUrls) { result.addAll(resourceUrls) }
-            synchronized(exposedMediaUrls) { result.addAll(exposedMediaUrls) }
-
-            val requestSnapshot = synchronized(observedRequests) { observedRequests.toList() }
-            val apiSnapshot = synchronized(exposedApiEndpoints) { exposedApiEndpoints.toList() }
-            val errorSnapshot = synchronized(networkErrors) { networkErrors.toList() }
-            val consoleSnapshot = synchronized(consoleMessages) { consoleMessages.toList() }
-
-            ClipboardLogger.logAndCopy(
-                "Rendered iframe inspection summary",
-                "pageFinished=$pageFinished; polls=$pollCount; " +
-                    "iframeUrls=${iframeUrls.size}; subframeRequests=${subframeRequests.size}; " +
-                    "mediaResources=${resourceUrls.size}; videoElementUrls=${exposedMediaUrls.size}; " +
-                    "observedRequests=${requestSnapshot.size}; " +
-                    "apiEndpoints=${apiSnapshot.size}; networkErrors=${errorSnapshot.size}"
-            )
-            ClipboardLogger.logAndCopy(
-                "Rendered iframe candidates",
-                result.joinToString("\n").ifBlank {
-                    "No public iframe/player/media URL observed after JavaScript execution"
-                }
-            )
-            ClipboardLogger.logAndCopy(
-                "Exposed player API attributes",
-                apiSnapshot.joinToString("\n").ifBlank { "No data-api URL attribute found" }
-            )
-            ClipboardLogger.logAndCopy(
-                "Observed WebView network requests",
-                requestSnapshot.joinToString("\n").ifBlank { "No WebView requests captured" }
-            )
-            ClipboardLogger.logAndCopy(
-                "WebView network errors",
-                errorSnapshot.joinToString("\n").ifBlank { "No HTTP/network errors reported by WebView" }
-            )
-            ClipboardLogger.logAndCopy(
-                "Filtered WebView console",
-                consoleSnapshot.joinToString("\n").ifBlank { "No console warnings/errors captured" }
-            )
-
-            try {
-                webView.stopLoading()
-                webView.destroy()
-            } catch (_: Exception) {
-                // Best-effort WebView cleanup.
-            }
-            continuation.resume(result.toList())
-        }
-
-        timeoutTask = Runnable {
-            ClipboardLogger.logAndCopy(
-                "Rendered iframe inspection",
-                "Timed out after 26 seconds waiting for the rendered iframe/player URL"
-            )
-            finish()
-        }
-
-        pollTask = Runnable {
-            if (finished) return@Runnable
-            pollCount++
-
-            val javascript = """
-                (function() {
-                  try {
-                    var frames = Array.prototype.slice.call(
-                      document.querySelectorAll('iframe,frame')
-                    ).map(function(f) {
-                      var attrs = Array.prototype.slice.call(f.attributes || [])
-                        .map(function(a) { return {name:a.name, value:a.value}; });
-                      return {
-                        id: f.id || '',
-                        name: f.name || '',
-                        srcAttr: f.getAttribute('src') || '',
-                        src: f.src || '',
-                        srcdoc: (f.getAttribute('srcdoc') || '').slice(0,5000),
-                        attrs: attrs,
-                        outerHTML: (f.outerHTML || '').slice(0,3000)
-                      };
-                    });
-                    var media = Array.prototype.slice.call(
-                      document.querySelectorAll('video,source')
-                    ).map(function(v) {
-                      var video = v.tagName === 'VIDEO';
-                      return {
-                        tag: v.tagName,
-                        srcAttr: v.getAttribute('src') || '',
-                        src: v.src || '',
-                        currentSrc: video ? (v.currentSrc || '') : '',
-                        type: v.getAttribute('type') || '',
-                        paused: video ? v.paused : null,
-                        readyState: video ? v.readyState : null,
-                        networkState: video ? v.networkState : null,
-                        videoWidth: video ? v.videoWidth : null,
-                        videoHeight: video ? v.videoHeight : null,
-                        duration: video && isFinite(v.duration) ? v.duration : null,
-                        error: video && v.error ? {
-                          code: v.error.code,
-                          message: v.error.message || ''
-                        } : null
-                      };
-                    });
-                    var bodyText = (document.body && document.body.innerText || '').slice(0,1800);
-                    var challengeLike = /captcha|verify you are human|checking your browser|are you a robot|security challenge/i.test(bodyText);
-                    var resources = performance.getEntriesByType('resource')
-                      .map(function(e) { return e.name; })
-                      .filter(function(u) {
-                        return /\.m3u8(?:$|[?#])|\.mpd(?:$|[?#])|\.mp4(?:$|[?#])|\/embed\/player\/|\/player\//i.test(u);
-                      }).slice(-100);
-                    return JSON.stringify({
-                      page: location.href,
-                      readyState: document.readyState,
-                      frameCount: frames.length,
-                      frames: frames,
-                      media: media,
-                      resources: resources,
-                      title: document.title || '',
-                      bodyText: bodyText,
-                      challengeLike: challengeLike
-                    });
-                  } catch (e) {
-                    return JSON.stringify({error:String(e)});
-                  }
-                })();
-            """.trimIndent()
-
-            webView.evaluateJavascript(javascript) { rawResult ->
-                if (finished) return@evaluateJavascript
-
-                try {
-                    val decoded = JSONTokener(rawResult ?: "null").nextValue() as? String
-                    if (!decoded.isNullOrBlank() && decoded != lastSnapshot) {
-                        lastSnapshot = decoded
-                        val snapshot = JSONObject(decoded)
-                        val frameLines = mutableListOf<String>()
-                        val frames = snapshot.optJSONArray("frames")
-
-                        if (frames != null) {
-                            for (i in 0 until frames.length()) {
-                                val frame = frames.optJSONObject(i) ?: continue
-                                val attrs = frame.optJSONArray("attrs")
-                                val values = linkedSetOf<String>()
-                                values.add(frame.optString("srcAttr"))
-                                values.add(frame.optString("src"))
-
-                                if (attrs != null) {
-                                    for (j in 0 until attrs.length()) {
-                                        val attr = attrs.optJSONObject(j) ?: continue
-                                        val attrName = attr.optString("name").lowercase()
-                                        val attrValue = attr.optString("value")
-                                        when (attrName) {
-                                            "src", "data-src", "data-url", "data-embed",
-                                            "data-player", "data-file", "data-href", "href" -> {
-                                                values.add(attrValue)
-                                            }
-                                            "data-api" -> {
-                                                val apiUrl = resolveHttpUrl(pageUrl, attrValue)
-                                                if (apiUrl != null) {
-                                                    synchronized(exposedApiEndpoints) {
-                                                        exposedApiEndpoints.add(apiUrl)
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                for (value in values) {
-                                    val candidate = resolveHttpUrl(pageUrl, value) ?: continue
-                                    if (candidate != pageUrl) iframeUrls.add(candidate)
-                                }
-
-                                val srcdoc = frame.optString("srcdoc")
-                                if (srcdoc.isNotBlank()) {
-                                    val srcdocDoc = Jsoup.parse(srcdoc, pageUrl)
-                                    for (nested in srcdocDoc.select("iframe[src],frame[src]")) {
-                                        resolveHttpUrl(pageUrl, nested.attr("src"))
-                                            ?.let(iframeUrls::add)
-                                    }
-                                }
-
-                                frameLines.add(
-                                    "iframe[$i] id=${frame.optString("id")} " +
-                                        "name=${frame.optString("name")} " +
-                                        "srcAttr=${frame.optString("srcAttr")} " +
-                                        "src=${frame.optString("src")} " +
-                                        "srcdoc=${srcdoc.take(500)} " +
-                                        "outerHTML=${frame.optString("outerHTML").take(1800)}"
-                                )
-                            }
-                        }
-
-                        ClipboardLogger.logAndCopy(
-                            "Rendered iframe DOM poll $pollCount",
-                            "page=${snapshot.optString("page")}\n" +
-                                "readyState=${snapshot.optString("readyState")}\n" +
-                                "frameCount=${snapshot.optInt("frameCount")}\n" +
-                                frameLines.joinToString("\n\n").ifBlank { "No iframe nodes" }
-                        )
-
-                        val media = snapshot.optJSONArray("media")
-                        val mediaStateLines = mutableListOf<String>()
-                        if (media != null && media.length() > 0) {
-                            for (i in 0 until media.length()) {
-                                val item = media.optJSONObject(i) ?: continue
-                                val raw = item.optString("currentSrc")
-                                    .ifBlank { item.optString("srcAttr") }
-                                    .ifBlank { item.optString("src") }
-
-                                if (raw.startsWith("http://") || raw.startsWith("https://")) {
-                                    synchronized(exposedMediaUrls) {
-                                        if (exposedMediaUrls.size < 40) exposedMediaUrls.add(raw)
-                                    }
-                                }
-
-                                mediaStateLines.add(
-                                    "tag=${item.optString("tag")}; src=${item.optString("src").take(260)}; " +
-                                        "currentSrc=${item.optString("currentSrc").take(260)}; " +
-                                        "paused=${item.opt("paused")}; readyState=${item.opt("readyState")}; " +
-                                        "networkState=${item.opt("networkState")}; " +
-                                        "videoSize=${item.opt("videoWidth")}x${item.opt("videoHeight")}; " +
-                                        "duration=${item.opt("duration")}; error=${item.opt("error")}"
-                                )
-                            }
-                        }
-
-                        ClipboardLogger.logAndCopy(
-                            "Direct player state poll $pollCount",
-                            "title=${snapshot.optString("title")}; " +
-                                "challengeLike=${snapshot.optBoolean("challengeLike")}\n" +
-                                "body=${snapshot.optString("bodyText").take(900)}\n" +
-                                mediaStateLines.joinToString("\n").ifBlank {
-                                    "No video/source element visible in the top-level player document"
-                                }
-                        )
-
-                        val resources = snapshot.optJSONArray("resources")
-                        if (resources != null) {
-                            for (i in 0 until resources.length()) {
-                                val raw = resources.optString(i)
-                                val resolved = resolveHttpUrl(pageUrl, raw) ?: continue
-                                val lower = resolved.lowercase()
-                                if (Regex("\\.(m3u8|mpd|mp4)(?:$|[?#])")
-                                        .containsMatchIn(lower) ||
-                                    lower.contains("/embed/player/") ||
-                                    lower.contains("/player/")) {
-                                    synchronized(resourceUrls) {
-                                        resourceUrls.add(resolved)
-                                    }
-                                }
-                            }
-                        }
+    @Synchronized
+    fun ensureStarted(): Int {
+        if (port > 0 && serverSocket?.isClosed == false) return port
+        return runCatching {
+            val ss = ServerSocket(0, 32, InetAddress.getByName("127.0.0.1"))
+            serverSocket = ss
+            port = ss.localPort
+            Thread {
+                while (!ss.isClosed) {
+                    try {
+                        val client = ss.accept()
+                        Thread { handleClient(client) }.apply { isDaemon = true }.start()
+                    } catch (_: Exception) {
+                        if (ss.isClosed) break
                     }
-                } catch (e: Exception) {
-                    ClipboardLogger.logAndCopy(
-                        "Rendered iframe inspection error",
-                        e.stackTraceToString()
-                    )
                 }
+            }.apply { isDaemon = true }.start()
+            port
+        }.getOrDefault(-1)
+    }
 
-                // Poll repeatedly: the wrapper may assign iframe.src asynchronously
-                // after sbx.js finishes initializing the page.
-                if (pollCount < 20) {
-                    pollTask?.let { mainHandler.postDelayed(it, 650L) }
-                } else {
-                    finish()
-                }
+    fun register(
+        targetUrl: String,
+        origin: String,
+        tokenName: String,
+        tokenValue: String,
+        referer: String,
+        userAgent: String
+    ): String? {
+        val p = ensureStarted()
+        if (p <= 0) return null
+        val cacheKey = "$targetUrl|$tokenName=$tokenValue"
+        keyByParams[cacheKey]?.let { existingId ->
+            if (entries.containsKey(existingId)) {
+                return "http://127.0.0.1:$p/hn_pl/$existingId.m3u8"
             }
         }
+        if (entries.size > 400) {
+            entries.clear()
+            keyByParams.clear()
+        }
+        val id = seq.incrementAndGet().toString()
+        entries[id] = RouteEntry(
+            targetUrl = targetUrl,
+            origin = origin,
+            tokenName = tokenName,
+            tokenValue = tokenValue,
+            referer = referer,
+            userAgent = userAgent
+        )
+        keyByParams[cacheKey] = id
+        return "http://127.0.0.1:$p/hn_pl/$id.m3u8"
+    }
 
+    private fun handleClient(socket: Socket) {
         try {
-            webView.settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                javaScriptCanOpenWindowsAutomatically = false
-                setSupportMultipleWindows(false)
-                userAgentString = userAgent
-                // The player landing page explicitly advertises autoStart=true.
-                // This only honors its own autoplay setting; no synthetic clicks are sent.
-                mediaPlaybackRequiresUserGesture = false
-                allowFileAccess = false
-                mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            socket.soTimeout = 15_000
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+            val reqLine = reader.readLine() ?: return
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.isEmpty()) break
             }
 
-            CookieManager.getInstance().setAcceptCookie(true)
-            CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+            val parts = reqLine.split(" ")
+            val method = parts.getOrNull(0)?.uppercase() ?: "GET"
+            val path = parts.getOrNull(1) ?: ""
+            val id = Regex("""/hn_pl/(\d+)\.m3u8""").find(path)?.groupValues?.getOrNull(1)
+            val entry = id?.let { entries[it] }
 
-            webView.webChromeClient = object : WebChromeClient() {
-                override fun onConsoleMessage(message: android.webkit.ConsoleMessage?): Boolean {
-                    if (message != null) {
-                        val level = message.messageLevel().toString()
-                        if (level == "ERROR" || level == "WARNING") {
-                            val text = "$level: ${message.message()} " +
-                                "(${message.sourceId()}:${message.lineNumber()})"
-                            synchronized(consoleMessages) {
-                                if (consoleMessages.size < 60) consoleMessages.add(text)
-                            }
-                        }
-                    }
-                    return true
-                }
+            val out = socket.getOutputStream()
+            if (id == null || entry == null) {
+                out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                out.flush()
+                return
             }
 
-            webView.webViewClient = object : WebViewClient() {
-                override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
-                    super.onPageStarted(view, url, favicon)
-                    ClipboardLogger.logAndCopy(
-                        "Rendered WebView page started",
-                        url ?: "<null>"
-                    )
-                }
-
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    super.onPageFinished(view, url)
-                    if (!pageFinished) {
-                        pageFinished = true
-                        ClipboardLogger.logAndCopy(
-                            "Rendered WebView page finished",
-                            url ?: "<null>"
-                        )
-                        pollTask?.let { mainHandler.postDelayed(it, 800L) }
-                    }
-                }
-
-                override fun shouldInterceptRequest(
-                    view: WebView?,
-                    request: WebResourceRequest?
-                ): WebResourceResponse? {
-                    if (request != null) {
-                        val url = request.url.toString()
-                        val kind = if (request.isForMainFrame) "MAIN" else "SUB"
-                        recordRequest("$kind ${request.method}", url)
-
-                        if (!request.isForMainFrame) {
-                            synchronized(subframeRequests) {
-                                if (subframeRequests.size < 120) subframeRequests.add(url)
-                            }
-                        }
-                    }
-                    return null
-                }
-
-                override fun onLoadResource(view: WebView?, url: String?) {
-                    super.onLoadResource(view, url)
-                    if (!url.isNullOrBlank()) recordRequest("LOAD", url)
-                }
-
-                override fun onReceivedHttpError(
-                    view: WebView?,
-                    request: WebResourceRequest?,
-                    errorResponse: WebResourceResponse?
-                ) {
-                    super.onReceivedHttpError(view, request, errorResponse)
-                    if (request != null && errorResponse != null) {
-                        recordNetworkError(
-                            "HTTP ${errorResponse.statusCode} " +
-                                "${if (request.isForMainFrame) "MAIN" else "SUB"} ${request.url}"
-                        )
-                    }
-                }
-
-                override fun onReceivedError(
-                    view: WebView?,
-                    request: WebResourceRequest?,
-                    error: android.webkit.WebResourceError?
-                ) {
-                    super.onReceivedError(view, request, error)
-                    if (request != null && error != null) {
-                        recordNetworkError(
-                            "WebError ${error.errorCode}: ${error.description} " +
-                                "${if (request.isForMainFrame) "MAIN" else "SUB"} ${request.url}"
-                        )
-                    }
-                }
-
-                override fun onReceivedSslError(
-                    view: WebView?,
-                    handler: android.webkit.SslErrorHandler?,
-                    error: android.net.http.SslError?
-                ) {
-                    recordNetworkError("SSL error: ${error?.toString() ?: "unknown"}")
-                    handler?.cancel()
-                }
+            val fetched = fetchPlaylistBlocking(entry)
+            if (fetched == null) {
+                out.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                out.flush()
+                return
             }
 
+            val (effectiveUrl, rawBody) = fetched
+            val rewritten = rewriteM3u8(rawBody, effectiveUrl, entry)
+            val bytes = rewritten.toByteArray(Charsets.UTF_8)
 
-            timeoutTask?.let { mainHandler.postDelayed(it, 26_000L) }
-            ClipboardLogger.logAndCopy(
-                "Rendered iframe inspection",
-                "Loading HNEmbed wrapper and polling the rendered iframe DOM for up to 13 seconds: $pageUrl"
-            )
-            ClipboardLogger.logAndCopy(
-                "Direct player top-level navigation",
-                "url=$pageUrl; referer=$initialReferer; " +
-                    "standalone=${pageUrl.contains("/embed/player/")}"
-            )
-            webView.loadUrl(
-                pageUrl,
-                mapOf(
-                    "User-Agent" to userAgent,
-                    "Referer" to initialReferer
-                )
-            )
-        } catch (e: Exception) {
-            ClipboardLogger.logAndCopy(
-                "Rendered iframe inspection error",
-                e.stackTraceToString()
-            )
-            finish()
+            val header = "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n" +
+                "Content-Length: ${bytes.size}\r\n" +
+                "Access-Control-Allow-Origin: *\r\n" +
+                "Cache-Control: no-store\r\n" +
+                "Connection: close\r\n\r\n"
+            out.write(header.toByteArray(Charsets.US_ASCII))
+            if (method != "HEAD") {
+                out.write(bytes)
+            }
+            out.flush()
+        } catch (_: Exception) {
+        } finally {
+            try { socket.close() } catch (_: Exception) { }
         }
     }
+
+    private fun fetchPlaylistBlocking(entry: RouteEntry): Pair<String, String>? {
+        var current = entry.targetUrl
+        for (hop in 0..3) {
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(current).openConnection() as HttpURLConnection).apply {
+                    instanceFollowRedirects = false
+                    connectTimeout = 12_000
+                    readTimeout = 15_000
+                    requestMethod = "GET"
+                    setRequestProperty("User-Agent", entry.userAgent)
+                    setRequestProperty("Accept", "*/*")
+                    if (entry.referer.isNotBlank()) {
+                        setRequestProperty("Referer", entry.referer)
+                        val refOrig = originOfUrl(entry.referer)
+                        if (refOrig.isNotBlank()) setRequestProperty("Origin", refOrig)
+                    }
+                }
+                val code = conn.responseCode
+                if (code in 300..399) {
+                    val loc = conn.getHeaderField("Location")?.trim()
+                    if (!loc.isNullOrBlank()) {
+                        current = resolveHttpUrl(current, loc) ?: loc
+                        continue
+                    }
+                }
+                if (code in 200..299) {
+                    val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                    return current to body
+                }
+                return null
+            } catch (_: Exception) {
+                return null
+            } finally {
+                conn?.disconnect()
+            }
+        }
+        return null
+    }
+
+    private fun rewriteChildUrl(resolvedUrl: String, entry: RouteEntry, forcePlaylistRoute: Boolean): String {
+        val withTok = if (entry.tokenValue.isNotBlank() && originOfUrl(resolvedUrl) == entry.origin) {
+            appendTokenParam(resolvedUrl, entry.tokenName, entry.tokenValue)
+        } else {
+            resolvedUrl
+        }
+
+        val lower = resolvedUrl.lowercase()
+        val isSubPlaylist = forcePlaylistRoute ||
+            lower.contains(".m3u8") ||
+            HN_ANY_PL_REGEX.containsMatchIn(resolvedUrl)
+
+        return if (isSubPlaylist) {
+            register(
+                targetUrl = withTok,
+                origin = entry.origin,
+                tokenName = entry.tokenName,
+                tokenValue = entry.tokenValue,
+                referer = entry.referer,
+                userAgent = entry.userAgent
+            ) ?: withTok
+        } else {
+            withTok
+        }
+    }
+
+    private fun rewriteM3u8(body: String, baseUrl: String, entry: RouteEntry): String {
+        val out = StringBuilder(body.length + 512)
+        val uriAttrRegex = Regex("URI=\"([^\"]+)\"")
+        var nextIsStreamVariant = false
+
+        val lines = body.replace("\r\n", "\n").split('\n')
+        for ((idx, rawLine) in lines.withIndex()) {
+            val line = rawLine.trim()
+            if (line.isEmpty()) {
+                if (idx < lines.lastIndex) out.append('\n')
+                continue
+            }
+
+            if (line.startsWith("#")) {
+                val rewrittenTag = if (line.contains("URI=\"")) {
+                    val isPlaylistTag = line.startsWith("#EXT-X-MEDIA", ignoreCase = true) ||
+                        line.startsWith("#EXT-X-I-FRAME-STREAM-INF", ignoreCase = true)
+                    uriAttrRegex.replace(line) { m ->
+                        val resolved = resolveHttpUrl(baseUrl, m.groupValues[1])
+                        if (resolved != null) {
+                            "URI=\"${rewriteChildUrl(resolved, entry, isPlaylistTag)}\""
+                        } else {
+                            m.value
+                        }
+                    }
+                } else {
+                    line
+                }
+                out.append(rewrittenTag)
+                nextIsStreamVariant = line.startsWith("#EXT-X-STREAM-INF", ignoreCase = true)
+            } else {
+                val resolved = resolveHttpUrl(baseUrl, line)
+                if (resolved != null) {
+                    out.append(rewriteChildUrl(resolved, entry, nextIsStreamVariant))
+                } else {
+                    out.append(line)
+                }
+                nextIsStreamVariant = false
+            }
+
+            if (idx < lines.lastIndex) out.append('\n')
+        }
+        return out.toString()
     }
 }
 
@@ -671,6 +410,7 @@ class HnembedProvider : MainAPI() {
     override var name = "Hnembed"
     override var lang = "en"
     override val hasMainPage = true
+    override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries)
 
     override val mainPage = mainPageOf(
@@ -687,7 +427,30 @@ class HnembedProvider : MainAPI() {
 
     private val userAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+
+    private val imdbCache = ConcurrentHashMap<Int, String>()
+
+    private val blockedWebViewDomains = listOf(
+        "disable-devtool",
+        "acscdn.com",
+        "rapidadexchange.com",
+        "usrpubtrck.com",
+        "histats.com",
+        "static.cloudflareinsights.com",
+        "googletagmanager.com",
+        "google-analytics.com",
+        "doubleclick.net",
+        "googlesyndication.com",
+        "googleadservices.com",
+        "popads.net",
+        "onclickads.net",
+        "propellerads.com",
+        "popcash.net",
+        "adsterra.com",
+        "adcash.com",
+        "rtmark.net"
+    )
 
     private fun imageUrl(path: String?, size: String = "w500"): String? {
         if (path.isNullOrBlank() || path == "null") return null
@@ -702,7 +465,8 @@ class HnembedProvider : MainAPI() {
             try {
                 val response = app.get(
                     "$host$path${separator}api_key=$TMDB_API_KEY",
-                    headers = mapOf("User-Agent" to userAgent)
+                    headers = mapOf("User-Agent" to userAgent),
+                    timeout = 10L
                 )
 
                 if (response.code == 200) {
@@ -712,7 +476,7 @@ class HnembedProvider : MainAPI() {
 
                 lastError = IllegalStateException("TMDB HTTP ${response.code}: $host")
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                rethrowIfCancellation(e)
                 lastError = e
             }
         }
@@ -738,8 +502,6 @@ class HnembedProvider : MainAPI() {
 
         if (title.isBlank()) return null
 
-        // Do not pass hnembed:movie:id as a SearchResponse URL. CloudStream may
-        // treat it as a relative URL and prepend mainUrl to it.
         return newMovieSearchResponse(
             title,
             hnDetailUrl(type, id),
@@ -776,7 +538,7 @@ class HnembedProvider : MainAPI() {
                 hasNext = page < json.optInt("total_pages", 1)
             )
         } catch (e: Exception) {
-            if (e is CancellationException) throw e
+            rethrowIfCancellation(e)
             ClipboardLogger.logAndCopy("getMainPage", e.stackTraceToString())
             newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
@@ -796,7 +558,7 @@ class HnembedProvider : MainAPI() {
 
             output.distinctBy { it.url }
         } catch (e: Exception) {
-            if (e is CancellationException) throw e
+            rethrowIfCancellation(e)
             ClipboardLogger.logAndCopy("search", e.stackTraceToString())
             emptyList()
         }
@@ -809,9 +571,16 @@ class HnembedProvider : MainAPI() {
         }
 
         return try {
-            val json = tmdbGet("/${ref.type}/${ref.id}")
+            val json = tmdbGet("/${ref.type}/${ref.id}?append_to_response=external_ids")
             if (json.has("status_code")) {
                 throw IllegalStateException(json.optString("status_message"))
+            }
+
+            val imdbId = json.optString("imdb_id", "").ifBlank {
+                json.optJSONObject("external_ids")?.optString("imdb_id", "") ?: ""
+            }
+            if (imdbId.startsWith("tt")) {
+                imdbCache[ref.id] = imdbId
             }
 
             val title = if (ref.type == "movie") {
@@ -872,7 +641,7 @@ class HnembedProvider : MainAPI() {
                             )
                         }
                     } catch (e: Exception) {
-                        if (e is CancellationException) throw e
+                        rethrowIfCancellation(e)
                         ClipboardLogger.logAndCopy(
                             "Season $seasonNumber",
                             e.message ?: "Unable to load season"
@@ -892,577 +661,962 @@ class HnembedProvider : MainAPI() {
                 }
             }
         } catch (e: Exception) {
-            if (e is CancellationException) throw e
+            rethrowIfCancellation(e)
             ClipboardLogger.logAndCopy("load detail", e.stackTraceToString())
             null
         }
     }
 
-    /**
-     * Extract only URLs exposed in the public embed markup and delegate player
-     * hosts to CloudStream's registered extractors. This method does not try to
-     * reverse proprietary player tokens or protected media delivery.
-     */
+    // =========================================================================
+    // Subtitles (OpenSubtitles matching HNEmbed subtitles.js + Stremio fallback)
+    // =========================================================================
+
+    private fun appendSubExtFragment(url: String, formatHint: String = "srt"): String {
+        val lower = url.lowercase()
+        if (lower.contains(".srt") || lower.contains(".vtt") || lower.contains(".ass")) {
+            return url
+        }
+        val cleanExt = if (formatHint.equals("vtt", ignoreCase = true) || formatHint.equals("webvtt", ignoreCase = true)) {
+            "vtt"
+        } else {
+            "srt"
+        }
+        return "$url#file.$cleanExt"
+    }
+
+    private suspend fun loadOpenSubtitles(
+        ref: HnMediaRef,
+        imdbId: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        seenSubs: HashSet<String>
+    ): Int {
+        if (imdbId.isBlank()) return 0
+        var added = 0
+        val cleanId = imdbId.removePrefix("tt").trimStart('0').ifEmpty { imdbId.removePrefix("tt") }
+        val osHeaders = mapOf(
+            "User-Agent" to "trailers.to-UA",
+            "X-User-Agent" to "trailers.to-UA"
+        )
+
+        val candidates = mutableListOf<Triple<String, String, String>>() // langLabel, release, url
+
+        // 1. OpenSubtitles REST API
+        for ((langCode, langLabel) in listOf("vie" to "Vietnamese", "eng" to "English")) {
+            runCatching {
+                val url = if (ref.type == "tv" && ref.season != null && ref.episode != null) {
+                    "https://rest.opensubtitles.org/search/episode-${ref.episode}/imdbid-$cleanId/season-${ref.season}/sublanguageid-$langCode"
+                } else {
+                    "https://rest.opensubtitles.org/search/imdbid-$cleanId/sublanguageid-$langCode"
+                }
+                val res = app.get(url, headers = osHeaders, timeout = 8L).text.trim()
+                if (!res.startsWith("[")) return@runCatching
+                val arr = JSONArray(res)
+                val items = (0 until arr.length()).mapNotNull { arr.optJSONObject(it) }
+                    .sortedBy { obj ->
+                        when (obj.optString("SubFormat", "").lowercase()) {
+                            "srt", "vtt" -> 0
+                            else -> 1
+                        }
+                    }
+                for (item in items.take(5)) {
+                    val rawLink = item.optString("SubDownloadLink", "").trim()
+                    if (!rawLink.startsWith("http")) continue
+                    val direct = rawLink
+                        .replace("/filead/", "/subencoding-utf8/filead/")
+                        .replace("/file/", "/subencoding-utf8/file/")
+                        .removeSuffix(".gz")
+                    val fmt = item.optString("SubFormat", "srt")
+                    val rel = item.optString("MovieReleaseName", "").trim().take(28)
+                    val lName = item.optString("LanguageName", langLabel).trim()
+                    candidates.add(Triple(lName, rel, appendSubExtFragment(direct, fmt)))
+                }
+            }.onFailure { rethrowIfCancellation(it) }
+        }
+
+        // 2. OpenSubtitles Stremio V3 fallback
+        runCatching {
+            val stremioUrl = if (ref.type == "tv" && ref.season != null && ref.episode != null) {
+                "https://opensubtitles-v3.strem.io/subtitles/series/$imdbId:${ref.season}:${ref.episode}.json"
+            } else {
+                "https://opensubtitles-v3.strem.io/subtitles/movie/$imdbId.json"
+            }
+            val body = app.get(stremioUrl, headers = mapOf("User-Agent" to userAgent), timeout = 8L).text.trim()
+            if (!body.startsWith("{")) return@runCatching
+            val arr = JSONObject(body).optJSONArray("subtitles") ?: return@runCatching
+            var viCount = 0
+            var enCount = 0
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val subUrl = o.optString("url", "").trim()
+                if (!subUrl.startsWith("http")) continue
+                val l = o.optString("lang", "").lowercase()
+                val rel = o.optString("releaseGroup", "").trim().take(28)
+                when {
+                    (l == "vie" || l == "vi") && viCount < 4 -> {
+                        candidates.add(Triple("Vietnamese", rel, appendSubExtFragment(subUrl, "srt")))
+                        viCount++
+                    }
+                    (l == "eng" || l == "en") && enCount < 4 -> {
+                        candidates.add(Triple("English", rel, appendSubExtFragment(subUrl, "srt")))
+                        enCount++
+                    }
+                }
+            }
+        }.onFailure { rethrowIfCancellation(it) }
+
+        for ((langLbl, rel, url) in candidates) {
+            if (!seenSubs.add(url)) continue
+            val label = if (rel.isNotBlank()) "$langLbl (OpenSubtitles: $rel)" else "$langLbl (OpenSubtitles)"
+            subtitleCallback.invoke(SubtitleFile(label, url))
+            added++
+        }
+        return added
+    }
+
+    // =========================================================================
+    // Attached Off-Screen WebView Sniffer for HNEmbed Player
+    // =========================================================================
+
+    private data class HnSniffResult(
+        val capturedStreams: List<String>,
+        val apiStreamUrls: List<String>,
+        val apiToken: String,
+        val capturedSubs: List<String>,
+        val observedRequests: List<String>,
+        val networkErrors: List<String>
+    )
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private suspend fun sniffHnembedPlayer(
+        playerPageUrl: String,
+        initialReferer: String,
+        timeoutMs: Long = 40_000L
+    ): HnSniffResult {
+        return suspendCoroutine { continuation ->
+            val activity = try {
+                CommonActivity.activity
+            } catch (_: Throwable) {
+                null
+            }
+            val appCtx = activity?.applicationContext ?: activity ?: runCatching {
+                val at = Class.forName("android.app.ActivityThread")
+                at.getMethod("currentApplication").invoke(null) as? Context
+            }.getOrNull()
+
+            if (appCtx == null) {
+                ClipboardLogger.logAndCopy("WebView Sniff", "Skipped: Context is null")
+                continuation.resume(
+                    HnSniffResult(emptyList(), emptyList(), "", emptyList(), emptyList(), emptyList())
+                )
+                return@suspendCoroutine
+            }
+
+            val mainHandler = Handler(Looper.getMainLooper())
+            mainHandler.post {
+                val webView = try {
+                    WebView(appCtx)
+                } catch (e: Exception) {
+                    ClipboardLogger.logAndCopy("WebView Sniff", "Creation failed: ${e.message}")
+                    continuation.resume(
+                        HnSniffResult(emptyList(), emptyList(), "", emptyList(), emptyList(), emptyList())
+                    )
+                    return@post
+                }
+
+                var finished = false
+                var graceScheduled = false
+                val w = 1080
+                val h = 1920
+
+                val capturedStreams = linkedSetOf<String>()
+                val capturedSubs = linkedSetOf<String>()
+                val observedRequests = linkedSetOf<String>()
+                val networkErrors = linkedSetOf<String>()
+
+                val directStreamRegex = Regex(
+                    """(?i)(/pl[ci]?/[A-Za-z0-9_-]{30,}(?:/master\.m3u8)?(?:\?|$)|\.m3u8(?:$|[?#])|\.mpd(?:$|[?#])|\.mp4(?:$|[?#])|\.mkv(?:$|[?#])|\.webm(?:$|[?#])|master\.txt|playManifest)"""
+                )
+                val assetIgnoreRegex = Regex(
+                    """(?i)(\.(?:css|js|png|jpe?g|gif|svg|ico|woff2?|ttf|wasm|ts|m4s)(?:$|[?#])|/generate\.php|/api\.php|/verify\.php|/cdn-cgi/)"""
+                )
+                val subRegex = Regex("""(?i)\.(?:vtt|srt)(?:$|[?#])""")
+
+                var timeoutTask: Runnable? = null
+                var graceTask: Runnable? = null
+                var pollTask: Runnable? = null
+
+                fun readHookState(onReady: (List<String>, String, List<String>) -> Unit) {
+                    val js = """
+                        (function(){
+                            try{
+                                var d = window.__hnCapture || {};
+                                var cfg = window.CONFIG || {};
+                                var v = document.querySelector('video');
+                                var srcs = [];
+                                if (v) {
+                                    if (v.src && /^https?:/i.test(v.src)) srcs.push(v.src);
+                                    if (v.currentSrc && /^https?:/i.test(v.currentSrc)) srcs.push(v.currentSrc);
+                                    Array.prototype.slice.call(v.querySelectorAll('source')).forEach(function(s){
+                                        if (s.src && /^https?:/i.test(s.src)) srcs.push(s.src);
+                                    });
+                                }
+                                return JSON.stringify({
+                                    streams: d.streams || [],
+                                    token: (cfg.apiToken || d.token || ''),
+                                    domSrcs: srcs
+                                });
+                            }catch(e){
+                                return '{"streams":[],"token":"","domSrcs":[]}';
+                            }
+                        })();
+                    """.trimIndent()
+                    try {
+                        webView.evaluateJavascript(js) { raw ->
+                            val decoded = runCatching {
+                                val str = org.json.JSONTokener(raw ?: "\"{}\"").nextValue() as? String ?: "{}"
+                                JSONObject(str)
+                            }.getOrNull()
+                            val streams = mutableListOf<String>()
+                            val domSrcs = mutableListOf<String>()
+                            var tok = ""
+                            if (decoded != null) {
+                                tok = decoded.optString("token", "").trim()
+                                val arr = decoded.optJSONArray("streams")
+                                if (arr != null) {
+                                    for (i in 0 until arr.length()) {
+                                        arr.optString(i, "").trim().takeIf { it.startsWith("http") }?.let(streams::add)
+                                    }
+                                }
+                                val dArr = decoded.optJSONArray("domSrcs")
+                                if (dArr != null) {
+                                    for (i in 0 until dArr.length()) {
+                                        dArr.optString(i, "").trim().takeIf { it.startsWith("http") }?.let(domSrcs::add)
+                                    }
+                                }
+                            }
+                            onReady(streams, tok, domSrcs)
+                        }
+                    } catch (_: Exception) {
+                        onReady(emptyList(), "", emptyList())
+                    }
+                }
+
+                fun completeWithState(apiStreams: List<String>, apiToken: String, domSrcs: List<String>) {
+                    if (finished) return
+                    finished = true
+                    timeoutTask?.let(mainHandler::removeCallbacks)
+                    graceTask?.let(mainHandler::removeCallbacks)
+                    pollTask?.let(mainHandler::removeCallbacks)
+
+                    val streamList = synchronized(capturedStreams) {
+                        val combined = linkedSetOf<String>()
+                        combined.addAll(capturedStreams)
+                        combined.addAll(domSrcs)
+                        combined.toList()
+                    }
+                    val subList = synchronized(capturedSubs) { capturedSubs.toList() }
+                    val reqList = synchronized(observedRequests) { observedRequests.toList() }
+                    val errList = synchronized(networkErrors) { networkErrors.toList() }
+
+                    try {
+                        webView.stopLoading()
+                        (webView.parent as? ViewGroup)?.removeView(webView)
+                        webView.destroy()
+                    } catch (_: Exception) { }
+
+                    continuation.resume(
+                        HnSniffResult(
+                            capturedStreams = streamList,
+                            apiStreamUrls = apiStreams,
+                            apiToken = apiToken,
+                            capturedSubs = subList,
+                            observedRequests = reqList,
+                            networkErrors = errList
+                        )
+                    )
+                }
+
+                fun finishSoon() {
+                    if (finished) return
+                    readHookState { apiStreams, apiToken, domSrcs ->
+                        completeWithState(apiStreams, apiToken, domSrcs)
+                    }
+                }
+
+                fun scheduleGraceFinish(delayMs: Long = 1600L) {
+                    if (finished || graceScheduled) return
+                    graceScheduled = true
+                    graceTask = Runnable { finishSoon() }
+                    mainHandler.postDelayed(graceTask!!, delayMs)
+                }
+
+                val hookScript = """
+                    (function(){
+                        try { window.open = function(){ return {closed:false,focus:function(){},close:function(){},blur:function(){}}; }; } catch(e) {}
+                        if (!window.__hnCapture) {
+                            window.__hnCapture = { streams: [], token: '' };
+                        }
+                        if (!window.__hnHooked && typeof window.vsFetchJSON === 'function') {
+                            window.__hnHooked = true;
+                            var orig = window.vsFetchJSON;
+                            window.vsFetchJSON = function(url, opts) {
+                                return orig.apply(this, arguments).then(function(res){
+                                    try {
+                                        if (res && res.data && Array.isArray(res.data.stream_urls)) {
+                                            res.data.stream_urls.forEach(function(u){
+                                                if (typeof u === 'string' && /^https?:/i.test(u) && window.__hnCapture.streams.indexOf(u) === -1) {
+                                                    window.__hnCapture.streams.push(u);
+                                                }
+                                            });
+                                        }
+                                        if (window.CONFIG && window.CONFIG.apiToken) {
+                                            window.__hnCapture.token = window.CONFIG.apiToken;
+                                        }
+                                    } catch(e) {}
+                                    return res;
+                                });
+                            };
+                        }
+                    })();
+                """.trimIndent()
+
+                pollTask = object : Runnable {
+                    override fun run() {
+                        if (finished) return
+                        try {
+                            webView.evaluateJavascript(hookScript, null)
+                        } catch (_: Exception) { }
+                        readHookState { apiStreams, _, domSrcs ->
+                            if (!finished) {
+                                val hasAny = synchronized(capturedStreams) { capturedStreams.isNotEmpty() } ||
+                                    apiStreams.isNotEmpty() || domSrcs.isNotEmpty()
+                                if (hasAny) {
+                                    scheduleGraceFinish(1800L)
+                                } else {
+                                    mainHandler.postDelayed(this, 800L)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                timeoutTask = Runnable { finishSoon() }
+
+                try {
+                    CookieManager.getInstance().setAcceptCookie(true)
+                    CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+
+                    webView.settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        databaseEnabled = true
+                        mediaPlaybackRequiresUserGesture = false
+                        javaScriptCanOpenWindowsAutomatically = false
+                        setSupportMultipleWindows(false)
+                        userAgentString = userAgent
+                        mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    }
+
+                    webView.webChromeClient = object : WebChromeClient() {
+                        override fun onCreateWindow(
+                            view: WebView?,
+                            isDialog: Boolean,
+                            isUserGesture: Boolean,
+                            resultMsg: android.os.Message?
+                        ): Boolean = false
+
+                        override fun onConsoleMessage(cm: ConsoleMessage?): Boolean = true
+                    }
+
+                    webView.webViewClient = object : WebViewClient() {
+                        override fun shouldInterceptRequest(
+                            view: WebView?,
+                            request: WebResourceRequest?
+                        ): WebResourceResponse? {
+                            val u = request?.url?.toString() ?: return null
+                            if (!u.startsWith("http://") && !u.startsWith("https://")) return null
+
+                            if (blockedWebViewDomains.any { u.contains(it, ignoreCase = true) }) {
+                                return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                            }
+
+                            val isMedia = !assetIgnoreRegex.containsMatchIn(u) && directStreamRegex.containsMatchIn(u)
+                            if (isMedia || !u.endsWith(".ts", ignoreCase = true)) {
+                                synchronized(observedRequests) {
+                                    if (observedRequests.size < 100) {
+                                        observedRequests.add("${request?.method ?: "GET"} ${u.take(200)}")
+                                    }
+                                }
+                            }
+
+                            if (subRegex.containsMatchIn(u) &&
+                                !u.contains("thumbnails.vtt", ignoreCase = true) &&
+                                !u.contains("/thumbs", ignoreCase = true)
+                            ) {
+                                synchronized(capturedSubs) {
+                                    if (capturedSubs.size < 20) capturedSubs.add(u)
+                                }
+                            }
+
+                            if (isMedia) {
+                                synchronized(capturedStreams) {
+                                    if (capturedStreams.size < 20) capturedStreams.add(u)
+                                }
+                                mainHandler.post { scheduleGraceFinish(1600L) }
+                            }
+                            return null
+                        }
+
+                        override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                            super.onPageStarted(view, url, favicon)
+                            try {
+                                webView.evaluateJavascript(hookScript, null)
+                            } catch (_: Exception) { }
+                        }
+
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            super.onPageFinished(view, url)
+                            try {
+                                webView.evaluateJavascript(hookScript, null)
+                            } catch (_: Exception) { }
+                            pollTask?.let { mainHandler.postDelayed(it, 600L) }
+                        }
+
+                        override fun onReceivedHttpError(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                            errorResponse: WebResourceResponse?
+                        ) {
+                            if (request != null && errorResponse != null) {
+                                synchronized(networkErrors) {
+                                    if (networkErrors.size < 40) {
+                                        networkErrors.add("HTTP ${errorResponse.statusCode} ${request.url.toString().take(180)}")
+                                    }
+                                }
+                            }
+                        }
+
+                        override fun onReceivedError(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                            error: WebResourceError?
+                        ) {
+                            if (request != null && error != null) {
+                                synchronized(networkErrors) {
+                                    if (networkErrors.size < 40) {
+                                        networkErrors.add("Err ${error.errorCode}: ${error.description} ${request.url.toString().take(150)}")
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Attach off-screen with real 1080x1920 dimensions so Turnstile & player.js run normally
+                    webView.measure(
+                        View.MeasureSpec.makeMeasureSpec(w, View.MeasureSpec.EXACTLY),
+                        View.MeasureSpec.makeMeasureSpec(h, View.MeasureSpec.EXACTLY)
+                    )
+                    webView.layout(0, 0, w, h)
+                    webView.translationX = -4000f
+                    try {
+                        activity?.addContentView(webView, ViewGroup.LayoutParams(w, h))
+                    } catch (_: Exception) { }
+
+                    timeoutTask?.let { mainHandler.postDelayed(it, timeoutMs) }
+                    webView.loadUrl(
+                        playerPageUrl,
+                        mapOf(
+                            "User-Agent" to userAgent,
+                            "Referer" to initialReferer
+                        )
+                    )
+                } catch (e: Exception) {
+                    ClipboardLogger.logAndCopy("WebView Err", e.stackTraceToString().take(600))
+                    try {
+                        (webView.parent as? ViewGroup)?.removeView(webView)
+                        webView.destroy()
+                    } catch (_: Exception) { }
+                    continuation.resume(
+                        HnSniffResult(emptyList(), emptyList(), "", emptyList(), emptyList(), emptyList())
+                    )
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // Stream Token Generation, /pli/ Conversion & ExoPlayer Verification
+    // =========================================================================
+
+    private fun parseTokenResponse(rawText: String): String {
+        val t = rawText.trim()
+        if (t.isBlank()) return ""
+        if (t.startsWith("{") || t.startsWith("[")) {
+            val parsed = runCatching {
+                if (t.startsWith("{")) {
+                    val j = JSONObject(t)
+                    j.optString("token")
+                        .ifBlank { j.optString("data") }
+                        .ifBlank { j.optString("string") }
+                        .ifBlank { j.optString("result") }
+                } else {
+                    ""
+                }
+            }.getOrNull()
+            if (!parsed.isNullOrBlank()) return parsed.trim()
+        }
+        return if (t.startsWith("<") || t.contains("error", ignoreCase = true) && t.length > 180) "" else t
+    }
+
+    private suspend fun fetchHostToken(
+        origin: String,
+        apiToken: String,
+        playerReferer: String,
+        tokenCache: MutableMap<String, String>
+    ): String {
+        if (origin.isBlank()) return ""
+        tokenCache[origin]?.let { return it }
+
+        val genUrl = if (apiToken.isNotBlank()) {
+            "$origin/generate.php?api_token=${URLEncoder.encode(apiToken, "UTF-8")}"
+        } else {
+            "$origin/generate.php"
+        }
+
+        val resp = runCatching {
+            app.get(
+                genUrl,
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Referer" to playerReferer,
+                    "Origin" to originOfUrl(playerReferer),
+                    "Accept" to "*/*"
+                ),
+                timeout = 8L
+            )
+        }.onFailure { rethrowIfCancellation(it) }.getOrNull() ?: return ""
+
+        if (resp.code !in 200..299) return ""
+        val tk = parseTokenResponse(resp.text)
+        if (tk.isNotBlank()) {
+            tokenCache[origin] = tk
+        }
+        return tk
+    }
+
+    private suspend fun probeAndEmitHnStream(
+        rawUrl: String,
+        serverIndex: Int,
+        playerPage: String,
+        emittedUrls: HashSet<String>,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val playerOrigin = originOfUrl(playerPage)
+        val reqHeaders = mutableMapOf(
+            "User-Agent" to userAgent,
+            "Accept" to "*/*",
+            "Referer" to playerPage
+        )
+        if (playerOrigin.isNotBlank()) {
+            reqHeaders["Origin"] = playerOrigin
+        }
+
+        val isMp4 = Regex("""\.(mp4|mkv|webm)(?:$|[?#])""", RegexOption.IGNORE_CASE).containsMatchIn(rawUrl)
+        if (isMp4) {
+            val probeResp = runCatching {
+                app.get(rawUrl, headers = reqHeaders + ("Range" to "bytes=0-1023"), timeout = 10L)
+            }.onFailure { rethrowIfCancellation(it) }.getOrNull()
+
+            if (probeResp != null && probeResp.code in 200..299) {
+                val head = probeResp.text.take(200).trimStart()
+                if (!head.startsWith("<!doctype", ignoreCase = true) && !head.startsWith("<html", ignoreCase = true)) {
+                    if (emittedUrls.add(rawUrl)) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = name,
+                                name = "Hnembed • Server $serverIndex (MP4)",
+                                url = rawUrl,
+                                type = ExtractorLinkType.VIDEO
+                            ) {
+                                this.referer = playerPage
+                                this.quality = Qualities.P1080.value
+                                this.headers = reqHeaders
+                            }
+                        )
+                        ClipboardLogger.logAndCopy("Live (Server $serverIndex)", "MP4 HTTP ${probeResp.code} -> ${rawUrl.take(150)}")
+                        return true
+                    }
+                }
+            }
+            return false
+        }
+
+        // 1. If HNEmbed /pl/<P>, prefer HNEmbed's native /pli/<P> (all child variant & segment URLs include token)
+        val plMatch = HN_STATIC_PL_REGEX.find(rawUrl)
+        if (plMatch != null && !rawUrl.contains("/pli/", ignoreCase = true) && !rawUrl.contains("/plc/", ignoreCase = true)) {
+            val pliUrl = rawUrl.replaceFirst("/pl/", "/pli/", ignoreCase = true)
+            val pliResp = runCatching {
+                app.get(pliUrl, headers = reqHeaders, timeout = 10L)
+            }.onFailure { rethrowIfCancellation(it) }.getOrNull()
+
+            if (pliResp != null && pliResp.code in 200..299 && pliResp.text.contains("#EXTM3U")) {
+                val childHasToken = pliResp.text.contains("token=") || pliResp.text.contains("cast_token=")
+                if (childHasToken) {
+                    val outUrl = if (pliUrl.contains(".m3u8", ignoreCase = true)) pliUrl else "$pliUrl#file.m3u8"
+                    if (emittedUrls.add(outUrl)) {
+                        callback.invoke(
+                            newExtractorLink(
+                                source = name,
+                                name = "Hnembed • Server $serverIndex (HLS)",
+                                url = outUrl,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = playerPage
+                                this.quality = Qualities.P1080.value
+                                this.headers = reqHeaders
+                            }
+                        )
+                        ClipboardLogger.logAndCopy("Live (Server $serverIndex /pli/)", "HLS HTTP ${pliResp.code} -> ${outUrl.take(150)}")
+                        return true
+                    }
+                }
+            }
+        }
+
+        // 2. Fetch raw playlist (direct .m3u8 / /pli/ / /pl/)
+        val resp = runCatching {
+            app.get(rawUrl, headers = reqHeaders, timeout = 10L)
+        }.onFailure { rethrowIfCancellation(it) }.getOrNull() ?: run {
+            ClipboardLogger.logAndCopy("Dead (Server $serverIndex)", "Request failed -> ${rawUrl.take(150)}")
+            return false
+        }
+
+        if (resp.code !in 200..299) {
+            ClipboardLogger.logAndCopy("Dead (Server $serverIndex)", "HTTP ${resp.code} -> ${rawUrl.take(150)}")
+            return false
+        }
+
+        val body = resp.text
+        if (body.contains("<MPD", ignoreCase = true) || rawUrl.contains(".mpd", ignoreCase = true)) {
+            val outUrl = if (rawUrl.contains(".mpd", ignoreCase = true)) rawUrl else "$rawUrl#file.mpd"
+            if (emittedUrls.add(outUrl)) {
+                callback.invoke(
+                    newExtractorLink(
+                        source = name,
+                        name = "Hnembed • Server $serverIndex (DASH)",
+                        url = outUrl,
+                        type = ExtractorLinkType.DASH
+                    ) {
+                        this.referer = playerPage
+                        this.quality = Qualities.P1080.value
+                        this.headers = reqHeaders
+                    }
+                )
+                ClipboardLogger.logAndCopy("Live (Server $serverIndex)", "DASH HTTP ${resp.code} -> ${outUrl.take(150)}")
+                return true
+            }
+            return false
+        }
+
+        if (!body.contains("#EXTM3U")) {
+            ClipboardLogger.logAndCopy("Dead (Server $serverIndex)", "Non-M3U8 HTTP ${resp.code} -> ${rawUrl.take(150)}")
+            return false
+        }
+
+        // Check whether child playlist / segment lines already carry token= or need loopback token stamping
+        val tok = extractQueryParam(rawUrl, "token")
+        val castTok = extractQueryParam(rawUrl, "cast_token")
+        val tokenName = if (!castTok.isNullOrBlank()) "cast_token" else "token"
+        val tokenValue = castTok?.takeIf { it.isNotBlank() } ?: tok.orEmpty()
+        val needsTokenStamp = tokenValue.isNotBlank() &&
+            !body.contains("token=") &&
+            !body.contains("cast_token=")
+
+        val playableUrl = if (needsTokenStamp) {
+            HnHlsTokenLoopbackProxy.register(
+                targetUrl = rawUrl,
+                origin = originOfUrl(rawUrl),
+                tokenName = tokenName,
+                tokenValue = tokenValue,
+                referer = playerPage,
+                userAgent = userAgent
+            ) ?: rawUrl
+        } else {
+            if (rawUrl.contains(".m3u8", ignoreCase = true)) rawUrl else "$rawUrl#file.m3u8"
+        }
+
+        if (emittedUrls.add(playableUrl)) {
+            val effectiveHeaders = if (playableUrl.startsWith("http://127.0.0.1")) {
+                mapOf("User-Agent" to userAgent)
+            } else {
+                reqHeaders
+            }
+            callback.invoke(
+                newExtractorLink(
+                    source = name,
+                    name = "Hnembed • Server $serverIndex (HLS)",
+                    url = playableUrl,
+                    type = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = playerPage
+                    this.quality = Qualities.P1080.value
+                    this.headers = effectiveHeaders
+                }
+            )
+            val modeTag = if (needsTokenStamp) "HLS-Proxy" else "HLS"
+            ClipboardLogger.logAndCopy("Live (Server $serverIndex)", "$modeTag HTTP ${resp.code} -> ${playableUrl.take(150)}")
+            return true
+        }
+        return false
+    }
+
+    // =========================================================================
+    // loadLinks (Strict HNEmbed-only, no external backup providers)
+    // =========================================================================
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        val startMs = SystemClock.elapsedRealtime()
         ClipboardLogger.clear()
-        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-RETURN-FIX-2026-11-24-V15")
-        ClipboardLogger.logAndCopy(
-            "loadLinks START",
-            "data=$data; provider=$name; casting=$isCasting"
-        )
+        ClipboardLogger.logAndCopy("Start", "Hnembed loadLinks: $data (casting=$isCasting)")
 
         val ref = parseHnRef(data) ?: run {
-            ClipboardLogger.logAndCopy("loadLinks", "Invalid data: $data")
+            ClipboardLogger.logAndCopy("Error", "Dữ liệu không hợp lệ: $data")
             return false
         }
 
         if (ref.type == "tv" && (ref.season == null || ref.episode == null)) {
-            ClipboardLogger.logAndCopy(
-                "loadLinks",
-                "TV playback requires season and episode: $data"
-            )
+            ClipboardLogger.logAndCopy("Error", "TV series cần season và episode: $data")
             return false
         }
 
-        // hnembed.net failed DNS resolution in the user's test; use the working .cc host.
-        val mirrors = listOf("https://hnembed.cc")
-        val headers = mapOf(
-            "User-Agent" to userAgent,
-            "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        )
+        var imdbId = imdbCache[ref.id] ?: ""
+        if (imdbId.isBlank()) {
+            runCatching {
+                val json = tmdbGet("/${ref.type}/${ref.id}?append_to_response=external_ids")
+                imdbId = json.optString("imdb_id", "").ifBlank {
+                    json.optJSONObject("external_ids")?.optString("imdb_id", "") ?: ""
+                }
+                if (imdbId.startsWith("tt")) {
+                    imdbCache[ref.id] = imdbId
+                }
+            }.onFailure { rethrowIfCancellation(it) }
+        }
+
+        val seenSubs = HashSet<String>()
+        var subCount = loadOpenSubtitles(ref, imdbId, subtitleCallback, seenSubs)
+        if (subCount > 0) {
+            ClipboardLogger.logAndCopy("Subtitles", "Đã nạp $subCount phụ đề OpenSubtitles")
+        }
+
+        val mirror = "https://hnembed.cc"
+        val embedUrl = if (ref.type == "movie") {
+            "$mirror/embed/movie/${ref.id}"
+        } else {
+            "$mirror/embed/tv/${ref.id}/${ref.season}/${ref.episode}"
+        }
+        ClipboardLogger.logAndCopy("HNEmbed Target", embedUrl)
 
         var emitted = 0
-        val tried = linkedSetOf<String>()
+        val emittedUrls = HashSet<String>()
 
-        for (mirror in mirrors) {
-            val embedUrl = if (ref.type == "movie") {
-                "$mirror/embed/movie/${ref.id}"
-            } else {
-                "$mirror/embed/tv/${ref.id}/${ref.season}/${ref.episode}"
+        try {
+            val response = app.get(
+                embedUrl,
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Referer" to "$mirror/"
+                ),
+                timeout = 12L
+            )
+            val html = response.text
+            val finalUrl = response.url.toString()
+            ClipboardLogger.logAndCopy("Embed Response", "HTTP ${response.code}; final=$finalUrl; bytes=${html.length}")
+            if (response.code !in 200..299) {
+                ClipboardLogger.logAndCopy("Failed", "HNEmbed embed trả về HTTP ${response.code}")
+                return false
             }
 
-            ClipboardLogger.logAndCopy("HNEmbed target", embedUrl)
+            val doc = Jsoup.parse(html, finalUrl)
+            val playerIframe = doc.selectFirst("iframe#player_iframe")
+                ?: doc.selectFirst("iframe[data-api]")
+            val apiUrl = resolveHttpUrl(finalUrl, playerIframe?.attr("data-api"))
 
-            // First ask CloudStream whether an installed extractor supports HNEmbed directly.
-            try {
-                loadExtractor(embedUrl, "$mirror/", subtitleCallback) { link ->
-                    callback.invoke(link)
-                    emitted++
-                    ClipboardLogger.logAndCopy(
-                        "Extractor link",
-                        "${link.name} | ${link.url.take(250)}"
-                    )
-                }
-            } catch (e: Exception) {
-                if (e is CancellationException) throw e
-                ClipboardLogger.logAndCopy(
-                    "HNEmbed extractor",
-                    "${e.javaClass.simpleName}: ${e.message}"
-                )
-            }
-
-            if (emitted > 0) return true
-
-            try {
-                val response = app.get(
-                    embedUrl,
-                    headers = headers,
-                    referer = "$mirror/"
-                )
-                val html = response.text
-                val finalUrl = response.url.toString()
-
-                ClipboardLogger.logAndCopy(
-                    "Embed response",
-                    "HTTP ${response.code}; final=$finalUrl; bytes=${html.length}"
-                )
-                if (response.code !in 200..299) continue
-
-                val doc = Jsoup.parse(html, finalUrl)
-                val iframeElements = doc.select("iframe, frame")
-                val videoElements = doc.select("video, source")
-                val embedElements = doc.select("embed, object")
-                val scriptElements = doc.select("script")
-
-                ClipboardLogger.logAndCopy(
-                    "HTML scan",
-                    "title=${doc.title()}\n" +
-                        "finalUrl=$finalUrl\n" +
-                        "htmlBytes=${html.length}\n" +
-                        "iframeCount=${iframeElements.size}\n" +
-                        "videoSourceCount=${videoElements.size}\n" +
-                        "embedObjectCount=${embedElements.size}\n" +
-                        "scriptCount=${scriptElements.size}"
-                )
-
-                val staticIframeDetails = iframeElements.mapIndexed { index, iframe ->
-                    val attrs = iframe.attributes().asList().joinToString("; ") {
-                        "${it.key}=${it.value}"
-                    }
-                    "iframe[$index] id=${iframe.id()} name=${iframe.attr("name")} attrs={$attrs} outer=${iframe.outerHtml().take(2200)}"
-                }
-                ClipboardLogger.logAndCopy(
-                    "Static iframe details",
-                    staticIframeDetails.joinToString("\n\n").ifBlank { "No iframe elements" }
-                )
-
-                val externalScripts = scriptElements
-                    .filter { it.hasAttr("src") }
-                    .map { it.absUrl("src") }
-                    .filter { it.startsWith("http://") || it.startsWith("https://") }
-                    .distinct()
-                    .take(25)
-
-                ClipboardLogger.logAndCopy(
-                    "External scripts",
-                    externalScripts.joinToString("\n").ifBlank { "No external scripts found" }
-                )
-
-                // Only inspect likely player/media elements and data-* attributes.
-                val scanElements = doc.select(
-                    "iframe, frame, video, source, embed, object, " +
-                        "[data-src], [data-lazy-src], [data-url], [data-embed], " +
-                        "[data-player], [data-video], [data-file], [data-href], [data-link]"
-                )
-                val attributeNames = listOf(
-                    "src",
-                    "data-src",
-                    "data-lazy-src",
-                    "data-url",
-                    "data-embed",
-                    "data-player",
-                    "data-video",
-                    "data-file",
-                    "data-href",
-                    "data-link",
-                    "href",
-                    "data"
-                )
-
-                // Keep URL plus the HTML element/attribute that exposed it.
-                val candidates = linkedMapOf<String, String>()
-                var directPlayerPageUrl: String? = null
-                var directPlayerReferer: String = finalUrl
-
-                /*
-                 * HNEmbed's public wrapper exposes its source endpoint on the
-                 * player iframe as data-api. Use that exact DOM attribute rather
-                 * than hard-coding an undocumented URL pattern for every host.
-                 * This step only reads the public API response and its returned
-                 * iframe/player URL; it does not bypass CAPTCHA or decode media.
-                 */
-                val playerIframe = iframeElements.firstOrNull {
-                    it.id() == "player_iframe"
-                } ?: iframeElements.firstOrNull {
-                    it.hasAttr("data-api")
-                }
-
-                val apiRaw = playerIframe?.attr("data-api")
-                    ?.takeIf { it.isNotBlank() }
-                val apiUrl = resolveHttpUrl(finalUrl, apiRaw)
-
-                ClipboardLogger.logAndCopy(
-                    "HNEmbed data-api",
-                    apiUrl ?: "The player iframe did not expose a usable data-api attribute"
-                )
-
-                if (apiUrl != null) {
-                    try {
-                        val apiResponse = app.get(
-                            apiUrl,
-                            headers = mapOf(
-                                "User-Agent" to userAgent,
-                                "Accept" to "application/json,text/plain,*/*",
-                                "Referer" to finalUrl,
-                                "Origin" to mirror
-                            )
-                        )
-                        val apiText = apiResponse.text
-
-                        ClipboardLogger.logAndCopy(
-                            "HNEmbed vs_src response",
-                            "HTTP ${apiResponse.code}; final=${apiResponse.url}; " +
-                                "bytes=${apiText.length}\n${apiText.take(1800)}"
-                        )
-
-                        val srcFromJson = try {
-                            JSONObject(apiText).optString("src")
-                                .takeIf { it.isNotBlank() && it != "null" }
-                        } catch (_: Exception) {
-                            null
-                        }
-                        val srcFromRegex = Regex(
-                            """\"src\"\s*:\s*\"([^\"]+)\""""
-                        ).find(apiText)?.groupValues?.getOrNull(1)
-
-                        val srcRaw = (srcFromJson ?: srcFromRegex)
-                            ?.replace("\\/", "/")
-                            ?.replace("\\u0026", "&")
-                        val srcUrl = resolveHttpUrl(apiUrl, srcRaw)
-
-                        ClipboardLogger.logAndCopy(
-                            "HNEmbed src result",
-                            srcUrl ?: "No valid HTTP src field was returned"
-                        )
-
-                        if (srcUrl != null) {
-                            candidates[srcUrl] = "HNEmbed data-api src"
-
-                            // Inspect the public landing response for a playerUrl
-                            // field. This is diagnostic; the normal extractor loop
-                            // below will handle the returned URL if one is present.
-                            try {
-                                val landing = app.get(
-                                    srcUrl,
-                                    headers = mapOf(
-                                        "User-Agent" to userAgent,
-                                        "Accept" to "text/html,application/json,*/*",
-                                        "Referer" to "$mirror/"
-                                    )
-                                )
-                                val landingText = landing.text
-
-                                ClipboardLogger.logAndCopy(
-                                    "HNEmbed src landing",
-                                    "HTTP ${landing.code}; final=${landing.url}; " +
-                                        "bytes=${landingText.length}\n${landingText.take(1800)}"
-                                )
-
-                                val playerFromJson = try {
-                                    JSONObject(landingText).optString("playerUrl")
-                                        .takeIf { it.isNotBlank() && it != "null" }
-                                } catch (_: Exception) {
-                                    null
-                                }
-                                val playerFromRegex = Regex(
-                                    """\"playerUrl\"\s*:\s*\"([^\"]+)\""""
-                                ).find(landingText)?.groupValues?.getOrNull(1)
-
-                                val playerRaw = (playerFromJson ?: playerFromRegex)
-                                    ?.replace("\\/", "/")
-                                    ?.replace("\\u0026", "&")
-                                val playerUrl = resolveHttpUrl(srcUrl, playerRaw)
-
-                                ClipboardLogger.logAndCopy(
-                                    "HNEmbed resolved playerUrl",
-                                    playerUrl ?: "No playerUrl field found in the src landing page"
-                                )
-
-                                if (playerUrl != null) {
-                                    candidates[playerUrl] = "HNEmbed src landing playerUrl"
-                                    directPlayerPageUrl = playerUrl
-                                    directPlayerReferer = srcUrl
-                                }
-                            } catch (e: Exception) {
-                                if (e is CancellationException) throw e
-                                ClipboardLogger.logAndCopy(
-                                    "HNEmbed src landing error",
-                                    "${e.javaClass.simpleName}: ${e.message}"
-                                )
-                            }
-                        }
-                    } catch (e: Exception) {
-                        if (e is CancellationException) throw e
-                        ClipboardLogger.logAndCopy(
-                            "HNEmbed vs_src error",
-                            "${e.javaClass.simpleName}: ${e.message}"
-                        )
-                    }
-                }
-
-                for (element in scanElements) {
-                    for (attribute in attributeNames) {
-                        val raw = element.attributeCandidate(attribute) ?: continue
-                        val candidate = resolveHttpUrl(finalUrl, raw) ?: continue
-                        if (!candidates.containsKey(candidate)) {
-                            candidates[candidate] = "<${element.tagName()}> @$attribute"
-                        }
-                    }
-                }
-
-                // Some players publish their URL in OpenGraph/Twitter player metadata.
-                val playerMeta = doc.select(
-                    "meta[property=og:video], meta[property=og:video:url], " +
-                        "meta[name=twitter:player], meta[name=twitter:player:stream]"
-                )
-                for (meta in playerMeta) {
-                    val raw = meta.attr("content")
-                    val candidate = resolveHttpUrl(finalUrl, raw) ?: continue
-                    if (!candidates.containsKey(candidate)) {
-                        candidates[candidate] = "<meta ${meta.attr("property").ifBlank { meta.attr("name") }}> @content"
-                    }
-                }
-
-                ClipboardLogger.logAndCopy(
-                    "HTML candidates",
-                    candidates.entries.take(60).joinToString("\n") {
-                        "${it.value} -> ${it.key.take(450)}"
-                    }.ifBlank { "No iframe/video/source/data-* candidates in static HTML" }
-                )
-
-                // Capture short surrounding snippets for useful inline-JS diagnostics.
-                // URLs in scripts are only promoted when they clearly look like player URLs.
-                val keywordRegex = Regex(
-                    "(?i)(iframe|player|embed|video|source|stream|manifest|m3u8|mpd)"
-                )
-                val inlineScriptHints = ArrayList<String>()
-                val scriptUrlRegex = Regex("""https?://[^\"'\s<>]+""")
-                for (script in scriptElements.filter { !it.hasAttr("src") }) {
-                    val content = script.data().ifBlank { script.html() }
-                        .replace("\\/", "/")
-                    val keyMatch = keywordRegex.find(content)
-                    if (keyMatch != null && inlineScriptHints.size < 10) {
-                        val start = (keyMatch.range.first - 180).coerceAtLeast(0)
-                        val end = (keyMatch.range.last + 350).coerceAtMost(content.length)
-                        inlineScriptHints.add(content.substring(start, end))
-                    }
-
-                    for (urlMatch in scriptUrlRegex.findAll(content)) {
-                        val raw = urlMatch.value.trimEnd(')', ']', '}', ',', ';')
-                        val lower = raw.lowercase()
-                        val looksLikePlayer = listOf(
-                            "/embed/", "/player", "video", "stream", ".m3u8", ".mpd", ".mp4"
-                        ).any { lower.contains(it) }
-                        if (!looksLikePlayer) continue
-
-                        val candidate = resolveHttpUrl(finalUrl, raw) ?: continue
-                        if (!candidates.containsKey(candidate)) {
-                            candidates[candidate] = "inline-script URL"
-                        }
-                    }
-                }
-
-                ClipboardLogger.logAndCopy(
-                    "Inline script hints",
-                    inlineScriptHints.joinToString("\n\n--- HINT ---\n\n").ifBlank {
-                        "No relevant inline player script found"
-                    }
-                )
-
-                ClipboardLogger.logAndCopy(
-                    "All candidates",
-                    candidates.entries.take(80).joinToString("\n") {
-                        "${it.value} -> ${it.key.take(450)}"
-                    }.ifBlank { "No candidates found" }
-                )
-
-                for ((candidate, sourceDescription) in candidates) {
-                    if (!tried.add(candidate)) continue
-
-                    ClipboardLogger.logAndCopy(
-                        "Embed candidate",
-                        "$sourceDescription -> ${candidate.take(450)}"
-                    )
-
-                    val directType = when {
-                        Regex("\\.m3u8(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
-                            ExtractorLinkType.M3U8
-                        Regex("\\.mpd(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
-                            ExtractorLinkType.DASH
-                        Regex("\\.mp4(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
-                            ExtractorLinkType.VIDEO
-                        else -> null
-                    }
-
-                    if (directType != null) {
-                        callback.invoke(
-                            newExtractorLink(
-                                source = name,
-                                name = "HNEmbed",
-                                url = candidate,
-                                type = directType
-                            ) {
-                                referer = finalUrl
-                                quality = Qualities.Unknown.value
-                                this.headers = mapOf(
-                                    "User-Agent" to userAgent,
-                                    "Referer" to finalUrl
-                                )
-                            }
-                        )
-                        emitted++
-                        continue
-                    }
-
-                    val beforeCandidate = emitted
-                    ClipboardLogger.logAndCopy(
-                        "Extractor attempt",
-                        "start=$candidate; referer=$finalUrl"
-                    )
-                    try {
-                        loadExtractor(candidate, finalUrl, subtitleCallback) { link ->
+            if (apiUrl == null) {
+                // Fallback only if Hnembed embed directly exposed a non-API iframe src
+                val directIframe = resolveHttpUrl(finalUrl, playerIframe?.attr("src"))
+                if (directIframe != null) {
+                    loadExtractor(directIframe, finalUrl, subtitleCallback) { link ->
+                        if (emittedUrls.add(link.url)) {
                             callback.invoke(link)
                             emitted++
-                            ClipboardLogger.logAndCopy(
-                                "Extractor link",
-                                "${link.name} | ${link.url.take(250)}"
-                            )
-                        }
-                        ClipboardLogger.logAndCopy(
-                            "Extractor result",
-                            "candidate=$candidate; callbacks=${emitted - beforeCandidate}"
-                        )
-                    } catch (e: Exception) {
-                        if (e is CancellationException) throw e
-                        ClipboardLogger.logAndCopy(
-                            "Candidate extractor",
-                            "${candidate.take(250)} | ${e.javaClass.simpleName}: ${e.message}"
-                        )
-                    }
-                }
-
-                // Prefer loading the returned playerUrl as the WebView's top-level page.
-                // This removes the cross-origin HNEmbed wrapper from the frame ancestry,
-                // allowing us to diagnose the player without trying to access another origin.
-                if (emitted == 0 && directPlayerPageUrl != null) {
-                    val playerPage = directPlayerPageUrl!!
-                    ClipboardLogger.logAndCopy(
-                        "Direct player inspection start",
-                        "url=$playerPage; referer=$directPlayerReferer"
-                    )
-
-                    val renderedCandidates = inspectRenderedIframeUrls(
-                        playerPage,
-                        userAgent,
-                        directPlayerReferer
-                    )
-
-                    ClipboardLogger.logAndCopy(
-                        "Direct player inspection candidates",
-                        renderedCandidates.joinToString("\n").ifBlank {
-                            "No public iframe or media URL exposed by the direct player page"
-                        }
-                    )
-
-                    for (candidate in renderedCandidates) {
-                        if (!tried.add(candidate)) continue
-
-                        ClipboardLogger.logAndCopy(
-                            "Direct player candidate",
-                            candidate.take(450)
-                        )
-
-                        // The V10 log showed a rendered <source> URL under /pl/.
-                        // Inspect its response headers before deciding whether it is
-                        // HLS, DASH, MP4, or a custom/HTML endpoint.
-                        if (candidate.contains("/pl/", ignoreCase = true)) {
-                            inspectPlayerSource(candidate, playerPage, userAgent)
-                        }
-
-                        val directType = when {
-                            Regex("\\.m3u8(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
-                                ExtractorLinkType.M3U8
-                            Regex("\\.mpd(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
-                                ExtractorLinkType.DASH
-                            Regex("\\.mp4(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
-                                ExtractorLinkType.VIDEO
-                            else -> null
-                        }
-
-                        if (directType != null) {
-                            callback.invoke(
-                                newExtractorLink(
-                                    source = name,
-                                    name = "HNEmbed",
-                                    url = candidate,
-                                    type = directType
-                                ) {
-                                    referer = playerPage
-                                    quality = Qualities.Unknown.value
-                                    this.headers = mapOf(
-                                        "User-Agent" to userAgent,
-                                        "Referer" to playerPage
-                                    )
-                                }
-                            )
-                            emitted++
-                            continue
-                        }
-
-                        val beforeCandidate = emitted
-                        try {
-                            loadExtractor(candidate, playerPage, subtitleCallback) { link ->
-                                callback.invoke(link)
-                                emitted++
-                                ClipboardLogger.logAndCopy(
-                                    "Direct player extractor link",
-                                    "${link.name} | ${link.url.take(250)}"
-                                )
-                            }
-                            ClipboardLogger.logAndCopy(
-                                "Direct player extractor result",
-                                "candidate=$candidate; callbacks=${emitted - beforeCandidate}"
-                            )
-                        } catch (e: Exception) {
-                            if (e is CancellationException) throw e
-                            ClipboardLogger.logAndCopy(
-                                "Direct player extractor error",
-                                "${candidate.take(250)} | ${e.javaClass.simpleName}: ${e.message}"
-                            )
-                        }
-                    }
-                } else if (emitted == 0 && iframeElements.isNotEmpty()) {
-                    // Fallback only if data-api/playerUrl was not exposed.
-                    val renderedCandidates = inspectRenderedIframeUrls(
-                        finalUrl,
-                        userAgent,
-                        "$mirror/"
-                    )
-
-                    for (candidate in renderedCandidates) {
-                        if (!tried.add(candidate)) continue
-
-                        ClipboardLogger.logAndCopy(
-                            "Rendered embed candidate",
-                            candidate.take(450)
-                        )
-
-                        val beforeCandidate = emitted
-                        try {
-                            loadExtractor(candidate, finalUrl, subtitleCallback) { link ->
-                                callback.invoke(link)
-                                emitted++
-                                ClipboardLogger.logAndCopy(
-                                    "Rendered extractor link",
-                                    "${link.name} | ${link.url.take(250)}"
-                                )
-                            }
-                            ClipboardLogger.logAndCopy(
-                                "Rendered extractor result",
-                                "candidate=$candidate; callbacks=${emitted - beforeCandidate}"
-                            )
-                        } catch (e: Exception) {
-                            if (e is CancellationException) throw e
-                            ClipboardLogger.logAndCopy(
-                                "Rendered candidate extractor",
-                                "${candidate.take(250)} | ${e.javaClass.simpleName}: ${e.message}"
-                            )
                         }
                     }
                 }
-
-            } catch (e: Exception) {
-                if (e is CancellationException) throw e
                 ClipboardLogger.logAndCopy(
-                    "Embed fetch/parse",
-                    "${e.javaClass.simpleName}: ${e.message}"
+                    if (emitted > 0) "Done" else "Failed",
+                    "Không tìm thấy data-api trên trang embed HNEmbed (emitted=$emitted)"
                 )
+                return emitted > 0
             }
 
-            if (emitted > 0) return true
+            ClipboardLogger.logAndCopy("HNEmbed data-api", apiUrl)
+
+            val apiResp = app.get(
+                apiUrl,
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Accept" to "application/json,text/plain,*/*",
+                    "Referer" to finalUrl
+                ),
+                timeout = 12L
+            )
+            val apiText = apiResp.text
+            val srcFromJson = runCatching {
+                JSONObject(apiText).optString("src").takeIf { it.isNotBlank() && it != "null" }
+            }.getOrNull()
+            val srcFromRegex = Regex("\"src\"\\s*:\\s*\"([^\"]+)\"").find(apiText)?.groupValues?.getOrNull(1)
+            val srcUrl = resolveHttpUrl(apiUrl, srcFromJson ?: srcFromRegex)
+
+            if (srcUrl == null) {
+                ClipboardLogger.logAndCopy("Failed", "vs_src HTTP ${apiResp.code} không có src: ${apiText.take(250)}")
+                return false
+            }
+            ClipboardLogger.logAndCopy("HNEmbed src", srcUrl)
+
+            val landingResp = app.get(
+                srcUrl,
+                headers = mapOf(
+                    "User-Agent" to userAgent,
+                    "Accept" to "text/html,application/json,*/*",
+                    "Referer" to "$mirror/"
+                ),
+                timeout = 12L
+            )
+            val landingText = landingResp.text
+            val playerFromJson = runCatching {
+                JSONObject(landingText).optString("playerUrl").takeIf { it.isNotBlank() && it != "null" }
+            }.getOrNull()
+            val playerFromRegex = Regex("\"playerUrl\"\\s*:\\s*\"([^\"]+)\"").find(landingText)?.groupValues?.getOrNull(1)
+            val playerUrl = resolveHttpUrl(srcUrl, playerFromJson ?: playerFromRegex)
+
+            if (playerUrl == null) {
+                ClipboardLogger.logAndCopy("Failed", "Trang src landing HTTP ${landingResp.code} không có playerUrl")
+                return false
+            }
+            ClipboardLogger.logAndCopy("Player Target", playerUrl)
+
+            // Fetch metaApi for default_subs or missing imdb_id
+            val metaApiRaw = Regex("\"metaApi\"\\s*:\\s*\"([^\"]+)\"").find(landingText)?.groupValues?.getOrNull(1)
+            val metaApiUrl = resolveHttpUrl(srcUrl, metaApiRaw)
+            if (metaApiUrl != null) {
+                runCatching {
+                    val mJson = JSONObject(
+                        app.get(
+                            metaApiUrl,
+                            headers = mapOf("User-Agent" to userAgent, "Referer" to playerUrl),
+                            timeout = 8L
+                        ).text
+                    )
+                    val metaImdb = mJson.optJSONObject("data")?.optString("imdb_id", "").orEmpty()
+                    if (imdbId.isBlank() && metaImdb.startsWith("tt")) {
+                        imdbId = metaImdb
+                        imdbCache[ref.id] = imdbId
+                        subCount += loadOpenSubtitles(ref, imdbId, subtitleCallback, seenSubs)
+                    }
+                    val defSubs = mJson.optJSONArray("default_subs")
+                        ?: mJson.optJSONObject("data")?.optJSONArray("default_subs")
+                    if (defSubs != null) {
+                        for (i in 0 until defSubs.length()) {
+                            val sObj = defSubs.optJSONObject(i) ?: continue
+                            val sUrl = resolveHttpUrl(metaApiUrl, sObj.optString("url").ifBlank { sObj.optString("file") })
+                                ?: continue
+                            val sLbl = sObj.optString("label").ifBlank { sObj.optString("lang", "Subtitle") }
+                            val normSub = appendSubExtFragment(sUrl, "vtt")
+                            if (seenSubs.add(normSub)) {
+                                subtitleCallback.invoke(SubtitleFile("Hnembed • $sLbl", normSub))
+                                subCount++
+                            }
+                        }
+                    }
+                }.onFailure { rethrowIfCancellation(it) }
+            }
+
+            // Sniff player page in attached off-screen WebView
+            val remWaitMs = (95_000L - (SystemClock.elapsedRealtime() - startMs)).coerceIn(20_000L, 42_000L)
+            ClipboardLogger.logAndCopy("WebView Sniff", "Đang sniff (${remWaitMs / 1000}s): $playerUrl")
+
+            val sniff = sniffHnembedPlayer(
+                playerPageUrl = playerUrl,
+                initialReferer = srcUrl,
+                timeoutMs = remWaitMs
+            )
+
+            for (subUrl in sniff.capturedSubs) {
+                val normSub = appendSubExtFragment(subUrl, "vtt")
+                if (seenSubs.add(normSub)) {
+                    subtitleCallback.invoke(SubtitleFile("Hnembed • WebVTT", normSub))
+                    subCount++
+                }
+            }
+
+            // Build candidate stream list: live captured streams from shouldInterceptRequest first,
+            // followed by any extra Hnembed servers decoded from api.php (tokenized via /generate.php)
+            val orderedStreams = linkedSetOf<String>()
+            orderedStreams.addAll(sniff.capturedStreams)
+
+            val tokenCache = HashMap<String, String>()
+            for (rawCaptured in sniff.capturedStreams) {
+                val orig = originOfUrl(rawCaptured)
+                val tk = extractQueryParam(rawCaptured, "token")
+                if (orig.isNotBlank() && !tk.isNullOrBlank()) {
+                    tokenCache[orig] = tk
+                }
+            }
+
+            for (rawApiStream in sniff.apiStreamUrls) {
+                val hasTok = rawApiStream.contains("token=") || rawApiStream.contains("cast_token=")
+                if (hasTok) {
+                    orderedStreams.add(rawApiStream)
+                    continue
+                }
+                val streamOrigin = originOfUrl(rawApiStream)
+                val tk = fetchHostToken(streamOrigin, sniff.apiToken, playerUrl, tokenCache)
+                val tokenized = if (tk.isNotBlank()) appendTokenParam(rawApiStream, "token", tk) else rawApiStream
+                orderedStreams.add(tokenized)
+            }
+
+            if (orderedStreams.isEmpty()) {
+                ClipboardLogger.logAndCopy(
+                    "WebView Miss",
+                    "Không bắt được luồng (${sniff.observedRequests.size} reqs, ${sniff.networkErrors.size} errs)\n" +
+                        sniff.observedRequests.take(30).joinToString("\n") +
+                        if (sniff.networkErrors.isNotEmpty()) "\n--- ERRORS ---\n${sniff.networkErrors.take(15).joinToString("\n")}" else ""
+                )
+            } else {
+                var srvIdx = 1
+                for (candUrl in orderedStreams) {
+                    if (emitted >= 3) break
+                    if (probeAndEmitHnStream(candUrl, srvIdx, playerUrl, emittedUrls, callback)) {
+                        emitted++
+                        srvIdx++
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            rethrowIfCancellation(e)
+            ClipboardLogger.logAndCopy("Exception", "${e.javaClass.simpleName}: ${e.message}")
         }
 
         ClipboardLogger.logAndCopy(
-            "No playable source",
-            "HNEmbed returned no public media URL handled by installed CloudStream extractors. " +
-                "Check Direct player state polls, Observed WebView network requests and WebView network errors. " +
-                "The HTML player page is not reported as a video link." 
+            if (emitted > 0) "Done" else "Failed",
+            "Đã nạp $emitted luồng phát & $subCount phụ đề từ Hnembed."
         )
-        return false
+        return emitted > 0
     }
 }
