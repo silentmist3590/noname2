@@ -110,13 +110,14 @@ private fun Element.attributeCandidate(attribute: String): String? =
     if (hasAttr(attribute)) attr(attribute).trim().takeIf { it.isNotBlank() } else null
 
 /**
- * Loads the public HNEmbed wrapper in a non-interactive WebView and reads the
- * rendered iframe DOM after the page scripts have had time to run.
- * It does not click controls, alter player behavior, or extract protected media.
+ * Loads either the public HNEmbed wrapper or the resolved player page in WebView.
+ * It reads the rendered DOM and observable network metadata after page scripts run.
+ * It does not synthesize clicks, bypass challenges, or decode protected media payloads.
  */
 private suspend fun inspectRenderedIframeUrls(
     pageUrl: String,
-    userAgent: String
+    userAgent: String,
+    initialReferer: String = "https://hnembed.cc/"
 ): List<String> = suspendCoroutine { continuation ->
     val activity = try {
         CommonActivity.activity
@@ -153,6 +154,7 @@ private suspend fun inspectRenderedIframeUrls(
         val iframeUrls = linkedSetOf<String>()
         val subframeRequests = linkedSetOf<String>()
         val resourceUrls = linkedSetOf<String>()
+        val exposedMediaUrls = linkedSetOf<String>()
         val observedRequests = linkedSetOf<String>()
         val exposedApiEndpoints = linkedSetOf<String>()
         val networkErrors = linkedSetOf<String>()
@@ -194,6 +196,7 @@ private suspend fun inspectRenderedIframeUrls(
             val result = linkedSetOf<String>()
             result.addAll(iframeUrls)
             synchronized(resourceUrls) { result.addAll(resourceUrls) }
+            synchronized(exposedMediaUrls) { result.addAll(exposedMediaUrls) }
 
             val requestSnapshot = synchronized(observedRequests) { observedRequests.toList() }
             val apiSnapshot = synchronized(exposedApiEndpoints) { exposedApiEndpoints.toList() }
@@ -204,7 +207,8 @@ private suspend fun inspectRenderedIframeUrls(
                 "Rendered iframe inspection summary",
                 "pageFinished=$pageFinished; polls=$pollCount; " +
                     "iframeUrls=${iframeUrls.size}; subframeRequests=${subframeRequests.size}; " +
-                    "mediaResources=${resourceUrls.size}; observedRequests=${requestSnapshot.size}; " +
+                    "mediaResources=${resourceUrls.size}; videoElementUrls=${exposedMediaUrls.size}; " +
+                    "observedRequests=${requestSnapshot.size}; " +
                     "apiEndpoints=${apiSnapshot.size}; networkErrors=${errorSnapshot.size}"
             )
             ClipboardLogger.logAndCopy(
@@ -272,13 +276,27 @@ private suspend fun inspectRenderedIframeUrls(
                     var media = Array.prototype.slice.call(
                       document.querySelectorAll('video,source')
                     ).map(function(v) {
+                      var video = v.tagName === 'VIDEO';
                       return {
                         tag: v.tagName,
                         srcAttr: v.getAttribute('src') || '',
                         src: v.src || '',
-                        type: v.getAttribute('type') || ''
+                        currentSrc: video ? (v.currentSrc || '') : '',
+                        type: v.getAttribute('type') || '',
+                        paused: video ? v.paused : null,
+                        readyState: video ? v.readyState : null,
+                        networkState: video ? v.networkState : null,
+                        videoWidth: video ? v.videoWidth : null,
+                        videoHeight: video ? v.videoHeight : null,
+                        duration: video && isFinite(v.duration) ? v.duration : null,
+                        error: video && v.error ? {
+                          code: v.error.code,
+                          message: v.error.message || ''
+                        } : null
                       };
                     });
+                    var bodyText = (document.body && document.body.innerText || '').slice(0,1800);
+                    var challengeLike = /captcha|verify you are human|checking your browser|are you a robot|security challenge/i.test(bodyText);
                     var resources = performance.getEntriesByType('resource')
                       .map(function(e) { return e.name; })
                       .filter(function(u) {
@@ -290,7 +308,10 @@ private suspend fun inspectRenderedIframeUrls(
                       frameCount: frames.length,
                       frames: frames,
                       media: media,
-                      resources: resources
+                      resources: resources,
+                      title: document.title || '',
+                      bodyText: bodyText,
+                      challengeLike: challengeLike
                     });
                   } catch (e) {
                     return JSON.stringify({error:String(e)});
@@ -373,19 +394,40 @@ private suspend fun inspectRenderedIframeUrls(
                         )
 
                         val media = snapshot.optJSONArray("media")
+                        val mediaStateLines = mutableListOf<String>()
                         if (media != null && media.length() > 0) {
                             for (i in 0 until media.length()) {
                                 val item = media.optJSONObject(i) ?: continue
-                                val raw = item.optString("srcAttr").ifBlank {
-                                    item.optString("src")
-                                }
-                                resolveHttpUrl(pageUrl, raw)?.let { candidate ->
-                                    synchronized(resourceUrls) {
-                                        resourceUrls.add(candidate)
+                                val raw = item.optString("currentSrc")
+                                    .ifBlank { item.optString("srcAttr") }
+                                    .ifBlank { item.optString("src") }
+
+                                if (raw.startsWith("http://") || raw.startsWith("https://")) {
+                                    synchronized(exposedMediaUrls) {
+                                        if (exposedMediaUrls.size < 40) exposedMediaUrls.add(raw)
                                     }
                                 }
+
+                                mediaStateLines.add(
+                                    "tag=${item.optString("tag")}; src=${item.optString("src").take(260)}; " +
+                                        "currentSrc=${item.optString("currentSrc").take(260)}; " +
+                                        "paused=${item.opt("paused")}; readyState=${item.opt("readyState")}; " +
+                                        "networkState=${item.opt("networkState")}; " +
+                                        "videoSize=${item.opt("videoWidth")}x${item.opt("videoHeight")}; " +
+                                        "duration=${item.opt("duration")}; error=${item.opt("error")}"
+                                )
                             }
                         }
+
+                        ClipboardLogger.logAndCopy(
+                            "Direct player state poll $pollCount",
+                            "title=${snapshot.optString("title")}; " +
+                                "challengeLike=${snapshot.optBoolean("challengeLike")}\n" +
+                                "body=${snapshot.optString("bodyText").take(900)}\n" +
+                                mediaStateLines.joinToString("\n").ifBlank {
+                                    "No video/source element visible in the top-level player document"
+                                }
+                        )
 
                         val resources = snapshot.optJSONArray("resources")
                         if (resources != null) {
@@ -428,7 +470,9 @@ private suspend fun inspectRenderedIframeUrls(
                 javaScriptCanOpenWindowsAutomatically = false
                 setSupportMultipleWindows(false)
                 userAgentString = userAgent
-                mediaPlaybackRequiresUserGesture = true
+                // The player landing page explicitly advertises autoStart=true.
+                // This only honors its own autoplay setting; no synthetic clicks are sent.
+                mediaPlaybackRequiresUserGesture = false
                 allowFileAccess = false
                 mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             }
@@ -540,11 +584,16 @@ private suspend fun inspectRenderedIframeUrls(
                 "Rendered iframe inspection",
                 "Loading HNEmbed wrapper and polling the rendered iframe DOM for up to 13 seconds: $pageUrl"
             )
+            ClipboardLogger.logAndCopy(
+                "Direct player top-level navigation",
+                "url=$pageUrl; referer=$initialReferer; " +
+                    "standalone=${pageUrl.contains("/embed/player/")}"
+            )
             webView.loadUrl(
                 pageUrl,
                 mapOf(
                     "User-Agent" to userAgent,
-                    "Referer" to "https://hnembed.cc/"
+                    "Referer" to initialReferer
                 )
             )
         } catch (e: Exception) {
@@ -801,7 +850,7 @@ class HnembedProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         ClipboardLogger.clear()
-        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-DATA-API-DIAG-2026-11-24-V9")
+        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-DIRECT-PLAYER-DIAG-2026-11-24-V10")
         ClipboardLogger.logAndCopy(
             "loadLinks START",
             "data=$data; provider=$name; casting=$isCasting"
@@ -937,6 +986,8 @@ class HnembedProvider : MainAPI() {
 
                 // Keep URL plus the HTML element/attribute that exposed it.
                 val candidates = linkedMapOf<String, String>()
+                var directPlayerPageUrl: String? = null
+                var directPlayerReferer: String = finalUrl
 
                 /*
                  * HNEmbed's public wrapper exposes its source endpoint on the
@@ -1044,6 +1095,8 @@ class HnembedProvider : MainAPI() {
 
                                 if (playerUrl != null) {
                                     candidates[playerUrl] = "HNEmbed src landing playerUrl"
+                                    directPlayerPageUrl = playerUrl
+                                    directPlayerReferer = srcUrl
                                 }
                             } catch (e: Exception) {
                                 if (e is CancellationException) throw e
@@ -1203,22 +1256,44 @@ class HnembedProvider : MainAPI() {
                     }
                 }
 
-                // Static HTML contains an iframe without a usable src. Execute the
-                // page's normal JavaScript in WebView and inspect the rendered DOM.
-                if (emitted == 0 && iframeElements.isNotEmpty()) {
-                    val renderedCandidates = inspectRenderedIframeUrls(finalUrl, userAgent)
+                // Prefer loading the returned playerUrl as the WebView's top-level page.
+                // This removes the cross-origin HNEmbed wrapper from the frame ancestry,
+                // allowing us to diagnose the player without trying to access another origin.
+                if (emitted == 0 && directPlayerPageUrl != null) {
+                    val playerPage = directPlayerPageUrl!!
+                    ClipboardLogger.logAndCopy(
+                        "Direct player inspection start",
+                        "url=$playerPage; referer=$directPlayerReferer"
+                    )
+
+                    val renderedCandidates = inspectRenderedIframeUrls(
+                        playerPage,
+                        userAgent,
+                        directPlayerReferer
+                    )
+
+                    ClipboardLogger.logAndCopy(
+                        "Direct player inspection candidates",
+                        renderedCandidates.joinToString("\n").ifBlank {
+                            "No public iframe or media URL exposed by the direct player page"
+                        }
+                    )
+
                     for (candidate in renderedCandidates) {
                         if (!tried.add(candidate)) continue
 
                         ClipboardLogger.logAndCopy(
-                            "Rendered embed candidate",
+                            "Direct player candidate",
                             candidate.take(450)
                         )
 
                         val directType = when {
-                            Regex("\\.m3u8(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) -> ExtractorLinkType.M3U8
-                            Regex("\\.mpd(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) -> ExtractorLinkType.DASH
-                            Regex("\\.mp4(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) -> ExtractorLinkType.VIDEO
+                            Regex("\\.m3u8(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
+                                ExtractorLinkType.M3U8
+                            Regex("\\.mpd(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
+                                ExtractorLinkType.DASH
+                            Regex("\\.mp4(?:$|[?#])", RegexOption.IGNORE_CASE).containsMatchIn(candidate) ->
+                                ExtractorLinkType.VIDEO
                             else -> null
                         }
 
@@ -1230,11 +1305,11 @@ class HnembedProvider : MainAPI() {
                                     url = candidate,
                                     type = directType
                                 ) {
-                                    referer = finalUrl
+                                    referer = playerPage
                                     quality = Qualities.Unknown.value
                                     this.headers = mapOf(
                                         "User-Agent" to userAgent,
-                                        "Referer" to finalUrl
+                                        "Referer" to playerPage
                                     )
                                 }
                             )
@@ -1243,10 +1318,44 @@ class HnembedProvider : MainAPI() {
                         }
 
                         val beforeCandidate = emitted
+                        try {
+                            loadExtractor(candidate, playerPage, subtitleCallback) { link ->
+                                callback.invoke(link)
+                                emitted++
+                                ClipboardLogger.logAndCopy(
+                                    "Direct player extractor link",
+                                    "${link.name} | ${link.url.take(250)}"
+                                )
+                            }
+                            ClipboardLogger.logAndCopy(
+                                "Direct player extractor result",
+                                "candidate=$candidate; callbacks=${emitted - beforeCandidate}"
+                            )
+                        } catch (e: Exception) {
+                            if (e is CancellationException) throw e
+                            ClipboardLogger.logAndCopy(
+                                "Direct player extractor error",
+                                "${candidate.take(250)} | ${e.javaClass.simpleName}: ${e.message}"
+                            )
+                        }
+                    }
+                } else if (emitted == 0 && iframeElements.isNotEmpty()) {
+                    // Fallback only if data-api/playerUrl was not exposed.
+                    val renderedCandidates = inspectRenderedIframeUrls(
+                        finalUrl,
+                        userAgent,
+                        "$mirror/"
+                    )
+
+                    for (candidate in renderedCandidates) {
+                        if (!tried.add(candidate)) continue
+
                         ClipboardLogger.logAndCopy(
-                            "Rendered extractor attempt",
-                            "start=$candidate; referer=$finalUrl"
+                            "Rendered embed candidate",
+                            candidate.take(450)
                         )
+
+                        val beforeCandidate = emitted
                         try {
                             loadExtractor(candidate, finalUrl, subtitleCallback) { link ->
                                 callback.invoke(link)
@@ -1269,6 +1378,7 @@ class HnembedProvider : MainAPI() {
                         }
                     }
                 }
+
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 ClipboardLogger.logAndCopy(
@@ -1282,9 +1392,9 @@ class HnembedProvider : MainAPI() {
 
         ClipboardLogger.logAndCopy(
             "No playable source",
-            "HNEmbed returned no candidate handled by the installed CloudStream extractors. " +
-                "Check Rendered iframe candidates, Observed WebView network requests and WebView network errors. " +
-                "The HTML page is not reported as a video link."
+            "HNEmbed returned no public media URL handled by installed CloudStream extractors. " +
+                "Check Direct player state polls, Observed WebView network requests and WebView network errors. " +
+                "The HTML player page is not reported as a video link." 
         )
         return false
     }
