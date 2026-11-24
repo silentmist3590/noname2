@@ -153,9 +153,13 @@ private suspend fun inspectPlayerSource(
             timeout = 12L
         )
 
-        fun header(name: String): String = response.headers.entries
-            .firstOrNull { it.key.equals(name, ignoreCase = true) }
-            ?.value.orEmpty()
+        // CloudStream's response headers support keyed lookup; avoid relying
+        // on Map.entries because the concrete header type varies by core version.
+        fun header(name: String): String =
+            response.headers[name]
+                ?: response.headers[name.lowercase()]
+                ?: response.headers[name.uppercase()]
+                ?: ""
 
         val contentType = header("Content-Type")
         val contentLength = header("Content-Length")
@@ -177,7 +181,7 @@ private suspend fun inspectPlayerSource(
                 "referer=${redactUrlForLog(playerUrl)}\n" +
                 "cookieSent=${!cookieHeader.isNullOrBlank()}"
         )
-        isHls
+        return isHls
     } catch (e: Exception) {
         if (e is CancellationException) throw e
         ClipboardLogger.logAndCopy(
@@ -959,7 +963,7 @@ class HnembedProvider : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         ClipboardLogger.clear()
-        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-DIRECT-PLAYER-DIAG-2026-11-24-V13")
+        ClipboardLogger.logAndCopy("BUILD MARKER", "HNEMBED-DIRECT-PLAYER-DIAG-2026-11-24-V14")
         ClipboardLogger.logAndCopy(
             "loadLinks START",
             "data=$data; provider=$name; casting=$isCasting"
